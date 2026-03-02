@@ -1,0 +1,258 @@
+- kernel:
+    watcher_kernel_id: 3
+    name: cq_dispatch_subordinate
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/cq_dispatch_subordinate/2462871850870169148/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+    program_id: 0
+- kernel:
+    watcher_kernel_id: 2
+    name: cq_dispatch
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/cq_dispatch/2888073033905727446/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+    program_id: 0
+- kernel:
+    watcher_kernel_id: 1
+    name: cq_prefetch
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/cq_prefetch/6769905397087476244/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+    program_id: 0
+- kernel:
+    watcher_kernel_id: 6
+    name: reader_bmm_tile_layout_in1_sender_writer_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in1_sender_writer_padding/14387212051366011041/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+    program_id: 1
+- kernel:
+    watcher_kernel_id: 5
+    name: reader_bmm_tile_layout_in0_receiver
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_receiver/10563353648572342344/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+    program_id: 1
+- kernel:
+    watcher_kernel_id: 4
+    name: reader_bmm_tile_layout_in0_sender_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_sender_padding/4558263272967502754/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+    program_id: 1
+- kernel:
+    watcher_kernel_id: 7
+    name: bmm_large_block_zm_fused_bias_activation
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/bmm_large_block_zm_fused_bias_activation/13676970876852462352/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm_fused_bias_activation.cpp
+    program_id: 1
+- kernel:
+    watcher_kernel_id: 11
+    name: bmm_large_block_zm_fused_bias_activation
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/bmm_large_block_zm_fused_bias_activation/13676970876852462352/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm_fused_bias_activation.cpp
+    program_id: 3
+- kernel:
+    watcher_kernel_id: 10
+    name: reader_bmm_tile_layout_in1_sender_writer_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in1_sender_writer_padding/14387212051366011041/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+    program_id: 3
+- kernel:
+    watcher_kernel_id: 9
+    name: reader_bmm_tile_layout_in0_receiver
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_receiver/10563353648572342344/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+    program_id: 3
+- kernel:
+    watcher_kernel_id: 8
+    name: reader_bmm_tile_layout_in0_sender_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_sender_padding/4558263272967502754/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+    program_id: 3
+- kernel:
+    watcher_kernel_id: 15
+    name: bmm_large_block_zm_fused_bias_activation
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/bmm_large_block_zm_fused_bias_activation/13676970876852462352/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm_fused_bias_activation.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 14
+    name: reader_bmm_tile_layout_in1_sender_writer_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in1_sender_writer_padding/14387212051366011041/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 13
+    name: reader_bmm_tile_layout_in0_receiver
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_receiver/10563353648572342344/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 12
+    name: reader_bmm_tile_layout_in0_sender_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_sender_padding/4558263272967502754/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 18
+    name: reader_bmm_tile_layout_in1_sender_writer_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in1_sender_writer_padding/14387212051366011041/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 19
+    name: bmm_large_block_zm_fused_bias_activation
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/bmm_large_block_zm_fused_bias_activation/13676970876852462352/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm_fused_bias_activation.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 17
+    name: reader_bmm_tile_layout_in0_receiver
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_receiver/10563353648572342344/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 16
+    name: reader_bmm_tile_layout_in0_sender_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_sender_padding/4558263272967502754/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 23
+    name: bmm_large_block_zm_fused_bias_activation
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/bmm_large_block_zm_fused_bias_activation/13676970876852462352/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm_fused_bias_activation.cpp
+    program_id: 9
+- kernel:
+    watcher_kernel_id: 22
+    name: reader_bmm_tile_layout_in1_sender_writer_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in1_sender_writer_padding/14387212051366011041/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+    program_id: 9
+- kernel:
+    watcher_kernel_id: 21
+    name: reader_bmm_tile_layout_in0_receiver
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_receiver/10563353648572342344/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+    program_id: 9
+- kernel:
+    watcher_kernel_id: 20
+    name: reader_bmm_tile_layout_in0_sender_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_sender_padding/4558263272967502754/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+    program_id: 9
+- kernel:
+    watcher_kernel_id: 27
+    name: bmm_large_block_zm_fused_bias_activation
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/bmm_large_block_zm_fused_bias_activation/13676970876852462352/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm_fused_bias_activation.cpp
+    program_id: 11
+- kernel:
+    watcher_kernel_id: 24
+    name: reader_bmm_tile_layout_in0_sender_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_sender_padding/4558263272967502754/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+    program_id: 11
+- kernel:
+    watcher_kernel_id: 26
+    name: reader_bmm_tile_layout_in1_sender_writer_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in1_sender_writer_padding/14387212051366011041/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+    program_id: 11
+- kernel:
+    watcher_kernel_id: 25
+    name: reader_bmm_tile_layout_in0_receiver
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_receiver/10563353648572342344/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+    program_id: 11
+- kernel:
+    watcher_kernel_id: 31
+    name: bmm_large_block_zm_fused_bias_activation
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/bmm_large_block_zm_fused_bias_activation/13676970876852462352/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm_fused_bias_activation.cpp
+    program_id: 13
+- kernel:
+    watcher_kernel_id: 29
+    name: reader_bmm_tile_layout_in0_receiver
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_receiver/10563353648572342344/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+    program_id: 13
+- kernel:
+    watcher_kernel_id: 30
+    name: reader_bmm_tile_layout_in1_sender_writer_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in1_sender_writer_padding/14387212051366011041/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+    program_id: 13
+- kernel:
+    watcher_kernel_id: 28
+    name: reader_bmm_tile_layout_in0_sender_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_sender_padding/4558263272967502754/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+    program_id: 13
+- kernel:
+    watcher_kernel_id: 35
+    name: bmm_large_block_zm_fused_bias_activation
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/bmm_large_block_zm_fused_bias_activation/13676970876852462352/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm_fused_bias_activation.cpp
+    program_id: 15
+- kernel:
+    watcher_kernel_id: 34
+    name: reader_bmm_tile_layout_in1_sender_writer_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in1_sender_writer_padding/14387212051366011041/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+    program_id: 15
+- kernel:
+    watcher_kernel_id: 33
+    name: reader_bmm_tile_layout_in0_receiver
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_receiver/10563353648572342344/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+    program_id: 15
+- kernel:
+    watcher_kernel_id: 32
+    name: reader_bmm_tile_layout_in0_sender_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_sender_padding/4558263272967502754/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+    program_id: 15
+- kernel:
+    watcher_kernel_id: 39
+    name: bmm_large_block_zm_fused_bias_activation
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/bmm_large_block_zm_fused_bias_activation/13676970876852462352/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm_fused_bias_activation.cpp
+    program_id: 17
+- kernel:
+    watcher_kernel_id: 38
+    name: reader_bmm_tile_layout_in1_sender_writer_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in1_sender_writer_padding/14387212051366011041/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+    program_id: 17
+- kernel:
+    watcher_kernel_id: 37
+    name: reader_bmm_tile_layout_in0_receiver
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_receiver/10563353648572342344/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+    program_id: 17
+- kernel:
+    watcher_kernel_id: 36
+    name: reader_bmm_tile_layout_in0_sender_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_sender_padding/4558263272967502754/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+    program_id: 17
+- kernel:
+    watcher_kernel_id: 41
+    name: reader_bmm_tile_layout_in0_receiver
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_receiver/10563353648572342344/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+    program_id: 19
+- kernel:
+    watcher_kernel_id: 42
+    name: reader_bmm_tile_layout_in1_sender_writer_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in1_sender_writer_padding/14387212051366011041/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+    program_id: 19
+- kernel:
+    watcher_kernel_id: 43
+    name: bmm_large_block_zm_fused_bias_activation
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/bmm_large_block_zm_fused_bias_activation/13676970876852462352/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/bmm_large_block_zm_fused_bias_activation.cpp
+    program_id: 19
+- kernel:
+    watcher_kernel_id: 40
+    name: reader_bmm_tile_layout_in0_sender_padding
+    path: /root/.cache/tt-metal-cache/e7c251da3b/3562031083613068753/kernels/reader_bmm_tile_layout_in0_sender_padding/4558263272967502754/
+    source: ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+    program_id: 19
