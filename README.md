@@ -2,6 +2,20 @@
 
 Educational implementation of IBM's Granite 4.0 MoE Hybrid model on Tenstorrent's TT-Metal hardware.
 
+## Environment
+```bash
+docker run -d \
+    --name tt-granite-dev \
+    --privileged \
+    --device /dev/tenstorrent \
+    -v /dev/hugepages:/dev/hugepages \
+    -v /dev/hugepages-1G:/dev/hugepages-1G \
+    -v ~/projects/tt-granite:/work/tt-granite \
+    --ipc=host \
+    ghcr.io/tenstorrent/tt-metal/tt-metalium-ubuntu-22.04-release-amd64:latest-rc \
+    sleep infinity
+```
+
 ## Performance Summary
 
 | Implementation | Latency | vs HF CPU | vs TT-Metal Llama |

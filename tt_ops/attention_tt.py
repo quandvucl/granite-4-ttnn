@@ -15,12 +15,12 @@ class TTAttentionOptimized:
     TT-optimized attention with accelerated projections.
 
     Architecture:
-    - Q/K/V projections: TTNN matmul (optimized)
+    - Q/K/V projections: TTNN matmul (optimized, with optional tensor parallelism)
     - Attention computation: HF (RoPE + cache management)
-    - O projection: TTNN matmul (optimized)
+    - O projection: TTNN matmul (optimized, with optional tensor parallelism)
     """
 
-    def __init__(self, hf_attention, device, dtype=ttnn.bfloat16):
+    def __init__(self, hf_attention, device, dtype=ttnn.bfloat16, tensor_parallel=False, tt_ccl=None):
         """
         Initialize TT-optimized attention.
 
@@ -28,11 +28,16 @@ class TTAttentionOptimized:
             hf_attention: HuggingFace attention module
             device: TTNN device
             dtype: Data type
+            tensor_parallel: Enable tensor parallelism (shard weights across devices)
+            tt_ccl: TT_CCL manager for collective operations
         """
         self.hf_attn = hf_attention
         self.device = device
         self.dtype = dtype
         self.layer_idx = hf_attention.layer_idx
+        self.is_mesh = hasattr(device, 'get_num_devices') and device.get_num_devices() > 1
+        self.tensor_parallel = tensor_parallel and self.is_mesh
+        self.tt_ccl = tt_ccl
 
         # Extract dimensions
         self.hidden_size = hf_attention.hidden_size
@@ -41,29 +46,45 @@ class TTAttentionOptimized:
         self.head_dim = hf_attention.head_dim
 
         # Pre-convert projection weights to TTNN (transposed for matmul)
+        # For tensor parallel: shard Q/K/V column-wise, O row-wise
+        if self.tensor_parallel:
+            mesh_shape = device.shape
+            # Column-parallel for Q/K/V (shard output dimension)
+            qkv_mesh_mapper = ttnn.ShardTensor2dMesh(device, dims=(-1, None), mesh_shape=mesh_shape)
+            # Row-parallel for O (shard input dimension)
+            o_mesh_mapper = ttnn.ShardTensor2dMesh(device, dims=(-2, None), mesh_shape=mesh_shape)
+        else:
+            # Replicate weights if tensor parallel is disabled
+            qkv_mesh_mapper = ttnn.ReplicateTensorToMesh(device) if self.is_mesh else None
+            o_mesh_mapper = ttnn.ReplicateTensorToMesh(device) if self.is_mesh else None
+
         self.q_weight_tt = to_tt_tensor(
             hf_attention.q_proj.weight.T.contiguous(),
             device,
             dtype,
-            layout=ttnn.TILE_LAYOUT
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=qkv_mesh_mapper
         )
         self.k_weight_tt = to_tt_tensor(
             hf_attention.k_proj.weight.T.contiguous(),
             device,
             dtype,
-            layout=ttnn.TILE_LAYOUT
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=qkv_mesh_mapper
         )
         self.v_weight_tt = to_tt_tensor(
             hf_attention.v_proj.weight.T.contiguous(),
             device,
             dtype,
-            layout=ttnn.TILE_LAYOUT
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=qkv_mesh_mapper
         )
         self.o_weight_tt = to_tt_tensor(
             hf_attention.o_proj.weight.T.contiguous(),
             device,
             dtype,
-            layout=ttnn.TILE_LAYOUT
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=o_mesh_mapper
         )
 
     def forward(
@@ -91,11 +112,10 @@ class TTAttentionOptimized:
 
         # OPTIMIZED: Minimize CPU↔TTNN conversions for decode mode
         # For decode (batch=1, q_len=1), attention computation is tiny (~0.01ms)
-        # But each conversion costs ~2ms. So keep attention on CPU, use TTNN only for large projections.
+        # But each conversion costs ~2ms on mesh devices. So keep projections on CPU.
 
         # 1. Q/K/V projections on CPU (avoid wasteful conversion round-trip)
-        # These are small matmuls for decode: [1, 1, 1536] @ [1536, X]
-        # CPU time: ~0.05ms each, TTNN time: ~2ms conversion + 0.001ms compute = worse!
+        # For mesh devices with replicated weights, CPU is faster due to no sync overhead
         query_states = hidden_states @ self.hf_attn.q_proj.weight.T
         key_states = hidden_states @ self.hf_attn.k_proj.weight.T
         value_states = hidden_states @ self.hf_attn.v_proj.weight.T
@@ -137,10 +157,16 @@ class TTAttentionOptimized:
         # 7. Reshape
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
 
-        # 8. O projection with TTNN (this IS worth it - larger output matrix)
-        # [1, 1, 1536] @ [1536, 1536] - reasonable size for TTNN
+        # 8. O projection with TTNN (optimized for single token decode)
         attn_output_tt = to_tt_tensor(attn_output.to(dtype), self.device, self.dtype, layout=ttnn.TILE_LAYOUT)
         output_tt = attn_output_tt @ self.o_weight_tt
+
+        # Deallocate intermediate
+        attn_output_tt.deallocate(True)
+
         output = to_torch_tensor(output_tt, target_shape=(bsz, q_len, self.hidden_size))
+
+        # Deallocate output tensor after conversion
+        output_tt.deallocate(True)
 
         return output, attention_probs

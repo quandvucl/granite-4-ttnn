@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
 from tt_ops.base import to_tt_tensor, to_torch_tensor
+from tt_ops.mamba import init_mamba_cache
 
 
 class HybridKVCacheManager:
@@ -56,7 +57,6 @@ class HybridKVCacheManager:
         for layer_idx in range(self.num_layers):
             if layer_idx in self.attention_layer_indices:
                 # Attention layer - initialize empty K/V cache
-                # Shape: [batch, n_kv_heads, 0, head_dim] (will grow with concat)
                 self.kv_cache[layer_idx] = {
                     "k": None,
                     "v": None,
@@ -64,8 +64,7 @@ class HybridKVCacheManager:
                 }
             else:
                 # Mamba layer - initialize empty state dict (float32 for precision)
-                from tt_ops.mamba import TTMambaLayer
-                self.mamba_states[layer_idx] = TTMambaLayer.init_cache(
+                self.mamba_states[layer_idx] = init_mamba_cache(
                     batch_size=self.batch_size,
                     device='cpu',
                     dtype=torch.bfloat16
@@ -100,7 +99,6 @@ class HybridKVCacheManager:
             cache_entry["length"] = k_new.shape[2] if hasattr(k_new, 'shape') else 1
         else:
             # Concatenate new KV to existing cache along seq dimension (dim=2)
-            # Convert to PyTorch for concatenation
             k_old_torch = to_torch_tensor(cache_entry["k"])
             v_old_torch = to_torch_tensor(cache_entry["v"])
             k_new_torch = to_torch_tensor(k_new)
@@ -109,12 +107,10 @@ class HybridKVCacheManager:
             k_concat = torch.cat([k_old_torch, k_new_torch], dim=2)
             v_concat = torch.cat([v_old_torch, v_new_torch], dim=2)
 
-            # Convert back to TTNN
             cache_entry["k"] = to_tt_tensor(k_concat, self.device, ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
             cache_entry["v"] = to_tt_tensor(v_concat, self.device, ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
             cache_entry["length"] += k_new.shape[2] if hasattr(k_new, 'shape') else 1
 
-            # Check if we've exceeded max cache length
             if cache_entry["length"] > self.max_cache_length:
                 print(f"Warning: Cache length ({cache_entry['length']}) exceeded max ({self.max_cache_length})")
 
@@ -189,7 +185,7 @@ class HybridKVCacheManager:
 
     def get_mamba_cache(self, layer_idx: int) -> Dict[str, torch.Tensor]:
         """
-        Get Mamba cache dict for TTMambaLayer.
+        Get Mamba cache dict for Mamba forward pass.
 
         Args:
             layer_idx: Layer index
@@ -198,9 +194,7 @@ class HybridKVCacheManager:
             Cache dict with 'conv_state' and 'ssm_state'
         """
         if layer_idx not in self.mamba_states:
-            # Initialize if not present
-            from tt_ops.mamba import TTMambaLayer
-            self.mamba_states[layer_idx] = TTMambaLayer.init_cache(
+            self.mamba_states[layer_idx] = init_mamba_cache(
                 batch_size=self.batch_size,
                 device='cpu',
                 dtype=torch.bfloat16
@@ -230,8 +224,7 @@ class HybridKVCacheManager:
                 "length": 0
             }
         else:
-            from tt_ops.mamba import TTMambaLayer
-            self.mamba_states[layer_idx] = TTMambaLayer.init_cache(
+            self.mamba_states[layer_idx] = init_mamba_cache(
                 batch_size=self.batch_size,
                 device='cpu',
                 dtype=torch.bfloat16

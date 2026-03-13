@@ -14,12 +14,17 @@ class TTSharedMLP(TTOperation):
         up = up_proj(x)
         activated = silu(gate) * up
         out = down_proj(activated)
+
+    Supports tensor parallelism when weights are sharded across mesh devices.
     """
 
-    def __init__(self, device, hidden_size: int, intermediate_size: int, dtype=ttnn.bfloat16):
+    def __init__(self, device, hidden_size: int, intermediate_size: int, dtype=ttnn.bfloat16, tensor_parallel: bool = False, tt_ccl=None):
         super().__init__(device, dtype)
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        self.tensor_parallel = tensor_parallel
+        self.is_mesh = hasattr(device, 'get_num_devices')
+        self.tt_ccl = tt_ccl
 
         # Weights (will be loaded separately)
         self.gate_proj_weight = None
@@ -36,9 +41,18 @@ class TTSharedMLP(TTOperation):
         Returns:
             output: [batch, seq, hidden_size]
         """
-        # Convert to PyTorch for full computation
-        # Native TTNN matmul requires manual program config which is complex
-        # For now, use PyTorch for correctness and maintain bfloat16 precision
+        if self.tensor_parallel and self.is_mesh:
+            return self._forward_tensor_parallel(hidden_states)
+        else:
+            return self._forward_replicated(hidden_states)
+
+    def _forward_replicated(self, hidden_states: ttnn.Tensor) -> ttnn.Tensor:
+        """Forward pass with replicated weights (no tensor parallelism)."""
+        # For mesh devices, use on-device computation to avoid CPU conversion overhead
+        if self.is_mesh:
+            return self._forward_on_device(hidden_states)
+
+        # Single device: use PyTorch path (already optimized)
         hidden_states_torch = to_torch_tensor(hidden_states)
         gate_weight_torch = to_torch_tensor(self.gate_proj_weight).T
         up_weight_torch = to_torch_tensor(self.up_proj_weight).T
@@ -61,6 +75,113 @@ class TTSharedMLP(TTOperation):
         output_tt = to_tt_tensor(output, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
 
         return output_tt
+
+    def _forward_on_device(self, hidden_states: ttnn.Tensor) -> ttnn.Tensor:
+        """
+        Forward pass keeping all computation on TTNN device (avoids CPU transfers).
+
+        Optimized for decode mode (single token): minimizes memory operations
+        and uses fused kernels where possible.
+        """
+        # Ensure tile layout for matmuls (required for optimal performance)
+        if hidden_states.layout != ttnn.TILE_LAYOUT:
+            hidden_states = ttnn.to_layout(hidden_states, ttnn.TILE_LAYOUT)
+
+        # Gate and up projections (fused where possible)
+        # These are independent and could be batched, but TTNN handles this internally
+        gate = hidden_states @ self.gate_proj_weight  # [B, S, H] @ [H, I] = [B, S, I]
+        up = hidden_states @ self.up_proj_weight      # [B, S, H] @ [H, I] = [B, S, I]
+
+        # SwiGLU activation: silu(gate) * up
+        # Using fused operation: applies silu to gate and multiplies with up in one kernel
+        activated = ttnn.mul(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
+
+        # Deallocate intermediate tensors to free memory faster
+        gate.deallocate(True)
+        up.deallocate(True)
+
+        # Down projection
+        output = activated @ self.down_proj_weight  # [B, S, I] @ [I, H] = [B, S, H]
+
+        # Deallocate activated tensor
+        activated.deallocate(True)
+
+        return output
+
+    def _forward_tensor_parallel(self, hidden_states: ttnn.Tensor) -> ttnn.Tensor:
+        """
+        Forward pass with tensor parallelism.
+
+        Column parallel for gate_proj and up_proj (weights sharded on dim 1).
+        Row parallel for down_proj (weights sharded on dim 0, followed by all-reduce).
+
+        Input tensors must be replicated across all devices (handled by to_tt_tensor with mesh_mapper).
+        """
+        # Ensure tile layout for matmuls
+        if hidden_states.layout != ttnn.TILE_LAYOUT:
+            hidden_states = ttnn.to_layout(hidden_states, ttnn.TILE_LAYOUT)
+
+        # Column parallel: gate_proj and up_proj
+        # Input replicated, weights sharded column-wise, output sharded
+        gate = hidden_states @ self.gate_proj_weight  # [B, S, H] @ [H, I/N] = [B, S, I/N] on each device
+        up = hidden_states @ self.up_proj_weight      # [B, S, H] @ [H, I/N] = [B, S, I/N] on each device
+
+        # SwiGLU activation: silu(gate) * up
+        activated = ttnn.mul(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
+
+        # Row parallel: down_proj
+        # Input sharded, weights sharded row-wise, output needs all-reduce
+        output_partial = activated @ self.down_proj_weight  # [B, S, I/N] @ [I/N, H] = [B, S, H] partial
+
+        # All-reduce to sum partial results from all devices
+        # Convert shape to tuple for later use (ttnn.Shape -> Python tuple)
+        original_shape = tuple(output_partial.shape)
+
+        # Reshape to [1, 1, seq, hidden] if needed
+        if original_shape[0] != 1 or original_shape[1] != 1:
+            output_partial = ttnn.reshape(
+                output_partial,
+                (1, 1, original_shape[0] * original_shape[1] * original_shape[2], original_shape[3])
+            )
+
+        # All-reduce to sum partial results from all devices
+        # Note: Using CPU fallback due to fabric routing complexity on 4x8 mesh
+        num_devices = self.device.get_num_devices()
+        if num_devices > 1:
+            # CPU fallback: convert to CPU, sum manually, convert back
+            import torch
+
+            # Get shards from all devices and convert to torch
+            shards = ttnn.get_device_tensors(output_partial)
+            torch_shards = [shard.cpu().to_torch() for shard in shards]
+
+            # Sum across devices to get final result
+            # Each device has partial results that need to be summed
+            summed = torch.stack(torch_shards).sum(dim=0)
+
+            # Reshape back to original shape if we reshaped earlier
+            current_shape = tuple(summed.shape)
+            if current_shape != original_shape:
+                summed = summed.view(*original_shape)
+
+            # Convert back to TTNN with replication
+            mesh_mapper = ttnn.ReplicateTensorToMesh(self.device)
+            output = ttnn.from_torch(
+                summed,
+                dtype=self.dtype,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+                mesh_mapper=mesh_mapper
+            )
+        else:
+            output = output_partial
+
+        # Reshape back to original shape if we reshaped earlier
+        output_shape = tuple(output.shape)
+        if output_shape != original_shape:
+            output = ttnn.reshape(output, original_shape)
+
+        return output
 
 
 def split_combined_mlp_weight(combined_weight_tt, device, dtype, hidden_size, intermediate_size):

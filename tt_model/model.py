@@ -12,6 +12,7 @@ from tt_ops.cache import HybridKVCacheManager
 from tt_model.config import TTGraniteConfig
 from tt_model.weight_cache import WeightCache, convert_hf_weights_to_cache
 from tt_model.decoder_layer import TTGraniteDecoderLayer
+from tt_ops.tt_ccl import SimpleTTCCL
 
 
 class TTGraniteMoeHybridForCausalLM:
@@ -45,16 +46,35 @@ class TTGraniteMoeHybridForCausalLM:
         if verbose:
             print("\n=== Initializing TTGraniteMoeHybridForCausalLM ===")
 
-        self.weight_cache = convert_hf_weights_to_cache(
-            hf_model, device, config.get_ttnn_dtype(), verbose=verbose
-        )
+        # For mesh devices, skip weight cache creation (weight distribution not yet implemented)
+        is_mesh = hasattr(device, 'get_num_devices')
+        if is_mesh:
+            if verbose:
+                num_devs = device.get_num_devices()
+                print(f"  Mesh device detected ({num_devs} devices) - using weight sharding with tensor parallelism")
+            self.weight_cache = WeightCache(device, dtype=config.get_ttnn_dtype())  # Empty cache
+            # Initialize TT_CCL for collective operations (all-reduce)
+            self.tt_ccl = SimpleTTCCL(device) if device.get_num_devices() > 1 else None
+        else:
+            self.weight_cache = convert_hf_weights_to_cache(
+                hf_model, device, config.get_ttnn_dtype(), verbose=verbose
+            )
+            self.tt_ccl = None
 
         # Initialize final norm
-        final_norm_weight = self.weight_cache.get("norm.weight")
-        if final_norm_weight is not None:
-            final_norm_weight_torch = final_norm_weight.to_torch()
-        else:
+        # For mesh devices, skip weight cache conversion and use HF weights directly
+        is_mesh = hasattr(device, 'get_num_devices')
+
+        if is_mesh:
+            # Use HF weights directly for mesh (weight distribution not yet implemented)
             final_norm_weight_torch = hf_model.model.norm.weight
+        else:
+            # Single device: use weight cache if available
+            final_norm_weight = self.weight_cache.get("norm.weight")
+            if final_norm_weight is not None:
+                final_norm_weight_torch = final_norm_weight.to_torch()
+            else:
+                final_norm_weight_torch = hf_model.model.norm.weight
 
         self.norm = TTRMSNorm(
             device,
@@ -69,28 +89,85 @@ class TTGraniteMoeHybridForCausalLM:
             is_attention = layer_idx in config.attention_layer_indices
 
             # Create per-layer MLP (LLaMA-style with separate gate/up projections)
+            # Tensor parallelism disabled: all_reduce/reduce_scatter has fabric routing issues
+            # Use replicated weights (simple, correct, but not optimal for 32 devices)
+            use_tensor_parallel = False
             layer_mlp = TTSharedMLP(
                 device,
                 config.hidden_size,
                 config.intermediate_size,
-                config.get_ttnn_dtype()
+                config.get_ttnn_dtype(),
+                tensor_parallel=False,
+                tt_ccl=None
             )
 
-            # Load weights from cache (already transposed and in TILE layout)
-            input_linear_weight = self.weight_cache.get(f"layers.{layer_idx}.shared_mlp.input_linear.weight")
-            output_linear_weight = self.weight_cache.get(f"layers.{layer_idx}.shared_mlp.output_linear.weight")
+            # Load MLP weights
+            if is_mesh:
+                # For mesh devices, shard weights using ShardTensor2dMesh
+                hf_mlp = hf_layer.shared_mlp
+                input_linear_weight_hf = hf_mlp.input_linear.weight  # [intermediate*2, hidden]
+                output_linear_weight_hf = hf_mlp.output_linear.weight  # [hidden, intermediate]
 
-            # Split combined weight into gate_proj and up_proj using helper
-            if input_linear_weight is not None:
-                layer_mlp.gate_proj_weight, layer_mlp.up_proj_weight = split_combined_mlp_weight(
-                    input_linear_weight,
-                    device,
-                    config.get_ttnn_dtype(),
-                    config.hidden_size,
-                    config.intermediate_size
+                # Split combined weight in PyTorch (before converting to TTNN)
+                # Transpose first: [intermediate*2, hidden] -> [hidden, intermediate*2]
+                input_linear_t = input_linear_weight_hf.T  # [hidden, intermediate*2]
+                gate_weight_torch = input_linear_t[:, :config.intermediate_size].contiguous()  # [hidden, intermediate]
+                up_weight_torch = input_linear_t[:, config.intermediate_size:].contiguous()  # [hidden, intermediate]
+                down_weight_torch = output_linear_weight_hf.T  # [intermediate, hidden]
+
+                # Make weights 4D [1, 1, H, W] as required by ShardTensor2dMesh
+                gate_weight_4d = gate_weight_torch.unsqueeze(0).unsqueeze(0)
+                up_weight_4d = up_weight_torch.unsqueeze(0).unsqueeze(0)
+                down_weight_4d = down_weight_torch.unsqueeze(0).unsqueeze(0)
+
+                # Get mesh shape for sharding
+                num_devices = device.get_num_devices()
+                mesh_shape = device.shape
+
+                # Replicate weights across all devices (tensor parallelism disabled)
+                # All devices compute the same thing (redundant but correct and simple)
+                mesh_mapper = ttnn.ReplicateTensorToMesh(device)
+
+                layer_mlp.gate_proj_weight = ttnn.operations.core.as_tensor(
+                    gate_weight_4d,
+                    dtype=config.get_ttnn_dtype(),
+                    device=device,
+                    mesh_mapper=mesh_mapper,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG
                 )
+                layer_mlp.up_proj_weight = ttnn.operations.core.as_tensor(
+                    up_weight_4d,
+                    dtype=config.get_ttnn_dtype(),
+                    device=device,
+                    mesh_mapper=mesh_mapper,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG
+                )
+                layer_mlp.down_proj_weight = ttnn.operations.core.as_tensor(
+                    down_weight_4d,
+                    dtype=config.get_ttnn_dtype(),
+                    device=device,
+                    mesh_mapper=mesh_mapper,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG
+                )
+            else:
+                # Single device: load from cache (already transposed and in TILE layout)
+                input_linear_weight = self.weight_cache.get(f"layers.{layer_idx}.shared_mlp.input_linear.weight")
+                output_linear_weight = self.weight_cache.get(f"layers.{layer_idx}.shared_mlp.output_linear.weight")
 
-            layer_mlp.down_proj_weight = output_linear_weight
+                # Split combined weight into gate_proj and up_proj using helper
+                if input_linear_weight is not None:
+                    layer_mlp.gate_proj_weight, layer_mlp.up_proj_weight = split_combined_mlp_weight(
+                        input_linear_weight,
+                        device,
+                        config.get_ttnn_dtype(),
+                        config.hidden_size,
+                        config.intermediate_size
+                    )
+
+                layer_mlp.down_proj_weight = output_linear_weight
 
             layer = TTGraniteDecoderLayer(
                 device=device,
@@ -101,7 +178,9 @@ class TTGraniteMoeHybridForCausalLM:
                 weight_cache=self.weight_cache,
                 is_attention_layer=is_attention,
                 hf_config=hf_model.config,
-                dtype=config.get_ttnn_dtype()
+                dtype=config.get_ttnn_dtype(),
+                tensor_parallel=use_tensor_parallel,
+                tt_ccl=self.tt_ccl if use_tensor_parallel else None
             )
 
             self.layers.append(layer)
@@ -127,6 +206,10 @@ class TTGraniteMoeHybridForCausalLM:
             print(f"\n✓ Model initialized with {len(self.layers)} layers")
             print(f"  - {len(config.attention_layer_indices)} attention layers on TT")
             print(f"  - {config.num_hidden_layers - len(config.attention_layer_indices)} mamba layers on CPU")
+            if is_mesh and device.get_num_devices() > 1:
+                print(f"  - Mesh device: {device.get_num_devices()} devices")
+                print(f"  - Tensor parallelism: DISABLED (using replicated weights)")
+                print(f"  - All devices compute same result (redundant but correct)")
             self.weight_cache.print_summary()
 
     def forward(
@@ -194,11 +277,22 @@ class TTGraniteMoeHybridForCausalLM:
                 layer_type = "Attention" if layer.is_attention_layer else "Mamba"
                 print(f"    Layer {layer_idx} ({layer_type}): shape={hidden_states.shape}")
 
-        # Final norm (on TT)
+        # Final norm (on TT) - single conversion round-trip
         if DEBUG_SCALE and seq_len > 1:
             print(f"[DEBUG] Before final norm: range=[{hidden_states.min():7.3f}, {hidden_states.max():7.3f}], abs_mean={hidden_states.abs().mean():7.3f}")
 
-        hidden_states_tt = to_tt_tensor(hidden_states, self.device, self.config.get_ttnn_dtype(), layout=ttnn.ROW_MAJOR_LAYOUT)
+        # Mesh mapper for input replication
+        mesh_mapper = None
+        if hasattr(self.device, 'get_num_devices') and self.device.get_num_devices() > 1:
+            mesh_mapper = ttnn.ReplicateTensorToMesh(self.device)
+
+        hidden_states_tt = to_tt_tensor(
+            hidden_states,
+            self.device,
+            self.config.get_ttnn_dtype(),
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=mesh_mapper
+        )
         hidden_states_tt = self.norm(hidden_states_tt)
         hidden_states = to_torch_tensor(hidden_states_tt, target_shape=hidden_states.shape)
 

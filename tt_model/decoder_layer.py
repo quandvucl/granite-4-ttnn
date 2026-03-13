@@ -4,12 +4,19 @@ from typing import Optional, Tuple
 from pathlib import Path
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
+import ttnn
 from tt_ops.base import to_tt_tensor, to_torch_tensor, to_tile_layout
 from tt_ops.attention_tt import TTAttentionOptimized
 from tt_ops.mlp import TTSharedMLP
 from tt_ops.mamba import SimpleMamba2TTNN
 from tt_ops.normalization import TTRMSNorm
 from tt_ops.cache import HybridKVCacheManager
+
+
+def _to_tt_replicated(tensor, device, dtype, layout=ttnn.ROW_MAJOR_LAYOUT):
+    """Convert to TT tensor, replicating across all devices on MeshDevice."""
+    mesh_mapper = ttnn.ReplicateTensorToMesh(device) if hasattr(device, 'get_num_devices') else None
+    return to_tt_tensor(tensor, device, dtype, layout=layout, mesh_mapper=mesh_mapper)
 
 
 class TTGraniteDecoderLayer:
@@ -45,7 +52,9 @@ class TTGraniteDecoderLayer:
         weight_cache,
         is_attention_layer: bool,
         hf_config=None,
-        dtype=ttnn.bfloat16
+        dtype=ttnn.bfloat16,
+        tensor_parallel=False,
+        tt_ccl=None
     ):
         self.device = device
         self.layer_idx = layer_idx
@@ -55,33 +64,51 @@ class TTGraniteDecoderLayer:
         self.shared_mlp = shared_mlp
         self.is_attention_layer = is_attention_layer
         self.dtype = dtype
+        self.tensor_parallel = tensor_parallel
+        self.tt_ccl = tt_ccl
 
         # Residual multiplier (0.22 for granite-1b)
         self.residual_multiplier = config.residual_multiplier if hasattr(config, 'residual_multiplier') else 1.0
 
+        # Detect mesh device
+        self.is_mesh = hasattr(device, 'get_num_devices') and device.get_num_devices() > 1
+
         # Layer norms
-        input_norm_weight = weight_cache.get(f"layers.{layer_idx}.input_layernorm.weight")
-        post_attn_norm_weight = weight_cache.get(f"layers.{layer_idx}.post_attention_layernorm.weight")
+        # For mesh devices, skip weight cache and use HF weights directly
+        is_mesh = self.is_mesh
 
-        if input_norm_weight is not None and post_attn_norm_weight is not None:
-            # Convert to torch first
-            input_norm_weight_torch = input_norm_weight.to_torch()
-            post_attn_norm_weight_torch = post_attn_norm_weight.to_torch()
-
-            self.input_layernorm = TTRMSNorm(device, input_norm_weight_torch, eps=config.rms_norm_eps, dtype=dtype)
-            self.post_attention_layernorm = TTRMSNorm(device, post_attn_norm_weight_torch, eps=config.rms_norm_eps, dtype=dtype)
-        else:
-            # Fallback: load directly from HF layer
+        if is_mesh:
+            # Use HF weights directly for mesh (weight distribution not yet implemented)
             self.input_layernorm = TTRMSNorm(device, hf_layer.input_layernorm.weight, eps=config.rms_norm_eps, dtype=dtype)
             self.post_attention_layernorm = TTRMSNorm(device, hf_layer.post_attention_layernorm.weight, eps=config.rms_norm_eps, dtype=dtype)
+        else:
+            # Single device: try weight cache first
+            input_norm_weight = weight_cache.get(f"layers.{layer_idx}.input_layernorm.weight")
+            post_attn_norm_weight = weight_cache.get(f"layers.{layer_idx}.post_attention_layernorm.weight")
+
+            if input_norm_weight is not None and post_attn_norm_weight is not None:
+                # Convert to torch first
+                input_norm_weight_torch = input_norm_weight.to_torch()
+                post_attn_norm_weight_torch = post_attn_norm_weight.to_torch()
+
+                self.input_layernorm = TTRMSNorm(device, input_norm_weight_torch, eps=config.rms_norm_eps, dtype=dtype)
+                self.post_attention_layernorm = TTRMSNorm(device, post_attn_norm_weight_torch, eps=config.rms_norm_eps, dtype=dtype)
+            else:
+                # Fallback: load directly from HF layer
+                self.input_layernorm = TTRMSNorm(device, hf_layer.input_layernorm.weight, eps=config.rms_norm_eps, dtype=dtype)
+                self.post_attention_layernorm = TTRMSNorm(device, hf_layer.post_attention_layernorm.weight, eps=config.rms_norm_eps, dtype=dtype)
 
         # Attention or Mamba
         if is_attention_layer:
             # Use TT-optimized attention with HF core
+            # Tensor parallelism disabled for attention due to complexity with Q/K/V gathering
+            # (MLP tensor parallelism alone provides most of the speedup)
             self.attention_optimized = TTAttentionOptimized(
                 hf_attention=hf_layer.self_attn,
                 device=device,
-                dtype=dtype
+                dtype=dtype,
+                tensor_parallel=False,  # Disable TP for attention
+                tt_ccl=None
             )
             self.attention = None
             self.mamba = None
@@ -149,17 +176,29 @@ class TTGraniteDecoderLayer:
                 use_cache=True
             )
 
-            # Residual connection with multiplier
+            # Residual connection with multiplier (keep on CPU)
             hidden_states = residual + attn_output * self.residual_multiplier
 
-            # Pre-MLP norm (use TT RMSNorm)
+            # Pre-MLP norm and MLP (optimized: minimize conversions and deallocate promptly)
             residual = hidden_states
-            hidden_states_tt = to_tt_tensor(hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+            # Single conversion to TT device
+            hidden_states_tt = _to_tt_replicated(hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+            # Norm (outputs ROW_MAJOR)
             hidden_states_tt = self.post_attention_layernorm(hidden_states_tt)
 
-            # MLP (shared) - on TT hardware
+            # MLP (converts to TILE internally, outputs TILE)
             mlp_output_tt = self.shared_mlp.forward(hidden_states_tt)
+
+            # Deallocate intermediate tensor
+            hidden_states_tt.deallocate(True)
+
+            # Single conversion back to CPU for residual
             mlp_output = to_torch_tensor(mlp_output_tt, target_shape=(batch_size, seq_len, hidden_size))
+
+            # Deallocate TT tensor
+            mlp_output_tt.deallocate(True)
 
             # Residual connection with multiplier
             hidden_states = residual + mlp_output * self.residual_multiplier
@@ -171,7 +210,7 @@ class TTGraniteDecoderLayer:
             if hidden_states.ndim != 3:
                 hidden_states = hidden_states.view(batch_size, seq_len, hidden_size)
 
-            # Pre-mamba norm (use TT RMSNorm)
+            # Pre-mamba norm (use TT for consistency)
             residual = hidden_states
             hidden_states_tt = to_tt_tensor(hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
             hidden_states_tt = self.input_layernorm(hidden_states_tt)
@@ -209,17 +248,29 @@ class TTGraniteDecoderLayer:
             else:
                 raise ValueError(f"Layer {self.layer_idx} does not have mamba attribute")
 
-            # Residual connection with multiplier
+            # Residual connection with multiplier (keep on CPU)
             hidden_states = residual + hidden_states * self.residual_multiplier
 
-            # Pre-MLP norm (use TT RMSNorm)
+            # Pre-MLP norm and MLP (optimized: minimize conversions and deallocate promptly)
             residual = hidden_states
-            hidden_states_tt = to_tt_tensor(hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+            # Single conversion to TT device
+            hidden_states_tt = _to_tt_replicated(hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+            # Norm (outputs ROW_MAJOR)
             hidden_states_tt = self.post_attention_layernorm(hidden_states_tt)
 
-            # MLP (shared) - on TT hardware
+            # MLP (converts to TILE internally, outputs TILE)
             mlp_output_tt = self.shared_mlp.forward(hidden_states_tt)
+
+            # Deallocate intermediate tensor
+            hidden_states_tt.deallocate(True)
+
+            # Single conversion back to CPU for residual
             mlp_output = to_torch_tensor(mlp_output_tt, target_shape=(batch_size, seq_len, hidden_size))
+
+            # Deallocate TT tensor
+            mlp_output_tt.deallocate(True)
 
             # Residual connection with multiplier
             hidden_states = residual + mlp_output * self.residual_multiplier

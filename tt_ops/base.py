@@ -24,7 +24,8 @@ def to_tt_tensor(
     torch_tensor: torch.Tensor,
     device,
     dtype=ttnn.bfloat16,
-    layout=ttnn.ROW_MAJOR_LAYOUT
+    layout=ttnn.ROW_MAJOR_LAYOUT,
+    mesh_mapper=None
 ) -> ttnn.Tensor:
     """
     Convert PyTorch tensor to TTNN tensor.
@@ -34,6 +35,7 @@ def to_tt_tensor(
         device: TTNN device
         dtype: Target dtype (default: bfloat16)
         layout: Target layout (default: ROW_MAJOR_LAYOUT for transfers)
+        mesh_mapper: Optional mesh mapper for sharding/replication across devices
 
     Returns:
         TTNN tensor
@@ -41,6 +43,9 @@ def to_tt_tensor(
     Note:
         Always use ROW_MAJOR_LAYOUT for CPU→TT transfers to prevent
         tile padding corruption. Convert to TILE_LAYOUT for computation.
+        For mesh tensors:
+        - Use mesh_mapper for explicit sharding/replication strategy
+        - If no mesh_mapper provided on mesh device, auto-replicate
     """
     if torch_tensor is None:
         return None
@@ -49,13 +54,37 @@ def to_tt_tensor(
     if not torch_tensor.is_contiguous():
         torch_tensor = torch_tensor.contiguous()
 
-    # Use ttnn.Tensor constructor (overload #8) which accepts torch tensors
-    tt_tensor = ttnn.Tensor(
-        torch_tensor,
-        data_type=dtype,
-        device=device,
-        layout=layout
-    )
+    # Check if device is a mesh
+    is_mesh = hasattr(device, 'get_num_devices') and device.get_num_devices() > 1
+
+    if mesh_mapper is not None:
+        # Explicit mesh mapper provided: use from_torch with mesh_mapper
+        tt_tensor = ttnn.from_torch(
+            torch_tensor,
+            dtype=dtype,
+            layout=layout,
+            device=device,
+            mesh_mapper=mesh_mapper
+        )
+    elif is_mesh:
+        # Mesh device with no explicit mapper: auto-replicate for safety
+        # (Most operations need replicated inputs when weights are sharded)
+        auto_mapper = ttnn.ReplicateTensorToMesh(device)
+        tt_tensor = ttnn.from_torch(
+            torch_tensor,
+            dtype=dtype,
+            layout=layout,
+            device=device,
+            mesh_mapper=auto_mapper
+        )
+    else:
+        # Standard single-device tensor
+        tt_tensor = ttnn.Tensor(
+            torch_tensor,
+            data_type=dtype,
+            device=device,
+            layout=layout
+        )
 
     return tt_tensor
 
@@ -77,12 +106,19 @@ def to_torch_tensor(
     Note:
         TILE_LAYOUT may add padding, so always force reshape to
         expected shape after conversion.
+        For mesh tensors, extracts first shard.
     """
     if tt_tensor is None:
         return None
 
-    # Use the tensor's to_torch() method
-    torch_tensor = tt_tensor.to_torch()
+    # Check if this is a mesh tensor
+    device = tt_tensor.device()
+    if hasattr(device, 'get_num_devices') and device.get_num_devices() > 1:
+        # All weights are replicated so all shards are identical — take first
+        shards = ttnn.get_device_tensors(tt_tensor)
+        torch_tensor = shards[0].cpu().to_torch()
+    else:
+        torch_tensor = tt_tensor.cpu().to_torch()
 
     # Force reshape to expected shape to undo padding
     if target_shape is not None:
@@ -104,7 +140,7 @@ def to_tile_layout(tt_tensor: ttnn.Tensor) -> ttnn.Tensor:
     if tt_tensor is None:
         return None
 
-    return tt_tensor.to(ttnn.TILE_LAYOUT)
+    return ttnn.to_layout(tt_tensor, ttnn.TILE_LAYOUT)
 
 
 def to_row_major_layout(tt_tensor: ttnn.Tensor) -> ttnn.Tensor:
@@ -120,7 +156,7 @@ def to_row_major_layout(tt_tensor: ttnn.Tensor) -> ttnn.Tensor:
     if tt_tensor is None:
         return None
 
-    return tt_tensor.to(ttnn.ROW_MAJOR_LAYOUT)
+    return ttnn.to_layout(tt_tensor, ttnn.ROW_MAJOR_LAYOUT)
 
 
 def validate_shape(
