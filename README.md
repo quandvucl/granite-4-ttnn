@@ -23,10 +23,6 @@ Educational implementation of IBM's Granite 4.0 MoE Hybrid model on Tenstorrent'
 ```
 tt-granite/
 ├── README.md                      # This file
-├── OPTIMIZATION_SUMMARY.md        # Detailed performance analysis
-├── FUSION_OPPORTUNITIES.md        # Python vs C++ optimization guide
-├── KERNEL_DEVELOPMENT_PLAN.md     # C++ kernel implementation roadmap
-│
 ├── generate.py                    # Main test script (working)
 │
 ├── tt_model/                      # Model implementation
