@@ -117,6 +117,10 @@ class TTSharedMLP(TTOperation):
 
         Input tensors must be replicated across all devices (handled by to_tt_tensor with mesh_mapper).
         """
+        DEBUG_TP = False  # Set to True to see if TP is being used
+        if DEBUG_TP:
+            print(f"[MLP TP] Using tensor parallel path with {self.device.get_num_devices()} devices")
+
         # Ensure tile layout for matmuls
         if hidden_states.layout != ttnn.TILE_LAYOUT:
             hidden_states = ttnn.to_layout(hidden_states, ttnn.TILE_LAYOUT)
@@ -145,26 +149,25 @@ class TTSharedMLP(TTOperation):
             )
 
         # All-reduce to sum partial results from all devices
-        # Note: Using CPU fallback due to fabric routing complexity on 4x8 mesh
+        # Manual CPU reduction since native all_reduce doesn't work on this mesh
+        # Optimized: minimize copies and use efficient torch operations
         num_devices = self.device.get_num_devices()
         if num_devices > 1:
-            # CPU fallback: convert to CPU, sum manually, convert back
             import torch
 
-            # Get shards from all devices and convert to torch
+            # Get shards from all devices (each has partial result from row-parallel matmul)
             shards = ttnn.get_device_tensors(output_partial)
-            torch_shards = [shard.cpu().to_torch() for shard in shards]
 
-            # Sum across devices to get final result
-            # Each device has partial results that need to be summed
-            summed = torch.stack(torch_shards).sum(dim=0)
+            # Fast path: convert first shard, then add remaining shards
+            summed = shards[0].cpu().to_torch().clone()
+            for i in range(1, len(shards)):
+                summed.add_(shards[i].cpu().to_torch())
 
-            # Reshape back to original shape if we reshaped earlier
-            current_shape = tuple(summed.shape)
-            if current_shape != original_shape:
-                summed = summed.view(*original_shape)
+            # Trim padding if needed (TILE_LAYOUT adds padding)
+            if tuple(summed.shape) != original_shape:
+                summed = summed.reshape(original_shape)
 
-            # Convert back to TTNN with replication
+            # Convert back to TTNN and replicate across all devices
             mesh_mapper = ttnn.ReplicateTensorToMesh(self.device)
             output = ttnn.from_torch(
                 summed,

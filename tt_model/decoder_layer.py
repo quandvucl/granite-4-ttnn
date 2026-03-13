@@ -113,13 +113,25 @@ class TTGraniteDecoderLayer:
             self.attention = None
             self.mamba = None
         else:
-            # Mamba layer - use SimpleMamba2TTNN (TTNN-ready wrapper)
+            # Mamba layer - use optimized version for decode acceleration
+            from tt_ops.mamba_optimized import MambaDecodeOptimized
+
             self.attention = None
-            self.mamba = SimpleMamba2TTNN(
-                hf_mamba=hf_layer.mamba,
-                device=device,
-                dtype=dtype
-            ) if hasattr(hf_layer, 'mamba') else None
+            if hasattr(hf_layer, 'mamba'):
+                # Use both original (for prefill) and optimized (for decode)
+                self.mamba = SimpleMamba2TTNN(
+                    hf_mamba=hf_layer.mamba,
+                    device=device,
+                    dtype=dtype
+                )
+                self.mamba_optimized = MambaDecodeOptimized(
+                    hf_mamba=hf_layer.mamba,
+                    device=device,
+                    dtype=dtype
+                )
+            else:
+                self.mamba = None
+                self.mamba_optimized = None
 
     def forward(
         self,
@@ -216,7 +228,7 @@ class TTGraniteDecoderLayer:
             hidden_states_tt = self.input_layernorm(hidden_states_tt)
             hidden_states = to_torch_tensor(hidden_states_tt, target_shape=(batch_size, seq_len, hidden_size))
 
-            # Use SimpleMamba2TTNN (TTNN-ready wrapper)
+            # Use optimized Mamba for decode, original for prefill
             if self.mamba is not None:
                 # Initialize cache on first use
                 if not hasattr(cache_manager, 'hybrid_cache'):
@@ -231,6 +243,7 @@ class TTGraniteDecoderLayer:
                 # Determine if we're in prefill (start_pos == 0) or decode (start_pos > 0)
                 start_pos = position_ids[0, 0].item()
                 is_prefill = (start_pos == 0)
+                is_decode = (seq_len == 1 and start_pos > 0)
 
                 # Set has_previous_state based on whether we're in prefill or decode
                 cache_manager.hybrid_cache.has_previous_state = not is_prefill
@@ -238,13 +251,32 @@ class TTGraniteDecoderLayer:
                 # Calculate cache_position based on current position
                 cache_position = torch.arange(start_pos, start_pos + seq_len, device=hidden_states.device)
 
-                # Run SimpleMamba2TTNN (uses HF core with TTNN-ready weights)
-                hidden_states = self.mamba.forward(
-                    hidden_states,
-                    cache_params=cache_manager.hybrid_cache,
-                    cache_position=cache_position,
-                    attention_mask=None
-                )
+                # Use optimized path for decode, original for prefill
+                if is_decode and self.mamba_optimized is not None:
+                    # OPTIMIZED DECODE PATH 🚀
+                    hidden_states_opt = self.mamba_optimized.forward_decode(
+                        hidden_states,
+                        cache_params=cache_manager.hybrid_cache,
+                        cache_position=cache_position
+                    )
+                    # If optimized returns None, fall back to original
+                    if hidden_states_opt is not None:
+                        hidden_states = hidden_states_opt
+                    else:
+                        hidden_states = self.mamba.forward(
+                            hidden_states,
+                            cache_params=cache_manager.hybrid_cache,
+                            cache_position=cache_position,
+                            attention_mask=None
+                        )
+                else:
+                    # Original path for prefill or if optimized not available
+                    hidden_states = self.mamba.forward(
+                        hidden_states,
+                        cache_params=cache_manager.hybrid_cache,
+                        cache_position=cache_position,
+                        attention_mask=None
+                    )
             else:
                 raise ValueError(f"Layer {self.layer_idx} does not have mamba attribute")
 
