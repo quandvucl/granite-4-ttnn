@@ -4,17 +4,25 @@ TT-Granite text generation script.
 
 Usage:
     # Single prompt
-    python generate.py --model hf                          # Run HuggingFace model
-    python generate.py --model tt                          # Run TT-optimized model
-    python generate.py --compare                           # Run both and compare
+    python generate.py --model hf                          # Run HuggingFace model (CPU)
+    python generate.py --model tt                          # Run TT-optimized model (all devices)
+    python generate.py --model a100                        # Run on NVIDIA A100 GPU
+    python generate.py --compare                           # Run both HF and TT and compare
+
+    # Multi-device (TT model can use multiple devices with tensor parallelism)
+    python generate.py --model tt                          # Uses 1 device (default)
+    python generate.py --model tt --num-devices 8          # Use 8 devices
+    python generate.py --model tt --num-devices 32         # Use all 32 devices
 
     # Batch processing
     python generate.py --compare --batch-size 4            # Compare with batch size 4
     python generate.py --compare --batch-size 8 --max-tokens 20
+    python generate.py --model a100 --batch-size 8         # A100 with batch size 8
 
     # Custom prompts
     python generate.py --compare --prompt "Once upon a time"
-    python generate.py --compare --prompts "Hello" "How are you?" "What is AI?" --batch-size 3
+    python generate.py --prompts "Hello" "How are you?" "What is AI?" --batch-size 3
+    python generate.py --model a100 --prompt "Explain quantum computing"
 """
 
 import argparse
@@ -85,11 +93,106 @@ def generate_hf(prompts, max_tokens=10, batch_size=1):
     return texts, all_ids, elapsed_time
 
 
+def generate_a100(prompts, max_tokens=10, batch_size=1):
+    """Generate text with NVIDIA A100 GPU."""
+    print("\n" + "="*70)
+    print("NVIDIA A100 GPU")
+    print("="*70)
+
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    if len(prompts) < batch_size:
+        prompts = (prompts * batch_size)[:batch_size]
+
+    # Check CUDA availability
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. A100 mode requires GPU.")
+
+    device = torch.device("cuda:0")
+    print(f"\nGPU: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA Version: {torch.version.cuda}")
+    print(f"Initial GPU Memory: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+
+    tokenizer = AutoTokenizer.from_pretrained('ibm-granite/granite-4.0-h-1b')
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print("\nLoading model to GPU...")
+    load_start = time.time()
+    model = AutoModelForCausalLM.from_pretrained(
+        'ibm-granite/granite-4.0-h-1b',
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        device_map="auto"  # Automatically map to available GPU
+    )
+    load_time = time.time() - load_start
+    print(f"Model loaded in {load_time:.2f}s")
+    print(f"GPU Memory After Load: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    print(f"\nBatch size: {batch_size}")
+    print(f"Prompts: {len(prompts)}")
+    print(f"Prompt: \"{prompts[0]}\"")
+    print(f"Generating {max_tokens} tokens per prompt...")
+
+    # Warmup run (compile CUDA kernels)
+    print("Warming up GPU kernels...", end=" ", flush=True)
+    with torch.no_grad():
+        _ = model.generate(
+            **inputs,
+            max_new_tokens=2,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    torch.cuda.synchronize()
+    print("done")
+
+    # Timed generation
+    torch.cuda.synchronize()
+    start_time = time.time()
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    torch.cuda.synchronize()
+    elapsed_time = time.time() - start_time
+
+    texts = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
+    all_ids = [output.tolist() for output in outputs]
+
+    total_tokens_generated = sum(
+        len(output) - len(inputs['input_ids'][i])
+        for i, output in enumerate(outputs)
+    )
+    tokens_per_sec = total_tokens_generated / elapsed_time if elapsed_time > 0 else 0
+
+    print(f"\nOutput (first sample):\n{texts[0]}")
+    if batch_size > 1:
+        print(f"\n... ({batch_size - 1} more samples)")
+
+    print(f"\nPerformance:")
+    print(f"  Total time:  {elapsed_time:.3f}s")
+    print(f"    - Load:    {load_time:.3f}s")
+    print(f"    - Generate:{elapsed_time:.3f}s")
+    print(f"  Total tokens: {total_tokens_generated}")
+    print(f"  Throughput:  {tokens_per_sec:.2f} tokens/sec")
+    print(f"  Per-sample:  {tokens_per_sec/batch_size:.2f} tokens/sec")
+    print(f"  Peak GPU Memory: {torch.cuda.max_memory_allocated(0) / 1024**3:.2f} GB")
+    print("\n" + "="*70)
+
+    return texts, all_ids, elapsed_time
+
+
 # Full system mesh shape — must match physical topology (32 cards = 4x8)
 _SYSTEM_MESH_SHAPE = ttnn.MeshShape(4, 8)
 _SYSTEM_NUM_DEVICES = 32
 
-def _open_device(num_devices: int):
+def _open_device(num_devices: int = 1):
     """
     Open TT device(s).
 
@@ -98,7 +201,11 @@ def _open_device(num_devices: int):
     directly is not supported when fabric is active.
 
     For single device, open just a 1x1 mesh (no fabric needed).
+
+    Args:
+        num_devices: Number of devices to use. Defaults to 1.
     """
+
     mesh_shape_map = {
         1:  ttnn.MeshShape(1, 1),
         2:  ttnn.MeshShape(1, 2),
@@ -120,6 +227,7 @@ def _open_device(num_devices: int):
         print(f"Opened full system mesh ({_SYSTEM_MESH_SHAPE})")
         if num_devices == _SYSTEM_NUM_DEVICES:
             # Using all devices — no submesh needed
+            print(f"Using all {num_devices} devices with tensor parallelism")
             return full_mesh, full_mesh
         else:
             # Create submesh of desired size
@@ -330,13 +438,14 @@ def compare(prompts, max_tokens=10, batch_size=1, num_devices=1):
 
 def main():
     parser = argparse.ArgumentParser(description="TT-Granite text generation")
-    parser.add_argument('--model', choices=['hf', 'tt'])
+    parser.add_argument('--model', choices=['hf', 'tt', 'a100'])
     parser.add_argument('--compare', action='store_true')
     parser.add_argument('--prompt', type=str, default='The future of AI is')
     parser.add_argument('--prompts', type=str, nargs='+')
     parser.add_argument('--max-tokens', type=int, default=10)
     parser.add_argument('--batch-size', type=int, default=1)
-    parser.add_argument('--num-devices', type=int, default=1)
+    parser.add_argument('--num-devices', type=int, default=1,
+                        help='Number of TT devices to use (default: 1)')
 
     args = parser.parse_args()
 
@@ -351,6 +460,8 @@ def main():
         generate_hf(prompts, args.max_tokens, args.batch_size)
     elif args.model == 'tt':
         generate_tt(prompts, args.max_tokens, args.batch_size, args.num_devices)
+    elif args.model == 'a100':
+        generate_a100(prompts, args.max_tokens, args.batch_size)
 
 
 if __name__ == "__main__":
