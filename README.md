@@ -168,8 +168,3 @@ This section documents optimization approaches that were explored but didn't yie
 - Each Mamba block maintains SSM state (d_state=16, d_model=1536)
 - Attention blocks require KV cache storage
 - During prefill, intermediate activations for full sequence don't fit in L1
-
-**What fits:** Individual weight matrices, small intermediate buffers
-**What doesn't fit:** Full KV cache for long sequences, prefill activations for batch>1
-
-**Decision:** Use DRAM as primary storage with strategic L1 caching for hot paths (decode phase single-token operations). Prefill phase uses DRAM buffering.
