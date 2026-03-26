@@ -1,39 +1,14 @@
-"""
-TTNN implementation of Mamba layer (Selective State Space Model).
+"""Mamba layer for multi-token prefill processing."""
 
-This implementation focuses on the decode path (single token with cached states)
-which is critical for generation performance. Complex operations use CPU fallback
-where TTNN doesn't have native support.
-
-Architecture:
-    Input [batch, seq_len, hidden_size] -> Mamba -> Output [batch, seq_len, hidden_size]
-
-Components:
-    1. Linear projection (in_proj): Expand and split to gate/hidden/dt
-    2. Conv1d: Temporal convolution (cached for decode)
-    3. Selective SSM: State space model with input-dependent transitions
-    4. Gated normalization: Special RMSNorm with gating
-    5. Output projection: Project back to hidden_size
-
-Performance:
-    - Native TT operations: @, *, +, element-wise ops
-    - CPU fallback: softplus, clamp, reshape, permute (minimal overhead in decode)
-    - Expected speedup: 5-10x vs pure CPU Mamba
-
-Multi-device notes:
-    - Input tensors are replicated across all devices via ReplicateTensorToMesh
-    - Weights are replicated at load time
-    - Output tensors are gathered back via ConcatMeshToTensor on dim=0
-    - SSM state operations remain on CPU (tiny matrices, not worth device transfer overhead)
-"""
+from typing import Optional
 
 import torch
 import ttnn
-from typing import Optional, Tuple
-from tt_ops.base import TTOperation, to_tt_tensor, to_torch_tensor, tt_linear
+
+from tt_ops.base import to_torch_tensor, to_tt_tensor
 
 
-def init_mamba_cache(batch_size: int, device='cpu', dtype=torch.bfloat16) -> dict:
+def init_mamba_cache(batch_size: int, device="cpu", dtype=torch.bfloat16) -> dict:
     """
     Initialize conv and SSM caches for Mamba decode mode.
 
@@ -49,14 +24,18 @@ def init_mamba_cache(batch_size: int, device='cpu', dtype=torch.bfloat16) -> dic
         Dict with 'conv_state' [batch, 3328, 4] and 'ssm_state' [batch, 48, 64, 128]
     """
     return {
-        'conv_state': torch.zeros(batch_size, 3328, 4, device=device, dtype=torch.float32),
-        'ssm_state':  torch.zeros(batch_size, 48, 64, 128, device=device, dtype=torch.float32),
+        "conv_state": torch.zeros(
+            batch_size, 3328, 4, device=device, dtype=torch.float32
+        ),
+        "ssm_state": torch.zeros(
+            batch_size, 48, 64, 128, device=device, dtype=torch.float32
+        ),
     }
 
 
 def _is_mesh_device(device) -> bool:
     """Check if device is a MeshDevice (multi-card)."""
-    return hasattr(device, 'get_num_devices')
+    return hasattr(device, "get_num_devices")
 
 
 def _make_mesh_mapper(device):
@@ -73,8 +52,7 @@ def _to_tt(tensor: torch.Tensor, device, dtype, layout=ttnn.TILE_LAYOUT) -> ttnn
     are not sharded (SSM state parallelism is not implemented here).
     """
     return to_tt_tensor(
-        tensor, device, dtype, layout=layout,
-        mesh_mapper=_make_mesh_mapper(device)
+        tensor, device, dtype, layout=layout, mesh_mapper=_make_mesh_mapper(device)
     )
 
 
@@ -124,14 +102,18 @@ class SimpleMamba2TTNN:
         # Pre-load TTNN weights (transposed for matmul), replicated across all devices
         self.in_proj_weight_tt = to_tt_tensor(
             hf_mamba.in_proj.weight.T.contiguous(),
-            device, dtype, layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=mesh_mapper
+            device,
+            dtype,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=mesh_mapper,
         )
 
         self.out_proj_weight_tt = to_tt_tensor(
             hf_mamba.out_proj.weight.T.contiguous(),
-            device, dtype, layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=mesh_mapper
+            device,
+            dtype,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=mesh_mapper,
         )
 
     def forward(
@@ -139,7 +121,7 @@ class SimpleMamba2TTNN:
         hidden_states: torch.Tensor,
         cache_params,
         cache_position: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward with TTNN-optimized projections + CPU SSM core.
@@ -180,7 +162,7 @@ class SimpleMamba2TTNN:
                 hidden_states,
                 cache_params=cache_params,
                 cache_position=cache_position,
-                attention_mask=attention_mask
+                attention_mask=attention_mask,
             )
 
         # ===================================================================
@@ -190,14 +172,17 @@ class SimpleMamba2TTNN:
 
         # 1. Input projection with TTNN (optimized: prompt deallocation)
         #    [batch, 1, hidden_size] -> [batch, 1, in_proj_out_size]
-        hidden_tt = _to_tt(hidden_states, self.device, self.dtype, layout=ttnn.TILE_LAYOUT)
+        hidden_tt = _to_tt(
+            hidden_states, self.device, self.dtype, layout=ttnn.TILE_LAYOUT
+        )
         projected_tt = hidden_tt @ self.in_proj_weight_tt
 
         # Deallocate input tensor
         hidden_tt.deallocate(True)
 
-        projected = _to_torch(projected_tt, self.device,
-                              target_shape=(batch_size, seq_len, -1))
+        projected = _to_torch(
+            projected_tt, self.device, target_shape=(batch_size, seq_len, -1)
+        )
 
         # Deallocate intermediate
         projected_tt.deallocate(True)
@@ -207,9 +192,9 @@ class SimpleMamba2TTNN:
             [
                 self.hf_mamba.intermediate_size,
                 self.hf_mamba.conv_dim,
-                self.hf_mamba.num_heads
+                self.hf_mamba.num_heads,
             ],
-            dim=-1
+            dim=-1,
         )
 
         # 2. Conv1d with cached states (optimized: single assignment)
@@ -234,9 +219,9 @@ class SimpleMamba2TTNN:
             [
                 self.hf_mamba.intermediate_size,
                 self.hf_mamba.n_groups * self.hf_mamba.ssm_state_size,
-                self.hf_mamba.n_groups * self.hf_mamba.ssm_state_size
+                self.hf_mamba.n_groups * self.hf_mamba.ssm_state_size,
             ],
-            dim=-1
+            dim=-1,
         )
 
         # 3. SSM transformation — kept on CPU intentionally
@@ -259,11 +244,19 @@ class SimpleMamba2TTNN:
             self.hf_mamba.dt_bias.shape[0], self.hf_mamba.head_dim
         )
         dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
-        dt = torch.clamp(dt, self.hf_mamba.time_step_limit[0], self.hf_mamba.time_step_limit[1])
+        dt = torch.clamp(
+            dt, self.hf_mamba.time_step_limit[0], self.hf_mamba.time_step_limit[1]
+        )
 
-        A = A[..., None, None].expand(
-            self.hf_mamba.num_heads, self.hf_mamba.head_dim, self.hf_mamba.ssm_state_size
-        ).to(dtype=torch.float32)
+        A = (
+            A[..., None, None]
+            .expand(
+                self.hf_mamba.num_heads,
+                self.hf_mamba.head_dim,
+                self.hf_mamba.ssm_state_size,
+            )
+            .to(dtype=torch.float32)
+        )
         dA = torch.exp(dt[..., None] * A).to(device=cache_device)
 
         B = B.reshape(batch_size, self.hf_mamba.n_groups, -1)[..., None, :]
@@ -271,7 +264,7 @@ class SimpleMamba2TTNN:
             batch_size,
             self.hf_mamba.n_groups,
             self.hf_mamba.num_heads // self.hf_mamba.n_groups,
-            B.shape[-1]
+            B.shape[-1],
         ).contiguous()
         B = B.reshape(batch_size, -1, B.shape[-1])
         dB = dt[..., None] * B[..., None, :]
@@ -290,25 +283,27 @@ class SimpleMamba2TTNN:
             batch_size,
             self.hf_mamba.n_groups,
             self.hf_mamba.num_heads // self.hf_mamba.n_groups,
-            C.shape[-1]
+            C.shape[-1],
         ).contiguous()
         C = C.reshape(batch_size, -1, C.shape[-1])
 
-        ssm_states = cache_params.ssm_states[self.layer_idx].to(device=C.device, dtype=C.dtype)
+        ssm_states = cache_params.ssm_states[self.layer_idx].to(
+            device=C.device, dtype=C.dtype
+        )
         ssm_states_reshaped = ssm_states.view(
             batch_size * self.hf_mamba.num_heads,
             self.hf_mamba.head_dim,
-            self.hf_mamba.ssm_state_size
+            self.hf_mamba.ssm_state_size,
         )
         C_reshaped = C.view(
-            batch_size * self.hf_mamba.num_heads,
-            self.hf_mamba.ssm_state_size,
-            1
+            batch_size * self.hf_mamba.num_heads, self.hf_mamba.ssm_state_size, 1
         )
         y = torch.bmm(ssm_states_reshaped, C_reshaped)
         y = y.view(batch_size, self.hf_mamba.num_heads, self.hf_mamba.head_dim)
 
-        D = self.hf_mamba.D[..., None].expand(self.hf_mamba.D.shape[0], self.hf_mamba.head_dim)
+        D = self.hf_mamba.D[..., None].expand(
+            self.hf_mamba.D.shape[0], self.hf_mamba.head_dim
+        )
         y = (y + hidden_states_inner * D).to(y.dtype)
 
         y = y.reshape(batch_size, -1)[:, None, ...]
@@ -326,8 +321,7 @@ class SimpleMamba2TTNN:
         scan_output_tt.deallocate(True)
 
         output = _to_torch(
-            output_tt, self.device,
-            target_shape=(batch_size, seq_len, self.hidden_size)
+            output_tt, self.device, target_shape=(batch_size, seq_len, self.hidden_size)
         )
 
         # Deallocate output tensor

@@ -1,11 +1,15 @@
-import ttnn
-import torch
-from typing import List, Optional, Tuple, Dict, Any
-from pathlib import Path
+"""Hybrid KV cache manager for attention and Mamba layers."""
+
 import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import ttnn
+
 sys.path.append(str(Path(__file__).parent.parent))
-from tt_ops.base import to_tt_tensor, to_torch_tensor
-from tt_ops.mamba import init_mamba_cache
+from tt_ops.base import to_torch_tensor, to_tt_tensor
+from tt_ops.mamba_prefill import init_mamba_cache
 
 
 class HybridKVCacheManager:
@@ -26,7 +30,7 @@ class HybridKVCacheManager:
         max_cache_length: int = 2048,
         batch_size: int = 1,
         attention_layer_indices: Optional[List[int]] = None,
-        dtype=ttnn.bfloat16
+        dtype=ttnn.bfloat16,
     ):
         self.device = device
         self.num_layers = num_layers
@@ -57,24 +61,15 @@ class HybridKVCacheManager:
         for layer_idx in range(self.num_layers):
             if layer_idx in self.attention_layer_indices:
                 # Attention layer - initialize empty K/V cache
-                self.kv_cache[layer_idx] = {
-                    "k": None,
-                    "v": None,
-                    "length": 0
-                }
+                self.kv_cache[layer_idx] = {"k": None, "v": None, "length": 0}
             else:
                 # Mamba layer - initialize empty state dict (float32 for precision)
                 self.mamba_states[layer_idx] = init_mamba_cache(
-                    batch_size=self.batch_size,
-                    device='cpu',
-                    dtype=torch.bfloat16
+                    batch_size=self.batch_size, device="cpu", dtype=torch.bfloat16
                 )
 
     def update_attention_cache(
-        self,
-        layer_idx: int,
-        k_new: ttnn.Tensor,
-        v_new: ttnn.Tensor
+        self, layer_idx: int, k_new: ttnn.Tensor, v_new: ttnn.Tensor
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """
         Update KV cache for an attention layer.
@@ -96,7 +91,7 @@ class HybridKVCacheManager:
             # First time - initialize cache
             cache_entry["k"] = k_new
             cache_entry["v"] = v_new
-            cache_entry["length"] = k_new.shape[2] if hasattr(k_new, 'shape') else 1
+            cache_entry["length"] = k_new.shape[2] if hasattr(k_new, "shape") else 1
         else:
             # Concatenate new KV to existing cache along seq dimension (dim=2)
             k_old_torch = to_torch_tensor(cache_entry["k"])
@@ -107,18 +102,23 @@ class HybridKVCacheManager:
             k_concat = torch.cat([k_old_torch, k_new_torch], dim=2)
             v_concat = torch.cat([v_old_torch, v_new_torch], dim=2)
 
-            cache_entry["k"] = to_tt_tensor(k_concat, self.device, ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
-            cache_entry["v"] = to_tt_tensor(v_concat, self.device, ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
-            cache_entry["length"] += k_new.shape[2] if hasattr(k_new, 'shape') else 1
+            cache_entry["k"] = to_tt_tensor(
+                k_concat, self.device, ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
+            cache_entry["v"] = to_tt_tensor(
+                v_concat, self.device, ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
+            cache_entry["length"] += k_new.shape[2] if hasattr(k_new, "shape") else 1
 
             if cache_entry["length"] > self.max_cache_length:
-                print(f"Warning: Cache length ({cache_entry['length']}) exceeded max ({self.max_cache_length})")
+                print(
+                    f"Warning: Cache length ({cache_entry['length']}) exceeded max ({self.max_cache_length})"
+                )
 
         return cache_entry["k"], cache_entry["v"]
 
     def get_attention_cache(
-        self,
-        layer_idx: int
+        self, layer_idx: int
     ) -> Tuple[Optional[ttnn.Tensor], Optional[ttnn.Tensor]]:
         """
         Get cached K and V for an attention layer.
@@ -146,7 +146,7 @@ class HybridKVCacheManager:
         self,
         layer_idx: int,
         conv_state: Optional[torch.Tensor] = None,
-        ssm_state: Optional[torch.Tensor] = None
+        ssm_state: Optional[torch.Tensor] = None,
     ):
         """
         Update Mamba state for a mamba layer (CPU only).
@@ -165,8 +165,7 @@ class HybridKVCacheManager:
             self.mamba_states[layer_idx]["ssm_state"] = ssm_state
 
     def get_mamba_state(
-        self,
-        layer_idx: int
+        self, layer_idx: int
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Get Mamba state for a layer.
@@ -195,9 +194,7 @@ class HybridKVCacheManager:
         """
         if layer_idx not in self.mamba_states:
             self.mamba_states[layer_idx] = init_mamba_cache(
-                batch_size=self.batch_size,
-                device='cpu',
-                dtype=torch.bfloat16
+                batch_size=self.batch_size, device="cpu", dtype=torch.bfloat16
             )
 
         return self.mamba_states[layer_idx]
@@ -218,16 +215,10 @@ class HybridKVCacheManager:
     def clear_layer(self, layer_idx: int):
         """Clear cache for a specific layer."""
         if layer_idx in self.attention_layer_indices:
-            self.kv_cache[layer_idx] = {
-                "k": None,
-                "v": None,
-                "length": 0
-            }
+            self.kv_cache[layer_idx] = {"k": None, "v": None, "length": 0}
         else:
             self.mamba_states[layer_idx] = init_mamba_cache(
-                batch_size=self.batch_size,
-                device='cpu',
-                dtype=torch.bfloat16
+                batch_size=self.batch_size, device="cpu", dtype=torch.bfloat16
             )
 
     def get_memory_usage(self) -> int:
@@ -239,7 +230,9 @@ class HybridKVCacheManager:
                 # K and V: [batch, n_kv_heads, cache_len, head_dim]
                 cache_len = cache_entry["length"]
                 # bfloat16 = 2 bytes per element
-                bytes_per_kv = self.batch_size * self.num_kv_heads * cache_len * self.head_dim * 2
+                bytes_per_kv = (
+                    self.batch_size * self.num_kv_heads * cache_len * self.head_dim * 2
+                )
                 total_bytes += 2 * bytes_per_kv  # K and V
 
         return total_bytes

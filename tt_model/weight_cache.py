@@ -1,8 +1,12 @@
-import ttnn
-import torch
-from typing import Dict, Optional, Tuple
-from pathlib import Path
+"""Model weight caching on Tenstorrent device."""
+
 import sys
+from pathlib import Path
+from typing import Dict, Optional
+
+import torch
+import ttnn
+
 sys.path.append(str(Path(__file__).parent.parent))
 from tt_ops.base import to_tt_tensor
 
@@ -26,7 +30,7 @@ class WeightCache:
         name: str,
         weight: torch.Tensor,
         layout: str = "TILE",
-        transpose: bool = False
+        transpose: bool = False,
     ) -> ttnn.Tensor:
         """
         Store a weight tensor in the cache.
@@ -62,7 +66,7 @@ class WeightCache:
             "shape": tuple(weight.shape),
             "layout": layout,
             "transpose": transpose,
-            "dtype": str(self.dtype)
+            "dtype": str(self.dtype),
         }
 
         return weight_tt
@@ -110,10 +114,7 @@ class WeightCache:
 
 
 def convert_hf_weights_to_cache(
-    hf_model,
-    device,
-    dtype=ttnn.bfloat16,
-    verbose: bool = True
+    hf_model, device, dtype=ttnn.bfloat16, verbose: bool = True
 ) -> WeightCache:
     """
     Convert HuggingFace model weights to TT weight cache.
@@ -138,11 +139,11 @@ def convert_hf_weights_to_cache(
         print(f"Total parameters: {total_params / 1e6:.1f}M")
 
     # Convert embeddings (keep in ROW_MAJOR for indexing)
-    if hasattr(hf_model.model, 'embed_tokens'):
+    if hasattr(hf_model.model, "embed_tokens"):
         cache.store(
             "embed_tokens.weight",
             hf_model.model.embed_tokens.weight,
-            layout="ROW_MAJOR"
+            layout="ROW_MAJOR",
         )
 
     # Convert layer weights
@@ -150,43 +151,92 @@ def convert_hf_weights_to_cache(
         prefix = f"layers.{layer_idx}"
 
         # Check if this is an attention layer or mamba layer
-        is_attention = hasattr(layer, 'self_attn') and layer.self_attn is not None
-        is_mamba = hasattr(layer, 'mamba') and layer.mamba is not None
+        is_attention = hasattr(layer, "self_attn") and layer.self_attn is not None
+        is_mamba = hasattr(layer, "mamba") and layer.mamba is not None
 
         if is_attention:
             # Attention layer weights
             attn = layer.self_attn
 
             # QKV projections (linear layers - transpose for matmul)
-            cache.store(f"{prefix}.self_attn.q_proj.weight", attn.q_proj.weight, layout="TILE", transpose=True)
-            cache.store(f"{prefix}.self_attn.k_proj.weight", attn.k_proj.weight, layout="TILE", transpose=True)
-            cache.store(f"{prefix}.self_attn.v_proj.weight", attn.v_proj.weight, layout="TILE", transpose=True)
-            cache.store(f"{prefix}.self_attn.o_proj.weight", attn.o_proj.weight, layout="TILE", transpose=True)
+            cache.store(
+                f"{prefix}.self_attn.q_proj.weight",
+                attn.q_proj.weight,
+                layout="TILE",
+                transpose=True,
+            )
+            cache.store(
+                f"{prefix}.self_attn.k_proj.weight",
+                attn.k_proj.weight,
+                layout="TILE",
+                transpose=True,
+            )
+            cache.store(
+                f"{prefix}.self_attn.v_proj.weight",
+                attn.v_proj.weight,
+                layout="TILE",
+                transpose=True,
+            )
+            cache.store(
+                f"{prefix}.self_attn.o_proj.weight",
+                attn.o_proj.weight,
+                layout="TILE",
+                transpose=True,
+            )
 
         elif is_mamba:
             # Mamba layer weights stay on CPU - no need to cache
             pass
 
         # MLP weights (each layer has its own despite the "shared_mlp" name)
-        if hasattr(layer, 'shared_mlp') and layer.shared_mlp is not None:
+        if hasattr(layer, "shared_mlp") and layer.shared_mlp is not None:
             mlp = layer.shared_mlp
-            cache.store(f"{prefix}.shared_mlp.input_linear.weight", mlp.input_linear.weight, layout="TILE", transpose=True)
-            cache.store(f"{prefix}.shared_mlp.output_linear.weight", mlp.output_linear.weight, layout="TILE", transpose=True)
+            cache.store(
+                f"{prefix}.shared_mlp.input_linear.weight",
+                mlp.input_linear.weight,
+                layout="TILE",
+                transpose=True,
+            )
+            cache.store(
+                f"{prefix}.shared_mlp.output_linear.weight",
+                mlp.output_linear.weight,
+                layout="TILE",
+                transpose=True,
+            )
 
-            if hasattr(mlp.input_linear, 'bias') and mlp.input_linear.bias is not None:
-                cache.store(f"{prefix}.shared_mlp.input_linear.bias", mlp.input_linear.bias, layout="ROW_MAJOR")
-            if hasattr(mlp.output_linear, 'bias') and mlp.output_linear.bias is not None:
-                cache.store(f"{prefix}.shared_mlp.output_linear.bias", mlp.output_linear.bias, layout="ROW_MAJOR")
+            if hasattr(mlp.input_linear, "bias") and mlp.input_linear.bias is not None:
+                cache.store(
+                    f"{prefix}.shared_mlp.input_linear.bias",
+                    mlp.input_linear.bias,
+                    layout="ROW_MAJOR",
+                )
+            if (
+                hasattr(mlp.output_linear, "bias")
+                and mlp.output_linear.bias is not None
+            ):
+                cache.store(
+                    f"{prefix}.shared_mlp.output_linear.bias",
+                    mlp.output_linear.bias,
+                    layout="ROW_MAJOR",
+                )
 
         # Layer norms
-        if hasattr(layer, 'input_layernorm'):
-            cache.store(f"{prefix}.input_layernorm.weight", layer.input_layernorm.weight, layout="ROW_MAJOR")
+        if hasattr(layer, "input_layernorm"):
+            cache.store(
+                f"{prefix}.input_layernorm.weight",
+                layer.input_layernorm.weight,
+                layout="ROW_MAJOR",
+            )
 
-        if hasattr(layer, 'post_attention_layernorm'):
-            cache.store(f"{prefix}.post_attention_layernorm.weight", layer.post_attention_layernorm.weight, layout="ROW_MAJOR")
+        if hasattr(layer, "post_attention_layernorm"):
+            cache.store(
+                f"{prefix}.post_attention_layernorm.weight",
+                layer.post_attention_layernorm.weight,
+                layout="ROW_MAJOR",
+            )
 
     # Final norm
-    if hasattr(hf_model.model, 'norm'):
+    if hasattr(hf_model.model, "norm"):
         cache.store("norm.weight", hf_model.model.norm.weight, layout="ROW_MAJOR")
 
     # LM head (keep on CPU for now - large vocab matmul)

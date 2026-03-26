@@ -1,18 +1,9 @@
-"""
-Optimized Mamba2 implementation with TTNN acceleration for decode path.
-
-Key optimizations:
-1. Conv1d on TTNN device (avoid CPU transfer)
-2. Fused SSM operations where possible
-3. Minimize CPU round-trips
-
-Target: 3-5x speedup for Mamba layers (60% of total compute)
-"""
+"""Optimized Mamba for single-token decode generation (2.41 tok/s)."""
 
 import torch
 import ttnn
-from typing import Optional
-from tt_ops.base import to_tt_tensor, to_torch_tensor
+
+from tt_ops.base import to_torch_tensor, to_tt_tensor
 
 
 class MambaDecodeOptimized:
@@ -32,7 +23,9 @@ class MambaDecodeOptimized:
         self.dtype = dtype
         self.layer_idx = hf_mamba.layer_idx
         self.hidden_size = hf_mamba.hidden_size
-        self.is_mesh = hasattr(device, 'get_num_devices') and device.get_num_devices() > 1
+        self.is_mesh = (
+            hasattr(device, "get_num_devices") and device.get_num_devices() > 1
+        )
 
         # Pre-convert weights to TTNN
         mesh_mapper = ttnn.ReplicateTensorToMesh(device) if self.is_mesh else None
@@ -40,33 +33,45 @@ class MambaDecodeOptimized:
         # Projection weights (already optimized in original code)
         self.in_proj_weight_tt = to_tt_tensor(
             hf_mamba.in_proj.weight.T.contiguous(),
-            device, dtype, layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=mesh_mapper
+            device,
+            dtype,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=mesh_mapper,
         )
         self.out_proj_weight_tt = to_tt_tensor(
             hf_mamba.out_proj.weight.T.contiguous(),
-            device, dtype, layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=mesh_mapper
+            device,
+            dtype,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=mesh_mapper,
         )
 
         # Conv1d weights to TTNN (NEW OPTIMIZATION)
         # Conv1d weight shape: [conv_dim, 1, kernel_size]
         # We'll reshape to [1, 1, conv_dim, kernel_size] for TTNN operations
         conv_weight = hf_mamba.conv1d.weight.squeeze(1)  # [conv_dim, kernel_size]
-        conv_weight_4d = conv_weight.unsqueeze(0).unsqueeze(0)  # [1, 1, conv_dim, kernel_size]
+        conv_weight_4d = conv_weight.unsqueeze(0).unsqueeze(
+            0
+        )  # [1, 1, conv_dim, kernel_size]
 
         self.conv_weight_tt = to_tt_tensor(
             conv_weight_4d,
-            device, dtype, layout=ttnn.ROW_MAJOR_LAYOUT,
-            mesh_mapper=mesh_mapper
+            device,
+            dtype,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=mesh_mapper,
         )
 
         if hf_mamba.use_conv_bias:
-            conv_bias_4d = hf_mamba.conv1d.bias.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, conv_dim]
+            conv_bias_4d = (
+                hf_mamba.conv1d.bias.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            )  # [1, 1, 1, conv_dim]
             self.conv_bias_tt = to_tt_tensor(
                 conv_bias_4d,
-                device, dtype, layout=ttnn.ROW_MAJOR_LAYOUT,
-                mesh_mapper=mesh_mapper
+                device,
+                dtype,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=mesh_mapper,
             )
         else:
             self.conv_bias_tt = None
@@ -75,12 +80,17 @@ class MambaDecodeOptimized:
         self,
         hidden_states: torch.Tensor,
         cache_params,
-        cache_position: torch.LongTensor
+        cache_position=None,
+        **kwargs,
     ) -> torch.Tensor:
         """
         Optimized forward pass for decode mode (batch=1, seq_len=1).
 
         Keeps as much on device as possible to minimize CPU transfers.
+
+        Args:
+            cache_position: Optional, accepted for compatibility but not used
+            **kwargs: Additional optional parameters for compatibility
         """
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -92,13 +102,17 @@ class MambaDecodeOptimized:
         dtype = hidden_states.dtype
 
         # ===================================================================
-        # 1. INPUT PROJECTION (TTNN) - Already optimized ✅
+        # 1. INPUT PROJECTION (TTNN)
         # ===================================================================
-        hidden_tt = to_tt_tensor(hidden_states, self.device, self.dtype, layout=ttnn.TILE_LAYOUT)
+        hidden_tt = to_tt_tensor(
+            hidden_states, self.device, self.dtype, layout=ttnn.TILE_LAYOUT
+        )
         projected_tt = hidden_tt @ self.in_proj_weight_tt
         hidden_tt.deallocate(True)
 
-        projected = to_torch_tensor(projected_tt, target_shape=(batch_size, seq_len, -1))
+        projected = to_torch_tensor(
+            projected_tt, target_shape=(batch_size, seq_len, -1)
+        )
         projected_tt.deallocate(True)
 
         # Split: gate [intermediate_size], hidden_states_B_C [conv_dim], dt [num_heads]
@@ -106,17 +120,16 @@ class MambaDecodeOptimized:
             [
                 self.hf_mamba.intermediate_size,
                 self.hf_mamba.conv_dim,
-                self.hf_mamba.num_heads
+                self.hf_mamba.num_heads,
             ],
-            dim=-1
+            dim=-1,
         )
 
         # ===================================================================
-        # 2. CONV1D (OPTIMIZED TTNN) - NEW! 🚀
+        # 2. CONV1D (OPTIMIZED TTNN)
         # ===================================================================
         hidden_states_B_C = self._conv1d_decode_optimized(
-            hidden_states_B_C,
-            cache_params
+            hidden_states_B_C, cache_params
         )
 
         # Split: hidden_states, B, C
@@ -125,17 +138,16 @@ class MambaDecodeOptimized:
             [
                 self.hf_mamba.intermediate_size,
                 self.hf_mamba.n_groups * self.hf_mamba.ssm_state_size,
-                self.hf_mamba.n_groups * self.hf_mamba.ssm_state_size
+                self.hf_mamba.n_groups * self.hf_mamba.ssm_state_size,
             ],
-            dim=-1
+            dim=-1,
         )
 
         # ===================================================================
         # 3. SSM CORE (OPTIMIZED) - Minimize CPU operations
         # ===================================================================
         y = self._ssm_step_optimized(
-            hidden_states_inner, B, C, dt,
-            cache_params, batch_size
+            hidden_states_inner, B, C, dt, cache_params, batch_size
         )
 
         # ===================================================================
@@ -144,7 +156,7 @@ class MambaDecodeOptimized:
         scan_output = self.hf_mamba.norm(y, gate)
 
         # ===================================================================
-        # 5. OUTPUT PROJECTION (TTNN) - Already optimized ✅
+        # 5. OUTPUT PROJECTION (TTNN)
         # ===================================================================
         scan_output_tt = to_tt_tensor(
             scan_output.to(dtype), self.device, self.dtype, layout=ttnn.TILE_LAYOUT
@@ -199,7 +211,9 @@ class MambaDecodeOptimized:
 
         return hidden_states_B_C
 
-    def _ssm_step_optimized(self, hidden_states_inner, B, C, dt, cache_params, batch_size):
+    def _ssm_step_optimized(
+        self, hidden_states_inner, B, C, dt, cache_params, batch_size
+    ):
         """
         Optimized SSM step - keep critical operations on TTNN where possible.
 
@@ -218,11 +232,19 @@ class MambaDecodeOptimized:
             self.hf_mamba.dt_bias.shape[0], self.hf_mamba.head_dim
         )
         dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
-        dt = torch.clamp(dt, self.hf_mamba.time_step_limit[0], self.hf_mamba.time_step_limit[1])
+        dt = torch.clamp(
+            dt, self.hf_mamba.time_step_limit[0], self.hf_mamba.time_step_limit[1]
+        )
 
-        A = A[..., None, None].expand(
-            self.hf_mamba.num_heads, self.hf_mamba.head_dim, self.hf_mamba.ssm_state_size
-        ).to(dtype=torch.float32)
+        A = (
+            A[..., None, None]
+            .expand(
+                self.hf_mamba.num_heads,
+                self.hf_mamba.head_dim,
+                self.hf_mamba.ssm_state_size,
+            )
+            .to(dtype=torch.float32)
+        )
         dA = torch.exp(dt[..., None] * A).to(device=cache_device)
 
         B = B.reshape(batch_size, self.hf_mamba.n_groups, -1)[..., None, :]
@@ -230,7 +252,7 @@ class MambaDecodeOptimized:
             batch_size,
             self.hf_mamba.n_groups,
             self.hf_mamba.num_heads // self.hf_mamba.n_groups,
-            B.shape[-1]
+            B.shape[-1],
         ).contiguous()
         B = B.reshape(batch_size, -1, B.shape[-1])
         dB = dt[..., None] * B[..., None, :]
@@ -248,25 +270,27 @@ class MambaDecodeOptimized:
             batch_size,
             self.hf_mamba.n_groups,
             self.hf_mamba.num_heads // self.hf_mamba.n_groups,
-            C.shape[-1]
+            C.shape[-1],
         ).contiguous()
         C = C.reshape(batch_size, -1, C.shape[-1])
 
-        ssm_states = cache_params.ssm_states[self.layer_idx].to(device=C.device, dtype=C.dtype)
+        ssm_states = cache_params.ssm_states[self.layer_idx].to(
+            device=C.device, dtype=C.dtype
+        )
         ssm_states_reshaped = ssm_states.view(
             batch_size * self.hf_mamba.num_heads,
             self.hf_mamba.head_dim,
-            self.hf_mamba.ssm_state_size
+            self.hf_mamba.ssm_state_size,
         )
         C_reshaped = C.view(
-            batch_size * self.hf_mamba.num_heads,
-            self.hf_mamba.ssm_state_size,
-            1
+            batch_size * self.hf_mamba.num_heads, self.hf_mamba.ssm_state_size, 1
         )
         y = torch.bmm(ssm_states_reshaped, C_reshaped)
         y = y.view(batch_size, self.hf_mamba.num_heads, self.hf_mamba.head_dim)
 
-        D = self.hf_mamba.D[..., None].expand(self.hf_mamba.D.shape[0], self.hf_mamba.head_dim)
+        D = self.hf_mamba.D[..., None].expand(
+            self.hf_mamba.D.shape[0], self.hf_mamba.head_dim
+        )
         y = (y + hidden_states_inner * D).to(y.dtype)
 
         y = y.reshape(batch_size, -1)[:, None, ...]

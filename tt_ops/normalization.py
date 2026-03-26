@@ -1,6 +1,9 @@
-import ttnn
+"""RMS normalization on TTNN."""
+
 import torch
-from .base import TTOperation, to_tt_tensor, to_torch_tensor, to_tile_layout
+import ttnn
+
+from .base import TTOperation, to_torch_tensor, to_tt_tensor
 
 
 class TTRMSNorm(TTOperation):
@@ -21,7 +24,7 @@ class TTRMSNorm(TTOperation):
         weight: torch.Tensor,
         eps: float = 1e-5,
         dtype=ttnn.bfloat16,
-        use_native_ttnn=False
+        use_native_ttnn=False,
     ):
         super().__init__(device, dtype)
         self.eps = eps
@@ -35,15 +38,17 @@ class TTRMSNorm(TTOperation):
         if use_native_ttnn:
             # Mesh mapper for weight replication
             mesh_mapper = None
-            if hasattr(device, 'get_num_devices') and device.get_num_devices() > 1:
+            if hasattr(device, "get_num_devices") and device.get_num_devices() > 1:
                 mesh_mapper = ttnn.ReplicateTensorToMesh(device)
 
             self.weight_tt = to_tt_tensor(
-                weight.unsqueeze(0).unsqueeze(0),  # [1, 1, hidden_size] for broadcasting
+                weight.unsqueeze(0).unsqueeze(
+                    0
+                ),  # [1, 1, hidden_size] for broadcasting
                 device,
                 dtype,
                 layout=ttnn.ROW_MAJOR_LAYOUT,
-                mesh_mapper=mesh_mapper
+                mesh_mapper=mesh_mapper,
             )
         else:
             self.weight_tt = None
@@ -68,14 +73,14 @@ class TTRMSNorm(TTOperation):
 
             # Ensure input is in ROW_MAJOR for RMSNorm
             if hidden_states_tt.layout != ttnn.ROW_MAJOR_LAYOUT:
-                hidden_states_tt = ttnn.to_layout(hidden_states_tt, ttnn.ROW_MAJOR_LAYOUT)
+                hidden_states_tt = ttnn.to_layout(
+                    hidden_states_tt, ttnn.ROW_MAJOR_LAYOUT
+                )
 
             # Native TTNN RMSNorm
             # Note: ttnn.rms_norm expects weight shape to broadcast correctly
             output_tt = ttnn.rms_norm(
-                hidden_states_tt,
-                epsilon=self.eps,
-                weight=self.weight_tt
+                hidden_states_tt, epsilon=self.eps, weight=self.weight_tt
             )
 
             return output_tt
@@ -94,15 +99,14 @@ class TTRMSNorm(TTOperation):
             output = self.weight_torch * hidden_states.to(input_dtype)
 
             # Convert back to TTNN (always ROW_MAJOR for consistency)
-            output_tt = to_tt_tensor(output, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+            output_tt = to_tt_tensor(
+                output, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
 
             return output_tt
 
     def forward_fused(
-        self,
-        hidden_states_tt: ttnn.Tensor,
-        residual_tt: ttnn.Tensor,
-        scale: float
+        self, hidden_states_tt: ttnn.Tensor, residual_tt: ttnn.Tensor, scale: float
     ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
         """
         Fused operation: (residual + hidden_states * scale), then normalize.
@@ -122,7 +126,10 @@ class TTRMSNorm(TTOperation):
         """
         # Fused residual add + scale (single kernel!)
         from .fused_ops import fused_residual_add_scale
-        updated_hidden_tt = fused_residual_add_scale(residual_tt, hidden_states_tt, scale)
+
+        updated_hidden_tt = fused_residual_add_scale(
+            residual_tt, hidden_states_tt, scale
+        )
 
         # Normalize (converts to torch, normalizes, converts back)
         normalized_tt = self.forward(updated_hidden_tt)
@@ -144,7 +151,7 @@ class TTRMSNormGated(TTOperation):
         weight: torch.Tensor,
         gate_weight: torch.Tensor,
         eps: float = 1e-5,
-        dtype=ttnn.bfloat16
+        dtype=ttnn.bfloat16,
     ):
         super().__init__(device, dtype)
         self.eps = eps
@@ -152,7 +159,9 @@ class TTRMSNormGated(TTOperation):
 
         # Store weights
         self.weight_torch = weight
-        self.gate_weight_tt = to_tt_tensor(gate_weight, device, dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+        self.gate_weight_tt = to_tt_tensor(
+            gate_weight, device, dtype, layout=ttnn.ROW_MAJOR_LAYOUT
+        )
 
     def forward(self, hidden_states_tt: ttnn.Tensor) -> ttnn.Tensor:
         """
@@ -180,14 +189,15 @@ class TTRMSNormGated(TTOperation):
         output = self.weight_torch * gated.to(input_dtype)
 
         # Convert back to TTNN (always ROW_MAJOR for consistency)
-        output_tt = to_tt_tensor(output, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+        output_tt = to_tt_tensor(
+            output, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT
+        )
 
         return output_tt
 
 
 def test_rmsnorm_cpu_vs_tt():
     """Test RMSNorm implementation against PyTorch CPU version."""
-    import torch.nn.functional as F
 
     batch_size, seq_len, hidden_size = 2, 4, 16
     eps = 1e-5
@@ -209,7 +219,9 @@ def test_rmsnorm_cpu_vs_tt():
         tt_norm = TTRMSNorm(device, weight, eps=eps)
         x_tt = to_tt_tensor(x, device)
         tt_output_tt = tt_norm(x_tt)
-        tt_output = to_torch_tensor(tt_output_tt, target_shape=(batch_size, seq_len, hidden_size))
+        tt_output = to_torch_tensor(
+            tt_output_tt, target_shape=(batch_size, seq_len, hidden_size)
+        )
 
         # Compare
         diff = torch.abs(cpu_output - tt_output)

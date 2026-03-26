@@ -1,17 +1,21 @@
-import ttnn
-import torch
-from typing import Optional
-from transformers import AutoModelForCausalLM
-from pathlib import Path
+"""TT-accelerated Granite hybrid model for causal language modeling."""
+
 import sys
+from pathlib import Path
+from typing import Optional
+
+import torch
+import ttnn
+from transformers import AutoModelForCausalLM
+
 sys.path.append(str(Path(__file__).parent.parent))
-from tt_ops.base import to_tt_tensor, to_torch_tensor
+from tt_model.config import TTGraniteConfig
+from tt_model.decoder_layer import TTGraniteDecoderLayer
+from tt_model.weight_cache import WeightCache, convert_hf_weights_to_cache
+from tt_ops.base import to_torch_tensor, to_tt_tensor
+from tt_ops.cache import HybridKVCacheManager
 from tt_ops.mlp import TTSharedMLP, split_combined_mlp_weight
 from tt_ops.normalization import TTRMSNorm
-from tt_ops.cache import HybridKVCacheManager
-from tt_model.config import TTGraniteConfig
-from tt_model.weight_cache import WeightCache, convert_hf_weights_to_cache
-from tt_model.decoder_layer import TTGraniteDecoderLayer
 from tt_ops.tt_ccl import SimpleTTCCL
 
 
@@ -26,13 +30,7 @@ class TTGraniteMoeHybridForCausalLM:
     - Embeddings and LM head: Run on CPU
     """
 
-    def __init__(
-        self,
-        device,
-        hf_model,
-        config: TTGraniteConfig,
-        verbose: bool = True
-    ):
+    def __init__(self, device, hf_model, config: TTGraniteConfig, verbose: bool = True):
         self.device = device
         self.hf_model = hf_model
         self.config = config
@@ -47,12 +45,16 @@ class TTGraniteMoeHybridForCausalLM:
             print("\n=== Initializing TTGraniteMoeHybridForCausalLM ===")
 
         # For mesh devices, skip weight cache creation (weight distribution not yet implemented)
-        is_mesh = hasattr(device, 'get_num_devices')
+        is_mesh = hasattr(device, "get_num_devices")
         if is_mesh:
             if verbose:
                 num_devs = device.get_num_devices()
-                print(f"  Mesh device detected ({num_devs} devices) - using weight sharding with tensor parallelism")
-            self.weight_cache = WeightCache(device, dtype=config.get_ttnn_dtype())  # Empty cache
+                print(
+                    f"  Mesh device detected ({num_devs} devices) - using weight sharding with tensor parallelism"
+                )
+            self.weight_cache = WeightCache(
+                device, dtype=config.get_ttnn_dtype()
+            )  # Empty cache
             # Initialize TT_CCL for collective operations (all-reduce)
             self.tt_ccl = SimpleTTCCL(device) if device.get_num_devices() > 1 else None
         else:
@@ -63,7 +65,7 @@ class TTGraniteMoeHybridForCausalLM:
 
         # Initialize final norm
         # For mesh devices, skip weight cache conversion and use HF weights directly
-        is_mesh = hasattr(device, 'get_num_devices')
+        is_mesh = hasattr(device, "get_num_devices")
 
         if is_mesh:
             # Use HF weights directly for mesh (weight distribution not yet implemented)
@@ -80,7 +82,7 @@ class TTGraniteMoeHybridForCausalLM:
             device,
             final_norm_weight_torch,
             eps=config.rms_norm_eps,
-            dtype=config.get_ttnn_dtype()
+            dtype=config.get_ttnn_dtype(),
         )
 
         # Initialize decoder layers
@@ -98,21 +100,28 @@ class TTGraniteMoeHybridForCausalLM:
                 config.intermediate_size,
                 config.get_ttnn_dtype(),
                 tensor_parallel=use_tensor_parallel,
-                tt_ccl=None  # Not using TT_CCL since native collectives don't work
             )
 
             # Load MLP weights
             if is_mesh:
                 # For mesh devices, shard weights using ShardTensor2dMesh
                 hf_mlp = hf_layer.shared_mlp
-                input_linear_weight_hf = hf_mlp.input_linear.weight  # [intermediate*2, hidden]
-                output_linear_weight_hf = hf_mlp.output_linear.weight  # [hidden, intermediate]
+                input_linear_weight_hf = (
+                    hf_mlp.input_linear.weight
+                )  # [intermediate*2, hidden]
+                output_linear_weight_hf = (
+                    hf_mlp.output_linear.weight
+                )  # [hidden, intermediate]
 
                 # Split combined weight in PyTorch (before converting to TTNN)
                 # Transpose first: [intermediate*2, hidden] -> [hidden, intermediate*2]
                 input_linear_t = input_linear_weight_hf.T  # [hidden, intermediate*2]
-                gate_weight_torch = input_linear_t[:, :config.intermediate_size].contiguous()  # [hidden, intermediate]
-                up_weight_torch = input_linear_t[:, config.intermediate_size:].contiguous()  # [hidden, intermediate]
+                gate_weight_torch = input_linear_t[
+                    :, : config.intermediate_size
+                ].contiguous()  # [hidden, intermediate]
+                up_weight_torch = input_linear_t[
+                    :, config.intermediate_size :
+                ].contiguous()  # [hidden, intermediate]
                 down_weight_torch = output_linear_weight_hf.T  # [intermediate, hidden]
 
                 # Make weights 4D [1, 1, H, W] as required by ShardTensor2dMesh
@@ -127,9 +136,13 @@ class TTGraniteMoeHybridForCausalLM:
                 # Shard weights for tensor parallelism or replicate if disabled
                 if use_tensor_parallel:
                     # Column-parallel for gate/up (shard along width/output dimension)
-                    col_mesh_mapper = ttnn.ShardTensor2dMesh(device, dims=(-1, None), mesh_shape=mesh_shape)
+                    col_mesh_mapper = ttnn.ShardTensor2dMesh(
+                        device, dims=(-1, None), mesh_shape=mesh_shape
+                    )
                     # Row-parallel for down (shard along height/input dimension)
-                    row_mesh_mapper = ttnn.ShardTensor2dMesh(device, dims=(-2, None), mesh_shape=mesh_shape)
+                    row_mesh_mapper = ttnn.ShardTensor2dMesh(
+                        device, dims=(-2, None), mesh_shape=mesh_shape
+                    )
 
                     layer_mlp.gate_proj_weight = ttnn.operations.core.as_tensor(
                         gate_weight_4d,
@@ -137,7 +150,7 @@ class TTGraniteMoeHybridForCausalLM:
                         device=device,
                         mesh_mapper=col_mesh_mapper,
                         layout=ttnn.TILE_LAYOUT,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     )
                     layer_mlp.up_proj_weight = ttnn.operations.core.as_tensor(
                         up_weight_4d,
@@ -145,7 +158,7 @@ class TTGraniteMoeHybridForCausalLM:
                         device=device,
                         mesh_mapper=col_mesh_mapper,
                         layout=ttnn.TILE_LAYOUT,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     )
                     layer_mlp.down_proj_weight = ttnn.operations.core.as_tensor(
                         down_weight_4d,
@@ -153,7 +166,7 @@ class TTGraniteMoeHybridForCausalLM:
                         device=device,
                         mesh_mapper=row_mesh_mapper,
                         layout=ttnn.TILE_LAYOUT,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     )
                 else:
                     # Replicate weights (no tensor parallelism)
@@ -165,7 +178,7 @@ class TTGraniteMoeHybridForCausalLM:
                         device=device,
                         mesh_mapper=mesh_mapper,
                         layout=ttnn.TILE_LAYOUT,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     )
                     layer_mlp.up_proj_weight = ttnn.operations.core.as_tensor(
                         up_weight_4d,
@@ -173,7 +186,7 @@ class TTGraniteMoeHybridForCausalLM:
                         device=device,
                         mesh_mapper=mesh_mapper,
                         layout=ttnn.TILE_LAYOUT,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     )
                     layer_mlp.down_proj_weight = ttnn.operations.core.as_tensor(
                         down_weight_4d,
@@ -181,21 +194,27 @@ class TTGraniteMoeHybridForCausalLM:
                         device=device,
                         mesh_mapper=mesh_mapper,
                         layout=ttnn.TILE_LAYOUT,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     )
             else:
                 # Single device: load from cache (already transposed and in TILE layout)
-                input_linear_weight = self.weight_cache.get(f"layers.{layer_idx}.shared_mlp.input_linear.weight")
-                output_linear_weight = self.weight_cache.get(f"layers.{layer_idx}.shared_mlp.output_linear.weight")
+                input_linear_weight = self.weight_cache.get(
+                    f"layers.{layer_idx}.shared_mlp.input_linear.weight"
+                )
+                output_linear_weight = self.weight_cache.get(
+                    f"layers.{layer_idx}.shared_mlp.output_linear.weight"
+                )
 
                 # Split combined weight into gate_proj and up_proj using helper
                 if input_linear_weight is not None:
-                    layer_mlp.gate_proj_weight, layer_mlp.up_proj_weight = split_combined_mlp_weight(
-                        input_linear_weight,
-                        device,
-                        config.get_ttnn_dtype(),
-                        config.hidden_size,
-                        config.intermediate_size
+                    layer_mlp.gate_proj_weight, layer_mlp.up_proj_weight = (
+                        split_combined_mlp_weight(
+                            input_linear_weight,
+                            device,
+                            config.get_ttnn_dtype(),
+                            config.hidden_size,
+                            config.intermediate_size,
+                        )
                     )
 
                 layer_mlp.down_proj_weight = output_linear_weight
@@ -211,7 +230,7 @@ class TTGraniteMoeHybridForCausalLM:
                 hf_config=hf_model.config,
                 dtype=config.get_ttnn_dtype(),
                 tensor_parallel=use_tensor_parallel,
-                tt_ccl=self.tt_ccl if use_tensor_parallel else None
+                tt_ccl=self.tt_ccl if use_tensor_parallel else None,
             )
 
             self.layers.append(layer)
@@ -230,23 +249,31 @@ class TTGraniteMoeHybridForCausalLM:
             max_cache_length=config.max_cache_length,
             batch_size=config.batch_size,
             attention_layer_indices=config.attention_layer_indices,
-            dtype=config.get_ttnn_dtype()
+            dtype=config.get_ttnn_dtype(),
         )
 
         if verbose:
             print(f"\n✓ Model initialized with {len(self.layers)} layers")
             print(f"  - {len(config.attention_layer_indices)} attention layers on TT")
-            print(f"  - {config.num_hidden_layers - len(config.attention_layer_indices)} mamba layers on CPU")
+            print(
+                f"  - {config.num_hidden_layers - len(config.attention_layer_indices)} mamba layers on CPU"
+            )
             if is_mesh and device.get_num_devices() > 1:
                 print(f"  - Mesh device: {device.get_num_devices()} devices")
                 if use_tensor_parallel:
                     print(f"  - Tensor parallelism: ENABLED")
-                    print(f"    • MLP weights sharded across devices (column/row parallel)")
+                    print(
+                        f"    • MLP weights sharded across devices (column/row parallel)"
+                    )
                     print(f"    • Reduction: CPU-based gather-sum-broadcast")
                     print(f"    • Expected speedup: ~20-25x for MLP layers")
                 else:
-                    print(f"  - Tensor parallelism: DISABLED (using replicated weights)")
-                    print(f"  - All devices compute same result (redundant but correct)")
+                    print(
+                        f"  - Tensor parallelism: DISABLED (using replicated weights)"
+                    )
+                    print(
+                        f"  - All devices compute same result (redundant but correct)"
+                    )
             self.weight_cache.print_summary()
 
     def forward(
@@ -254,7 +281,7 @@ class TTGraniteMoeHybridForCausalLM:
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        use_cache: bool = True
+        use_cache: bool = True,
     ) -> torch.Tensor:
         """
         Forward pass through the model.
@@ -272,12 +299,16 @@ class TTGraniteMoeHybridForCausalLM:
 
         # Generate position IDs if not provided
         if position_ids is None:
-            position_ids = torch.arange(
-                self.cache_manager.get_position(),
-                self.cache_manager.get_position() + seq_len,
-                dtype=torch.long,
-                device=input_ids.device
-            ).unsqueeze(0).expand(batch_size, -1)
+            position_ids = (
+                torch.arange(
+                    self.cache_manager.get_position(),
+                    self.cache_manager.get_position() + seq_len,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
 
         # Embed tokens (on CPU)
         hidden_states = self.embed_tokens(input_ids)  # [batch, seq, hidden_size]
@@ -285,42 +316,52 @@ class TTGraniteMoeHybridForCausalLM:
         # DEBUG: Track scale through layers
         DEBUG_SCALE = False
         if DEBUG_SCALE and seq_len > 1:
-            print(f"[DEBUG] After embeddings (before scaling): range=[{hidden_states.min():.3f}, {hidden_states.max():.3f}], mean={hidden_states.mean():.6f}")
+            print(
+                f"[DEBUG] After embeddings (before scaling): range=[{hidden_states.min():.3f}, {hidden_states.max():.3f}], mean={hidden_states.mean():.6f}"
+            )
 
         # Apply embedding multiplier (granite-1b uses 12.0)
         if self.config.embedding_multiplier != 1.0:
             hidden_states = hidden_states * self.config.embedding_multiplier
 
         if DEBUG_SCALE and seq_len > 1:
-            print(f"[DEBUG] After embeddings (scaled by {self.config.embedding_multiplier}): range=[{hidden_states.min():.3f}, {hidden_states.max():.3f}], mean={hidden_states.mean():.6f}")
+            print(
+                f"[DEBUG] After embeddings (scaled by {self.config.embedding_multiplier}): range=[{hidden_states.min():.3f}, {hidden_states.max():.3f}], mean={hidden_states.mean():.6f}"
+            )
 
         # Process through all decoder layers
         for layer_idx, layer in enumerate(self.layers):
             hidden_states = layer.forward(
-                hidden_states,
-                self.cache_manager,
-                position_ids,
-                attention_mask
+                hidden_states, self.cache_manager, position_ids, attention_mask
             )
 
             # DEBUG: Track scale at key layers
             if DEBUG_SCALE and seq_len > 1 and layer_idx in [0, 1, 2, 10, 20, 30, 39]:
                 layer_type = "Attention" if layer.is_attention_layer else "Mamba"
                 abs_mean = hidden_states.abs().mean().item()
-                print(f"[DEBUG] Layer {layer_idx:2d} ({layer_type:9s}): range=[{hidden_states.min():7.3f}, {hidden_states.max():7.3f}], abs_mean={abs_mean:7.3f}")
+                print(
+                    f"[DEBUG] Layer {layer_idx:2d} ({layer_type:9s}): range=[{hidden_states.min():7.3f}, {hidden_states.max():7.3f}], abs_mean={abs_mean:7.3f}"
+                )
 
             # Only print during prefill (seq_len > 1), not during decode
             if self.verbose and layer_idx < 3 and seq_len > 1:
                 layer_type = "Attention" if layer.is_attention_layer else "Mamba"
-                print(f"    Layer {layer_idx} ({layer_type}): shape={hidden_states.shape}")
+                print(
+                    f"    Layer {layer_idx} ({layer_type}): shape={hidden_states.shape}"
+                )
 
         # Final norm (on TT) - single conversion round-trip
         if DEBUG_SCALE and seq_len > 1:
-            print(f"[DEBUG] Before final norm: range=[{hidden_states.min():7.3f}, {hidden_states.max():7.3f}], abs_mean={hidden_states.abs().mean():7.3f}")
+            print(
+                f"[DEBUG] Before final norm: range=[{hidden_states.min():7.3f}, {hidden_states.max():7.3f}], abs_mean={hidden_states.abs().mean():7.3f}"
+            )
 
         # Mesh mapper for input replication
         mesh_mapper = None
-        if hasattr(self.device, 'get_num_devices') and self.device.get_num_devices() > 1:
+        if (
+            hasattr(self.device, "get_num_devices")
+            and self.device.get_num_devices() > 1
+        ):
             mesh_mapper = ttnn.ReplicateTensorToMesh(self.device)
 
         hidden_states_tt = to_tt_tensor(
@@ -328,26 +369,34 @@ class TTGraniteMoeHybridForCausalLM:
             self.device,
             self.config.get_ttnn_dtype(),
             layout=ttnn.ROW_MAJOR_LAYOUT,
-            mesh_mapper=mesh_mapper
+            mesh_mapper=mesh_mapper,
         )
         hidden_states_tt = self.norm(hidden_states_tt)
-        hidden_states = to_torch_tensor(hidden_states_tt, target_shape=hidden_states.shape)
+        hidden_states = to_torch_tensor(
+            hidden_states_tt, target_shape=hidden_states.shape
+        )
 
         if DEBUG_SCALE and seq_len > 1:
-            print(f"[DEBUG] After final norm: range=[{hidden_states.min():7.3f}, {hidden_states.max():7.3f}], abs_mean={hidden_states.abs().mean():7.3f}")
+            print(
+                f"[DEBUG] After final norm: range=[{hidden_states.min():7.3f}, {hidden_states.max():7.3f}], abs_mean={hidden_states.abs().mean():7.3f}"
+            )
 
         # LM head (on CPU - large vocab matmul)
         logits = self.lm_head(hidden_states)  # [batch, seq, vocab_size]
 
         if DEBUG_SCALE and seq_len > 1:
-            print(f"[DEBUG] After LM head (before scaling): range=[{logits[0,-1].min():7.3f}, {logits[0,-1].max():7.3f}], abs_mean={logits[0,-1].abs().mean():7.3f}")
+            print(
+                f"[DEBUG] After LM head (before scaling): range=[{logits[0,-1].min():7.3f}, {logits[0,-1].max():7.3f}], abs_mean={logits[0,-1].abs().mean():7.3f}"
+            )
 
         # Apply logits scaling (granite-1b uses scaling factor of 6.0)
         if self.config.logits_scaling != 1.0:
             logits = logits / self.config.logits_scaling
 
         if DEBUG_SCALE and seq_len > 1:
-            print(f"[DEBUG] After logits scaling (/{self.config.logits_scaling}): abs_mean={logits[0,-1].abs().mean():7.3f}")
+            print(
+                f"[DEBUG] After logits scaling (/{self.config.logits_scaling}): abs_mean={logits[0,-1].abs().mean():7.3f}"
+            )
 
         # Update position tracker if using cache
         if use_cache:
@@ -359,8 +408,8 @@ class TTGraniteMoeHybridForCausalLM:
         """Reset KV cache for new generation."""
         self.cache_manager.reset()
         # Reset hybrid cache if it exists
-        if hasattr(self.cache_manager, 'hybrid_cache'):
-            delattr(self.cache_manager, 'hybrid_cache')
+        if hasattr(self.cache_manager, "hybrid_cache"):
+            delattr(self.cache_manager, "hybrid_cache")
 
     def print_cache_stats(self):
         """Print cache statistics."""
@@ -374,7 +423,7 @@ class TTGraniteMoeHybridForCausalLM:
         dtype: str = "bfloat16",
         torch_dtype=torch.bfloat16,
         trust_remote_code: bool = True,
-        verbose: bool = True
+        verbose: bool = True,
     ):
         """
         Load model from HuggingFace and convert to TT format.
@@ -395,9 +444,7 @@ class TTGraniteMoeHybridForCausalLM:
 
         # Load HuggingFace model
         hf_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=torch_dtype,
-            trust_remote_code=trust_remote_code
+            model_name, dtype=torch_dtype, trust_remote_code=trust_remote_code
         )
         hf_model.eval()  # Set to evaluation mode
 

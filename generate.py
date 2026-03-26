@@ -26,39 +26,43 @@ Usage:
 """
 
 import argparse
+import time
+
 import torch
 import ttnn
-import time
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typing import List
 
 
 def generate_hf(prompts, max_tokens=10, batch_size=1):
     """Generate text with HuggingFace model."""
-    print("\n" + "="*70)
-    print("HUGGINGFACE MODEL")
-    print("="*70)
+    print("\n" + "=" * 70)
+    print("HUGGINGFACE MODEL (CPU)")
+    print("=" * 70)
 
     if isinstance(prompts, str):
         prompts = [prompts]
     if len(prompts) < batch_size:
         prompts = (prompts * batch_size)[:batch_size]
 
-    tokenizer = AutoTokenizer.from_pretrained('ibm-granite/granite-4.0-h-1b')
+    tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-4.0-h-1b")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    print("\nLoading model to CPU...")
+    load_start = time.time()
     model = AutoModelForCausalLM.from_pretrained(
-        'ibm-granite/granite-4.0-h-1b',
+        "ibm-granite/granite-4.0-h-1b",
         torch_dtype=torch.bfloat16,
-        trust_remote_code=True
+        trust_remote_code=True,
     )
+    load_time = time.time() - load_start
+    print(f"Model loaded in {load_time:.2f}s")
 
     inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
 
     print(f"\nBatch size: {batch_size}")
     print(f"Prompts: {len(prompts)}")
-    print(f"Prompt: \"{prompts[0]}\"")
+    print(f'Prompt: "{prompts[0]}"')
     print(f"Generating {max_tokens} tokens per prompt...")
 
     start_time = time.time()
@@ -67,37 +71,40 @@ def generate_hf(prompts, max_tokens=10, batch_size=1):
             **inputs,
             max_new_tokens=max_tokens,
             do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
+            pad_token_id=tokenizer.eos_token_id,
         )
-    elapsed_time = time.time() - start_time
+    gen_time = time.time() - start_time
 
     texts = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
     all_ids = [output.tolist() for output in outputs]
 
     total_tokens_generated = sum(
-        len(output) - len(inputs['input_ids'][i])
-        for i, output in enumerate(outputs)
+        len(output) - len(inputs["input_ids"][i]) for i, output in enumerate(outputs)
     )
-    tokens_per_sec = total_tokens_generated / elapsed_time if elapsed_time > 0 else 0
+    tokens_per_sec = total_tokens_generated / gen_time if gen_time > 0 else 0
 
     print(f"\nOutput (first sample):\n{texts[0]}")
     if batch_size > 1:
         print(f"\n... ({batch_size - 1} more samples)")
-    print(f"\nPerformance:")
-    print(f"  Time: {elapsed_time:.3f}s")
-    print(f"  Total tokens: {total_tokens_generated}")
-    print(f"  Throughput: {tokens_per_sec:.2f} tokens/sec")
-    print(f"  Per-sample: {tokens_per_sec/batch_size:.2f} tokens/sec")
-    print("\n" + "="*70)
 
-    return texts, all_ids, elapsed_time
+    total_time = load_time + gen_time
+    print(f"\nPerformance:")
+    print(f"  Total time:  {total_time:.3f}s")
+    print(f"    - Load:    {load_time:.3f}s")
+    print(f"    - Generate:{gen_time:.3f}s")
+    print(f"  Total tokens: {total_tokens_generated}")
+    print(f"  Throughput:  {tokens_per_sec:.2f} tokens/sec")
+    print(f"  Per-sample:  {tokens_per_sec/batch_size:.2f} tokens/sec")
+    print("\n" + "=" * 70)
+
+    return texts, all_ids, gen_time
 
 
 def generate_a100(prompts, max_tokens=10, batch_size=1):
     """Generate text with NVIDIA A100 GPU."""
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("NVIDIA A100 GPU")
-    print("="*70)
+    print("=" * 70)
 
     if isinstance(prompts, str):
         prompts = [prompts]
@@ -113,17 +120,17 @@ def generate_a100(prompts, max_tokens=10, batch_size=1):
     print(f"CUDA Version: {torch.version.cuda}")
     print(f"Initial GPU Memory: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
 
-    tokenizer = AutoTokenizer.from_pretrained('ibm-granite/granite-4.0-h-1b')
+    tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-4.0-h-1b")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     print("\nLoading model to GPU...")
     load_start = time.time()
     model = AutoModelForCausalLM.from_pretrained(
-        'ibm-granite/granite-4.0-h-1b',
+        "ibm-granite/granite-4.0-h-1b",
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        device_map="auto"  # Automatically map to available GPU
+        device_map="auto",  # Automatically map to available GPU
     )
     load_time = time.time() - load_start
     print(f"Model loaded in {load_time:.2f}s")
@@ -134,7 +141,7 @@ def generate_a100(prompts, max_tokens=10, batch_size=1):
 
     print(f"\nBatch size: {batch_size}")
     print(f"Prompts: {len(prompts)}")
-    print(f"Prompt: \"{prompts[0]}\"")
+    print(f'Prompt: "{prompts[0]}"')
     print(f"Generating {max_tokens} tokens per prompt...")
 
     # Warmup run (compile CUDA kernels)
@@ -144,7 +151,7 @@ def generate_a100(prompts, max_tokens=10, batch_size=1):
             **inputs,
             max_new_tokens=2,
             do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
+            pad_token_id=tokenizer.eos_token_id,
         )
     torch.cuda.synchronize()
     print("done")
@@ -157,7 +164,7 @@ def generate_a100(prompts, max_tokens=10, batch_size=1):
             **inputs,
             max_new_tokens=max_tokens,
             do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
+            pad_token_id=tokenizer.eos_token_id,
         )
     torch.cuda.synchronize()
     elapsed_time = time.time() - start_time
@@ -166,8 +173,7 @@ def generate_a100(prompts, max_tokens=10, batch_size=1):
     all_ids = [output.tolist() for output in outputs]
 
     total_tokens_generated = sum(
-        len(output) - len(inputs['input_ids'][i])
-        for i, output in enumerate(outputs)
+        len(output) - len(inputs["input_ids"][i]) for i, output in enumerate(outputs)
     )
     tokens_per_sec = total_tokens_generated / elapsed_time if elapsed_time > 0 else 0
 
@@ -183,7 +189,7 @@ def generate_a100(prompts, max_tokens=10, batch_size=1):
     print(f"  Throughput:  {tokens_per_sec:.2f} tokens/sec")
     print(f"  Per-sample:  {tokens_per_sec/batch_size:.2f} tokens/sec")
     print(f"  Peak GPU Memory: {torch.cuda.max_memory_allocated(0) / 1024**3:.2f} GB")
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
 
     return texts, all_ids, elapsed_time
 
@@ -191,6 +197,7 @@ def generate_a100(prompts, max_tokens=10, batch_size=1):
 # Full system mesh shape — must match physical topology (32 cards = 4x8)
 _SYSTEM_MESH_SHAPE = ttnn.MeshShape(4, 8)
 _SYSTEM_NUM_DEVICES = 32
+
 
 def _open_device(num_devices: int = 1):
     """
@@ -207,10 +214,10 @@ def _open_device(num_devices: int = 1):
     """
 
     mesh_shape_map = {
-        1:  ttnn.MeshShape(1, 1),
-        2:  ttnn.MeshShape(1, 2),
-        4:  ttnn.MeshShape(2, 2),
-        8:  ttnn.MeshShape(2, 4),
+        1: ttnn.MeshShape(1, 1),
+        2: ttnn.MeshShape(1, 2),
+        4: ttnn.MeshShape(2, 2),
+        8: ttnn.MeshShape(2, 4),
         16: ttnn.MeshShape(4, 4),
         32: ttnn.MeshShape(4, 8),
     }
@@ -274,9 +281,9 @@ def generate_tt(prompts, max_tokens=10, batch_size=1, num_devices=1):
     This is critical for performance. Passing the full sequence every step causes
     the model to re-run prefill (O(seq_len) work) instead of decode (O(1) work).
     """
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("TT-OPTIMIZED MODEL")
-    print("="*70)
+    print("=" * 70)
 
     if isinstance(prompts, str):
         prompts = [prompts]
@@ -288,16 +295,14 @@ def generate_tt(prompts, max_tokens=10, batch_size=1, num_devices=1):
     try:
         from tt_model.model import TTGraniteMoeHybridForCausalLM
 
-        tokenizer = AutoTokenizer.from_pretrained('ibm-granite/granite-4.0-h-1b')
+        tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-4.0-h-1b")
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
         print("\nLoading TT model...")
         load_start = time.time()
         tt_model = TTGraniteMoeHybridForCausalLM.from_pretrained(
-            'ibm-granite/granite-4.0-h-1b',
-            device,
-            verbose=False
+            "ibm-granite/granite-4.0-h-1b", device, verbose=False
         )
         load_time = time.time() - load_start
         print(f"Model loaded in {load_time:.2f}s")
@@ -306,11 +311,11 @@ def generate_tt(prompts, max_tokens=10, batch_size=1, num_devices=1):
         _warmup(tt_model, tokenizer, device)
 
         inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-        input_ids = inputs['input_ids']  # [batch, prompt_len]
+        input_ids = inputs["input_ids"]  # [batch, prompt_len]
 
         print(f"\nBatch size: {batch_size}")
         print(f"Prompts: {len(prompts)}")
-        print(f"Prompt: \"{prompts[0]}\"")
+        print(f'Prompt: "{prompts[0]}"')
         print(f"Generating {max_tokens} tokens per prompt...")
 
         all_generated_ids = []
@@ -323,14 +328,14 @@ def generate_tt(prompts, max_tokens=10, batch_size=1, num_devices=1):
         # TODO: Implement data parallelism to process different samples on different devices.
         # With 32 devices, we could process up to 32 samples in parallel!
         for batch_idx in range(batch_size):
-            prompt_ids = input_ids[batch_idx:batch_idx+1]  # [1, prompt_len]
+            prompt_ids = input_ids[batch_idx : batch_idx + 1]  # [1, prompt_len]
             generated_ids = input_ids[batch_idx].tolist()
 
             # ── PREFILL ───────────────────────────────────────────────────
             # Pass the full prompt; cache is populated; we get logits for all
             # positions but only use the last one to pick the first new token.
             with torch.no_grad():
-                logits = tt_model.forward(prompt_ids)          # [1, prompt_len, vocab]
+                logits = tt_model.forward(prompt_ids)  # [1, prompt_len, vocab]
 
             next_token = logits[0, -1, :].argmax().item()
             generated_ids.append(next_token)
@@ -347,7 +352,7 @@ def generate_tt(prompts, max_tokens=10, batch_size=1, num_devices=1):
 
                 decode_ids = torch.tensor([[next_token]], dtype=torch.long)  # [1, 1]
                 with torch.no_grad():
-                    logits = tt_model.forward(decode_ids)      # [1, 1, vocab]
+                    logits = tt_model.forward(decode_ids)  # [1, 1, vocab]
 
                 next_token = logits[0, -1, :].argmax().item()
                 generated_ids.append(next_token)
@@ -375,10 +380,10 @@ def generate_tt(prompts, max_tokens=10, batch_size=1, num_devices=1):
         print(f"  Total time:  {elapsed_time:.3f}s")
         print(f"    - Load:    {load_time:.3f}s")
         print(f"    - Generate:{gen_time:.3f}s")
-        print(f"  Total tokens generated: {total_tokens_generated}")
+        print(f"  Total tokens: {total_tokens_generated}")
         print(f"  Throughput:  {tokens_per_sec:.2f} tokens/sec")
         print(f"  Per-sample:  {tokens_per_sec/batch_size:.2f} tokens/sec")
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
 
         return all_texts, all_generated_ids, gen_time
 
@@ -388,20 +393,22 @@ def generate_tt(prompts, max_tokens=10, batch_size=1, num_devices=1):
 
 def compare(prompts, max_tokens=10, batch_size=1, num_devices=1):
     """Run both models and compare outputs."""
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("COMPARING HF vs TT")
-    print("="*70)
+    print("=" * 70)
 
     hf_texts, hf_ids_list, hf_time = generate_hf(prompts, max_tokens, batch_size)
-    tt_texts, tt_ids_list, tt_time = generate_tt(prompts, max_tokens, batch_size, num_devices)
+    tt_texts, tt_ids_list, tt_time = generate_tt(
+        prompts, max_tokens, batch_size, num_devices
+    )
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("COMPARISON")
-    print("="*70)
+    print("=" * 70)
 
     print(f"\nFirst sample comparison:")
-    print(f"HF output: \"{hf_texts[0]}\"")
-    print(f"TT output: \"{tt_texts[0]}\"")
+    print(f'HF output: "{hf_texts[0]}"')
+    print(f'TT output: "{tt_texts[0]}"')
 
     if hf_ids_list[0] == tt_ids_list[0]:
         print("\n✓ IDENTICAL! Both models generated the same tokens")
@@ -426,26 +433,34 @@ def compare(prompts, max_tokens=10, batch_size=1, num_devices=1):
 
     if tt_time < hf_time:
         speedup = hf_time / tt_time
-        print(f"  Speedup: {speedup:.2f}x faster ({((hf_time-tt_time)/hf_time)*100:.1f}% improvement)")
+        print(
+            f"  Speedup: {speedup:.2f}x faster ({((hf_time-tt_time)/hf_time)*100:.1f}% improvement)"
+        )
     elif tt_time > hf_time:
         slowdown = tt_time / hf_time
-        print(f"  Slowdown: {slowdown:.2f}x slower ({((tt_time-hf_time)/hf_time)*100:.1f}% regression)")
+        print(
+            f"  Slowdown: {slowdown:.2f}x slower ({((tt_time-hf_time)/hf_time)*100:.1f}% regression)"
+        )
     else:
         print(f"  No difference")
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
 
 
 def main():
     parser = argparse.ArgumentParser(description="TT-Granite text generation")
-    parser.add_argument('--model', choices=['hf', 'tt', 'a100'])
-    parser.add_argument('--compare', action='store_true')
-    parser.add_argument('--prompt', type=str, default='The future of AI is')
-    parser.add_argument('--prompts', type=str, nargs='+')
-    parser.add_argument('--max-tokens', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=1)
-    parser.add_argument('--num-devices', type=int, default=1,
-                        help='Number of TT devices to use (default: 1)')
+    parser.add_argument("--model", choices=["hf", "tt", "a100"])
+    parser.add_argument("--compare", action="store_true")
+    parser.add_argument("--prompt", type=str, default="The future of AI is")
+    parser.add_argument("--prompts", type=str, nargs="+")
+    parser.add_argument("--max-tokens", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--num-devices",
+        type=int,
+        default=1,
+        help="Number of TT devices to use (default: 1)",
+    )
 
     args = parser.parse_args()
 
@@ -456,11 +471,11 @@ def main():
 
     if args.compare:
         compare(prompts, args.max_tokens, args.batch_size, args.num_devices)
-    elif args.model == 'hf':
+    elif args.model == "hf":
         generate_hf(prompts, args.max_tokens, args.batch_size)
-    elif args.model == 'tt':
+    elif args.model == "tt":
         generate_tt(prompts, args.max_tokens, args.batch_size, args.num_devices)
-    elif args.model == 'a100':
+    elif args.model == "a100":
         generate_a100(prompts, args.max_tokens, args.batch_size)
 
 

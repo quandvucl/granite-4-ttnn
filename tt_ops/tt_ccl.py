@@ -1,7 +1,5 @@
-"""
-Simple TT_CCL wrapper for managing collective communication semaphores.
-Based on tt-metal/models/tt_transformers/tt/ccl.py
-"""
+"""Collective communication semaphore management for multi-device operations."""
+
 import ttnn
 
 
@@ -12,15 +10,17 @@ class SimpleTTCCL:
         self.mesh_device = mesh_device
 
         # Create core range set for all compute cores
-        self.sub_device_crs = ttnn.CoreRangeSet({
-            ttnn.CoreRange(
-                ttnn.CoreCoord(0, 0),
-                ttnn.CoreCoord(
-                    mesh_device.compute_with_storage_grid_size().x - 1,
-                    mesh_device.compute_with_storage_grid_size().y - 1,
-                ),
-            )
-        })
+        self.sub_device_crs = ttnn.CoreRangeSet(
+            {
+                ttnn.CoreRange(
+                    ttnn.CoreCoord(0, 0),
+                    ttnn.CoreCoord(
+                        mesh_device.compute_with_storage_grid_size().x - 1,
+                        mesh_device.compute_with_storage_grid_size().y - 1,
+                    ),
+                )
+            }
+        )
 
         # Initialize semaphore indices (double-buffered)
         self.barrier_semaphore_idx = 0
@@ -33,7 +33,10 @@ class SimpleTTCCL:
         ]
 
         self.rs_semaphore_handles = [
-            [ttnn.create_global_semaphore(mesh_device, self.sub_device_crs, 0) for _ in range(3)]
+            [
+                ttnn.create_global_semaphore(mesh_device, self.sub_device_crs, 0)
+                for _ in range(3)
+            ]
             for _ in range(2)
         ]
 

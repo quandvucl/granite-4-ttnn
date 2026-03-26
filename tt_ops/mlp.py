@@ -1,8 +1,9 @@
-import ttnn
-import torch
-from tt_ops.base import TTOperation, to_tt_tensor, to_torch_tensor, tt_linear
+"""Shared gated MLP with SwiGLU activation."""
 
-DEBUG = False
+import torch
+import ttnn
+
+from tt_ops.base import TTOperation, to_torch_tensor, to_tt_tensor
 
 
 class TTSharedMLP(TTOperation):
@@ -18,13 +19,19 @@ class TTSharedMLP(TTOperation):
     Supports tensor parallelism when weights are sharded across mesh devices.
     """
 
-    def __init__(self, device, hidden_size: int, intermediate_size: int, dtype=ttnn.bfloat16, tensor_parallel: bool = False, tt_ccl=None):
+    def __init__(
+        self,
+        device,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype=ttnn.bfloat16,
+        tensor_parallel: bool = False,
+    ):
         super().__init__(device, dtype)
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.tensor_parallel = tensor_parallel
-        self.is_mesh = hasattr(device, 'get_num_devices')
-        self.tt_ccl = tt_ccl
+        self.is_mesh = hasattr(device, "get_num_devices")
 
         # Weights (will be loaded separately)
         self.gate_proj_weight = None
@@ -72,7 +79,9 @@ class TTSharedMLP(TTOperation):
         output = torch.nn.functional.linear(activated, down_weight_torch)
 
         # Convert back to TTNN
-        output_tt = to_tt_tensor(output, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+        output_tt = to_tt_tensor(
+            output, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT
+        )
 
         return output_tt
 
@@ -90,11 +99,13 @@ class TTSharedMLP(TTOperation):
         # Gate and up projections (fused where possible)
         # These are independent and could be batched, but TTNN handles this internally
         gate = hidden_states @ self.gate_proj_weight  # [B, S, H] @ [H, I] = [B, S, I]
-        up = hidden_states @ self.up_proj_weight      # [B, S, H] @ [H, I] = [B, S, I]
+        up = hidden_states @ self.up_proj_weight  # [B, S, H] @ [H, I] = [B, S, I]
 
         # SwiGLU activation: silu(gate) * up
         # Using fused operation: applies silu to gate and multiplies with up in one kernel
-        activated = ttnn.mul(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
+        activated = ttnn.mul(
+            gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU]
+        )
 
         # Deallocate intermediate tensors to free memory faster
         gate.deallocate(True)
@@ -117,25 +128,29 @@ class TTSharedMLP(TTOperation):
 
         Input tensors must be replicated across all devices (handled by to_tt_tensor with mesh_mapper).
         """
-        DEBUG_TP = False  # Set to True to see if TP is being used
-        if DEBUG_TP:
-            print(f"[MLP TP] Using tensor parallel path with {self.device.get_num_devices()} devices")
-
         # Ensure tile layout for matmuls
         if hidden_states.layout != ttnn.TILE_LAYOUT:
             hidden_states = ttnn.to_layout(hidden_states, ttnn.TILE_LAYOUT)
 
         # Column parallel: gate_proj and up_proj
         # Input replicated, weights sharded column-wise, output sharded
-        gate = hidden_states @ self.gate_proj_weight  # [B, S, H] @ [H, I/N] = [B, S, I/N] on each device
-        up = hidden_states @ self.up_proj_weight      # [B, S, H] @ [H, I/N] = [B, S, I/N] on each device
+        gate = (
+            hidden_states @ self.gate_proj_weight
+        )  # [B, S, H] @ [H, I/N] = [B, S, I/N] on each device
+        up = (
+            hidden_states @ self.up_proj_weight
+        )  # [B, S, H] @ [H, I/N] = [B, S, I/N] on each device
 
         # SwiGLU activation: silu(gate) * up
-        activated = ttnn.mul(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
+        activated = ttnn.mul(
+            gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU]
+        )
 
         # Row parallel: down_proj
         # Input sharded, weights sharded row-wise, output needs all-reduce
-        output_partial = activated @ self.down_proj_weight  # [B, S, I/N] @ [I/N, H] = [B, S, H] partial
+        output_partial = (
+            activated @ self.down_proj_weight
+        )  # [B, S, I/N] @ [I/N, H] = [B, S, H] partial
 
         # All-reduce to sum partial results from all devices
         # Convert shape to tuple for later use (ttnn.Shape -> Python tuple)
@@ -145,7 +160,12 @@ class TTSharedMLP(TTOperation):
         if original_shape[0] != 1 or original_shape[1] != 1:
             output_partial = ttnn.reshape(
                 output_partial,
-                (1, 1, original_shape[0] * original_shape[1] * original_shape[2], original_shape[3])
+                (
+                    1,
+                    1,
+                    original_shape[0] * original_shape[1] * original_shape[2],
+                    original_shape[3],
+                ),
             )
 
         # All-reduce to sum partial results from all devices
@@ -153,7 +173,6 @@ class TTSharedMLP(TTOperation):
         # Optimized: minimize copies and use efficient torch operations
         num_devices = self.device.get_num_devices()
         if num_devices > 1:
-            import torch
 
             # Get shards from all devices (each has partial result from row-parallel matmul)
             shards = ttnn.get_device_tensors(output_partial)
@@ -174,7 +193,7 @@ class TTSharedMLP(TTOperation):
                 dtype=self.dtype,
                 layout=ttnn.TILE_LAYOUT,
                 device=self.device,
-                mesh_mapper=mesh_mapper
+                mesh_mapper=mesh_mapper,
             )
         else:
             output = output_partial
@@ -187,7 +206,9 @@ class TTSharedMLP(TTOperation):
         return output
 
 
-def split_combined_mlp_weight(combined_weight_tt, device, dtype, hidden_size, intermediate_size):
+def split_combined_mlp_weight(
+    combined_weight_tt, device, dtype, hidden_size, intermediate_size
+):
     """
     Split Granite's combined input_linear weight into gate_proj and up_proj.
 
@@ -203,8 +224,7 @@ def split_combined_mlp_weight(combined_weight_tt, device, dtype, hidden_size, in
     """
     # Convert to PyTorch for splitting
     combined_torch = to_torch_tensor(
-        combined_weight_tt,
-        target_shape=(hidden_size, intermediate_size * 2)
+        combined_weight_tt, target_shape=(hidden_size, intermediate_size * 2)
     )
 
     # Split along last dimension

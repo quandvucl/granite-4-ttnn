@@ -1,6 +1,9 @@
-import ttnn
+"""TT-Granite model configuration."""
+
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import List
+
+import ttnn
 
 
 @dataclass
@@ -77,17 +80,17 @@ class TTGraniteConfig:
         }
 
         # Add optional attributes if they exist
-        if hasattr(hf_config, 'rope_theta'):
+        if hasattr(hf_config, "rope_theta"):
             config_dict["rope_theta"] = hf_config.rope_theta
-        if hasattr(hf_config, 'attention_dropout'):
+        if hasattr(hf_config, "attention_dropout"):
             config_dict["attention_dropout"] = hf_config.attention_dropout
-        if hasattr(hf_config, 'residual_multiplier'):
+        if hasattr(hf_config, "residual_multiplier"):
             config_dict["residual_multiplier"] = hf_config.residual_multiplier
-        if hasattr(hf_config, 'attention_layer_indices'):
+        if hasattr(hf_config, "attention_layer_indices"):
             config_dict["attention_layer_indices"] = hf_config.attention_layer_indices
-        if hasattr(hf_config, 'logits_scaling'):
+        if hasattr(hf_config, "logits_scaling"):
             config_dict["logits_scaling"] = hf_config.logits_scaling
-        if hasattr(hf_config, 'embedding_multiplier'):
+        if hasattr(hf_config, "embedding_multiplier"):
             config_dict["embedding_multiplier"] = hf_config.embedding_multiplier
 
         # Override with kwargs
@@ -120,7 +123,9 @@ class TTGraniteConfig:
         print(f"  Residual multiplier: {self.residual_multiplier}")
         print(f"\nLayer Configuration:")
         print(f"  Attention layers: {self.attention_layer_indices}")
-        print(f"  Mamba layers: {[i for i in range(self.num_hidden_layers) if i not in self.attention_layer_indices]}")
+        print(
+            f"  Mamba layers: {[i for i in range(self.num_hidden_layers) if i not in self.attention_layer_indices]}"
+        )
         print(f"\nTT Settings:")
         print(f"  Device ID: {self.device_id}")
         print(f"  Dtype: {self.dtype}")

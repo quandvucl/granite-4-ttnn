@@ -1,21 +1,28 @@
-import ttnn
-import torch
-from typing import Optional, Tuple
-from pathlib import Path
+"""Hybrid Granite decoder layer with attention and Mamba support."""
+
 import sys
-sys.path.append(str(Path(__file__).parent.parent))
+from pathlib import Path
+from typing import Optional
+
+import torch
 import ttnn
-from tt_ops.base import to_tt_tensor, to_torch_tensor, to_tile_layout
+
+sys.path.append(str(Path(__file__).parent.parent))
 from tt_ops.attention_tt import TTAttentionOptimized
-from tt_ops.mlp import TTSharedMLP
-from tt_ops.mamba import SimpleMamba2TTNN
-from tt_ops.normalization import TTRMSNorm
+from tt_ops.base import to_torch_tensor, to_tt_tensor
 from tt_ops.cache import HybridKVCacheManager
+from tt_ops.mamba_prefill import SimpleMamba2TTNN
+from tt_ops.mlp import TTSharedMLP
+from tt_ops.normalization import TTRMSNorm
 
 
 def _to_tt_replicated(tensor, device, dtype, layout=ttnn.ROW_MAJOR_LAYOUT):
     """Convert to TT tensor, replicating across all devices on MeshDevice."""
-    mesh_mapper = ttnn.ReplicateTensorToMesh(device) if hasattr(device, 'get_num_devices') else None
+    mesh_mapper = (
+        ttnn.ReplicateTensorToMesh(device)
+        if hasattr(device, "get_num_devices")
+        else None
+    )
     return to_tt_tensor(tensor, device, dtype, layout=layout, mesh_mapper=mesh_mapper)
 
 
@@ -54,7 +61,7 @@ class TTGraniteDecoderLayer:
         hf_config=None,
         dtype=ttnn.bfloat16,
         tensor_parallel=False,
-        tt_ccl=None
+        tt_ccl=None,
     ):
         self.device = device
         self.layer_idx = layer_idx
@@ -68,10 +75,16 @@ class TTGraniteDecoderLayer:
         self.tt_ccl = tt_ccl
 
         # Residual multiplier (0.22 for granite-1b)
-        self.residual_multiplier = config.residual_multiplier if hasattr(config, 'residual_multiplier') else 1.0
+        self.residual_multiplier = (
+            config.residual_multiplier
+            if hasattr(config, "residual_multiplier")
+            else 1.0
+        )
 
         # Detect mesh device
-        self.is_mesh = hasattr(device, 'get_num_devices') and device.get_num_devices() > 1
+        self.is_mesh = (
+            hasattr(device, "get_num_devices") and device.get_num_devices() > 1
+        )
 
         # Layer norms
         # For mesh devices, skip weight cache and use HF weights directly
@@ -79,24 +92,58 @@ class TTGraniteDecoderLayer:
 
         if is_mesh:
             # Use HF weights directly for mesh (weight distribution not yet implemented)
-            self.input_layernorm = TTRMSNorm(device, hf_layer.input_layernorm.weight, eps=config.rms_norm_eps, dtype=dtype)
-            self.post_attention_layernorm = TTRMSNorm(device, hf_layer.post_attention_layernorm.weight, eps=config.rms_norm_eps, dtype=dtype)
+            self.input_layernorm = TTRMSNorm(
+                device,
+                hf_layer.input_layernorm.weight,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+            )
+            self.post_attention_layernorm = TTRMSNorm(
+                device,
+                hf_layer.post_attention_layernorm.weight,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+            )
         else:
             # Single device: try weight cache first
-            input_norm_weight = weight_cache.get(f"layers.{layer_idx}.input_layernorm.weight")
-            post_attn_norm_weight = weight_cache.get(f"layers.{layer_idx}.post_attention_layernorm.weight")
+            input_norm_weight = weight_cache.get(
+                f"layers.{layer_idx}.input_layernorm.weight"
+            )
+            post_attn_norm_weight = weight_cache.get(
+                f"layers.{layer_idx}.post_attention_layernorm.weight"
+            )
 
             if input_norm_weight is not None and post_attn_norm_weight is not None:
                 # Convert to torch first
                 input_norm_weight_torch = input_norm_weight.to_torch()
                 post_attn_norm_weight_torch = post_attn_norm_weight.to_torch()
 
-                self.input_layernorm = TTRMSNorm(device, input_norm_weight_torch, eps=config.rms_norm_eps, dtype=dtype)
-                self.post_attention_layernorm = TTRMSNorm(device, post_attn_norm_weight_torch, eps=config.rms_norm_eps, dtype=dtype)
+                self.input_layernorm = TTRMSNorm(
+                    device,
+                    input_norm_weight_torch,
+                    eps=config.rms_norm_eps,
+                    dtype=dtype,
+                )
+                self.post_attention_layernorm = TTRMSNorm(
+                    device,
+                    post_attn_norm_weight_torch,
+                    eps=config.rms_norm_eps,
+                    dtype=dtype,
+                )
             else:
                 # Fallback: load directly from HF layer
-                self.input_layernorm = TTRMSNorm(device, hf_layer.input_layernorm.weight, eps=config.rms_norm_eps, dtype=dtype)
-                self.post_attention_layernorm = TTRMSNorm(device, hf_layer.post_attention_layernorm.weight, eps=config.rms_norm_eps, dtype=dtype)
+                self.input_layernorm = TTRMSNorm(
+                    device,
+                    hf_layer.input_layernorm.weight,
+                    eps=config.rms_norm_eps,
+                    dtype=dtype,
+                )
+                self.post_attention_layernorm = TTRMSNorm(
+                    device,
+                    hf_layer.post_attention_layernorm.weight,
+                    eps=config.rms_norm_eps,
+                    dtype=dtype,
+                )
 
         # Attention or Mamba
         if is_attention_layer:
@@ -104,30 +151,22 @@ class TTGraniteDecoderLayer:
             # Tensor parallelism disabled for attention due to complexity with Q/K/V gathering
             # (MLP tensor parallelism alone provides most of the speedup)
             self.attention_optimized = TTAttentionOptimized(
-                hf_attention=hf_layer.self_attn,
-                device=device,
-                dtype=dtype,
-                tensor_parallel=False,  # Disable TP for attention
-                tt_ccl=None
+                hf_attention=hf_layer.self_attn, device=device, dtype=dtype
             )
             self.attention = None
             self.mamba = None
         else:
             # Mamba layer - use optimized version for decode acceleration
-            from tt_ops.mamba_optimized import MambaDecodeOptimized
+            from tt_ops.mamba_decode import MambaDecodeOptimized
 
             self.attention = None
-            if hasattr(hf_layer, 'mamba'):
+            if hasattr(hf_layer, "mamba"):
                 # Use both original (for prefill) and optimized (for decode)
                 self.mamba = SimpleMamba2TTNN(
-                    hf_mamba=hf_layer.mamba,
-                    device=device,
-                    dtype=dtype
+                    hf_mamba=hf_layer.mamba, device=device, dtype=dtype
                 )
                 self.mamba_optimized = MambaDecodeOptimized(
-                    hf_mamba=hf_layer.mamba,
-                    device=device,
-                    dtype=dtype
+                    hf_mamba=hf_layer.mamba, device=device, dtype=dtype
                 )
             else:
                 self.mamba = None
@@ -138,7 +177,7 @@ class TTGraniteDecoderLayer:
         hidden_states: torch.Tensor,
         cache_manager: HybridKVCacheManager,
         position_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass of decoder layer.
@@ -158,25 +197,32 @@ class TTGraniteDecoderLayer:
             # ===== ATTENTION PATH (use HF directly with hybrid cache) =====
 
             # Initialize hybrid cache on first use
-            if not hasattr(cache_manager, 'hybrid_cache'):
-                from transformers.models.granitemoehybrid.modeling_granitemoehybrid import HybridMambaAttentionDynamicCache
+            if not hasattr(cache_manager, "hybrid_cache"):
+                from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
+                    HybridMambaAttentionDynamicCache,
+                )
+
                 cache_manager.hybrid_cache = HybridMambaAttentionDynamicCache(
                     config=self.hf_config,
                     batch_size=batch_size,
                     dtype=hidden_states.dtype,
-                    device=hidden_states.device
+                    device=hidden_states.device,
                 )
 
             # Determine if we're in prefill or decode
             start_pos = position_ids[0, 0].item()
-            is_prefill = (start_pos == 0)
+            is_prefill = start_pos == 0
             cache_manager.hybrid_cache.has_previous_state = not is_prefill
 
             # Pre-attention norm (use TT RMSNorm)
             residual = hidden_states
-            hidden_states_tt = to_tt_tensor(hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+            hidden_states_tt = to_tt_tensor(
+                hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
             hidden_states_tt = self.input_layernorm(hidden_states_tt)
-            hidden_states = to_torch_tensor(hidden_states_tt, target_shape=(batch_size, seq_len, hidden_size))
+            hidden_states = to_torch_tensor(
+                hidden_states_tt, target_shape=(batch_size, seq_len, hidden_size)
+            )
 
             # Attention - use TT-optimized attention (QKV/O projections with TT)
             # TT accelerates heavy matmuls, HF handles RoPE + cache
@@ -185,7 +231,6 @@ class TTGraniteDecoderLayer:
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=cache_manager.hybrid_cache,
-                use_cache=True
             )
 
             # Residual connection with multiplier (keep on CPU)
@@ -195,7 +240,9 @@ class TTGraniteDecoderLayer:
             residual = hidden_states
 
             # Single conversion to TT device
-            hidden_states_tt = _to_tt_replicated(hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+            hidden_states_tt = _to_tt_replicated(
+                hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
 
             # Norm (outputs ROW_MAJOR)
             hidden_states_tt = self.post_attention_layernorm(hidden_states_tt)
@@ -207,7 +254,9 @@ class TTGraniteDecoderLayer:
             hidden_states_tt.deallocate(True)
 
             # Single conversion back to CPU for residual
-            mlp_output = to_torch_tensor(mlp_output_tt, target_shape=(batch_size, seq_len, hidden_size))
+            mlp_output = to_torch_tensor(
+                mlp_output_tt, target_shape=(batch_size, seq_len, hidden_size)
+            )
 
             # Deallocate TT tensor
             mlp_output_tt.deallocate(True)
@@ -224,32 +273,41 @@ class TTGraniteDecoderLayer:
 
             # Pre-mamba norm (use TT for consistency)
             residual = hidden_states
-            hidden_states_tt = to_tt_tensor(hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+            hidden_states_tt = to_tt_tensor(
+                hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
             hidden_states_tt = self.input_layernorm(hidden_states_tt)
-            hidden_states = to_torch_tensor(hidden_states_tt, target_shape=(batch_size, seq_len, hidden_size))
+            hidden_states = to_torch_tensor(
+                hidden_states_tt, target_shape=(batch_size, seq_len, hidden_size)
+            )
 
             # Use optimized Mamba for decode, original for prefill
             if self.mamba is not None:
                 # Initialize cache on first use
-                if not hasattr(cache_manager, 'hybrid_cache'):
-                    from transformers.models.granitemoehybrid.modeling_granitemoehybrid import HybridMambaAttentionDynamicCache
+                if not hasattr(cache_manager, "hybrid_cache"):
+                    from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
+                        HybridMambaAttentionDynamicCache,
+                    )
+
                     cache_manager.hybrid_cache = HybridMambaAttentionDynamicCache(
                         config=self.hf_config,
                         batch_size=batch_size,
                         dtype=hidden_states.dtype,
-                        device=hidden_states.device
+                        device=hidden_states.device,
                     )
 
                 # Determine if we're in prefill (start_pos == 0) or decode (start_pos > 0)
                 start_pos = position_ids[0, 0].item()
-                is_prefill = (start_pos == 0)
-                is_decode = (seq_len == 1 and start_pos > 0)
+                is_prefill = start_pos == 0
+                is_decode = seq_len == 1 and start_pos > 0
 
                 # Set has_previous_state based on whether we're in prefill or decode
                 cache_manager.hybrid_cache.has_previous_state = not is_prefill
 
                 # Calculate cache_position based on current position
-                cache_position = torch.arange(start_pos, start_pos + seq_len, device=hidden_states.device)
+                cache_position = torch.arange(
+                    start_pos, start_pos + seq_len, device=hidden_states.device
+                )
 
                 # Use optimized path for decode, original for prefill
                 if is_decode and self.mamba_optimized is not None:
@@ -257,7 +315,6 @@ class TTGraniteDecoderLayer:
                     hidden_states_opt = self.mamba_optimized.forward_decode(
                         hidden_states,
                         cache_params=cache_manager.hybrid_cache,
-                        cache_position=cache_position
                     )
                     # If optimized returns None, fall back to original
                     if hidden_states_opt is not None:
@@ -267,7 +324,7 @@ class TTGraniteDecoderLayer:
                             hidden_states,
                             cache_params=cache_manager.hybrid_cache,
                             cache_position=cache_position,
-                            attention_mask=None
+                            attention_mask=None,
                         )
                 else:
                     # Original path for prefill or if optimized not available
@@ -275,10 +332,12 @@ class TTGraniteDecoderLayer:
                         hidden_states,
                         cache_params=cache_manager.hybrid_cache,
                         cache_position=cache_position,
-                        attention_mask=None
+                        attention_mask=None,
                     )
             else:
-                raise ValueError(f"Layer {self.layer_idx} does not have mamba attribute")
+                raise ValueError(
+                    f"Layer {self.layer_idx} does not have mamba attribute"
+                )
 
             # Residual connection with multiplier (keep on CPU)
             hidden_states = residual + hidden_states * self.residual_multiplier
@@ -287,7 +346,9 @@ class TTGraniteDecoderLayer:
             residual = hidden_states
 
             # Single conversion to TT device
-            hidden_states_tt = _to_tt_replicated(hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT)
+            hidden_states_tt = _to_tt_replicated(
+                hidden_states, self.device, self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
 
             # Norm (outputs ROW_MAJOR)
             hidden_states_tt = self.post_attention_layernorm(hidden_states_tt)
@@ -299,7 +360,9 @@ class TTGraniteDecoderLayer:
             hidden_states_tt.deallocate(True)
 
             # Single conversion back to CPU for residual
-            mlp_output = to_torch_tensor(mlp_output_tt, target_shape=(batch_size, seq_len, hidden_size))
+            mlp_output = to_torch_tensor(
+                mlp_output_tt, target_shape=(batch_size, seq_len, hidden_size)
+            )
 
             # Deallocate TT tensor
             mlp_output_tt.deallocate(True)

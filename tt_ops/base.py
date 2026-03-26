@@ -1,7 +1,10 @@
-import ttnn
-import torch
+"""Base utilities for TTNN operations and tensor conversions."""
+
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
+
+import torch
+import ttnn
 
 
 class TTOperation(ABC):
@@ -25,7 +28,7 @@ def to_tt_tensor(
     device,
     dtype=ttnn.bfloat16,
     layout=ttnn.ROW_MAJOR_LAYOUT,
-    mesh_mapper=None
+    mesh_mapper=None,
 ) -> ttnn.Tensor:
     """
     Convert PyTorch tensor to TTNN tensor.
@@ -55,7 +58,7 @@ def to_tt_tensor(
         torch_tensor = torch_tensor.contiguous()
 
     # Check if device is a mesh
-    is_mesh = hasattr(device, 'get_num_devices') and device.get_num_devices() > 1
+    is_mesh = hasattr(device, "get_num_devices") and device.get_num_devices() > 1
 
     if mesh_mapper is not None:
         # Explicit mesh mapper provided: use from_torch with mesh_mapper
@@ -64,7 +67,7 @@ def to_tt_tensor(
             dtype=dtype,
             layout=layout,
             device=device,
-            mesh_mapper=mesh_mapper
+            mesh_mapper=mesh_mapper,
         )
     elif is_mesh:
         # Mesh device with no explicit mapper: auto-replicate for safety
@@ -75,23 +78,19 @@ def to_tt_tensor(
             dtype=dtype,
             layout=layout,
             device=device,
-            mesh_mapper=auto_mapper
+            mesh_mapper=auto_mapper,
         )
     else:
         # Standard single-device tensor
         tt_tensor = ttnn.Tensor(
-            torch_tensor,
-            data_type=dtype,
-            device=device,
-            layout=layout
+            torch_tensor, data_type=dtype, device=device, layout=layout
         )
 
     return tt_tensor
 
 
 def to_torch_tensor(
-    tt_tensor: ttnn.Tensor,
-    target_shape: Optional[Tuple[int, ...]] = None
+    tt_tensor: ttnn.Tensor, target_shape: Optional[Tuple[int, ...]] = None
 ) -> torch.Tensor:
     """
     Convert TTNN tensor back to PyTorch tensor.
@@ -113,7 +112,7 @@ def to_torch_tensor(
 
     # Check if this is a mesh tensor
     device = tt_tensor.device()
-    if hasattr(device, 'get_num_devices') and device.get_num_devices() > 1:
+    if hasattr(device, "get_num_devices") and device.get_num_devices() > 1:
         # All weights are replicated so all shards are identical — take first
         shards = ttnn.get_device_tensors(tt_tensor)
         torch_tensor = shards[0].cpu().to_torch()
@@ -141,101 +140,3 @@ def to_tile_layout(tt_tensor: ttnn.Tensor) -> ttnn.Tensor:
         return None
 
     return ttnn.to_layout(tt_tensor, ttnn.TILE_LAYOUT)
-
-
-def to_row_major_layout(tt_tensor: ttnn.Tensor) -> ttnn.Tensor:
-    """
-    Convert TTNN tensor to ROW_MAJOR layout.
-
-    Args:
-        tt_tensor: Input TTNN tensor in TILE layout
-
-    Returns:
-        TTNN tensor in ROW_MAJOR layout
-    """
-    if tt_tensor is None:
-        return None
-
-    return ttnn.to_layout(tt_tensor, ttnn.ROW_MAJOR_LAYOUT)
-
-
-def validate_shape(
-    tensor: Union[torch.Tensor, ttnn.Tensor],
-    expected_shape: Tuple[int, ...],
-    name: str = "tensor"
-) -> None:
-    """
-    Validate tensor shape matches expected shape.
-
-    Args:
-        tensor: Input tensor
-        expected_shape: Expected shape tuple
-        name: Tensor name for error messages
-
-    Raises:
-        ValueError: If shape doesn't match
-    """
-    if isinstance(tensor, ttnn.Tensor):
-        actual_shape = tensor.shape
-    else:
-        actual_shape = tensor.shape
-
-    if len(actual_shape) != len(expected_shape):
-        raise ValueError(
-            f"{name} rank mismatch: expected {len(expected_shape)}, "
-            f"got {len(actual_shape)} (shape: {actual_shape})"
-        )
-
-    for i, (actual, expected) in enumerate(zip(actual_shape, expected_shape)):
-        if expected != -1 and actual != expected:
-            raise ValueError(
-                f"{name} shape mismatch at dim {i}: "
-                f"expected {expected}, got {actual} (full shape: {actual_shape})"
-            )
-
-
-def tt_linear(
-    input_tt: ttnn.Tensor,
-    weight_tt: ttnn.Tensor,
-    bias_tt: Optional[ttnn.Tensor] = None
-) -> ttnn.Tensor:
-    """
-    Perform linear transformation on TTNN tensors.
-
-    Args:
-        input_tt: Input tensor [batch, seq, in_features] (ROW_MAJOR or TILE)
-        weight_tt: Weight tensor [in_features, out_features] (TILE)
-        bias_tt: Optional bias tensor [out_features]
-
-    Returns:
-        Output tensor [batch, seq, out_features] (TILE)
-    """
-    # Ensure input is in TILE layout for optimal matmul
-    if input_tt.layout != ttnn.TILE_LAYOUT:
-        input_tt = to_tile_layout(input_tt)
-
-    # Weight should already be in TILE from cache
-    # Matmul: [batch, seq, in_features] @ [in_features, out_features]
-    output = input_tt @ weight_tt
-
-    if bias_tt is not None:
-        output = output + bias_tt
-
-    return output
-
-
-def reshape_for_broadcast(
-    tensor_tt: ttnn.Tensor,
-    target_shape: Tuple[int, ...]
-) -> ttnn.Tensor:
-    """
-    Reshape tensor for broadcasting operations.
-
-    Args:
-        tensor_tt: Input TTNN tensor
-        target_shape: Target shape for broadcasting
-
-    Returns:
-        Reshaped TTNN tensor
-    """
-    return tensor_tt.reshape(target_shape)
