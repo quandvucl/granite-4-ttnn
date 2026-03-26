@@ -131,8 +131,6 @@ Performance:
 
 This section documents optimization approaches that were explored but didn't yield the expected benefits for this specific model and hardware configuration. These insights are valuable for understanding the trade-offs when porting models to Tenstorrent hardware.
 
-### What We Tried
-
 #### 1. Full TTNN Tensor Conversion
 **Approach:** Convert all operations to native TTNN tensors for maximum hardware acceleration.
 
