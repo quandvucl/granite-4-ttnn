@@ -37,7 +37,7 @@ class TTGraniteConfig:
     dtype: str = "bfloat16"
     use_tile_layout_for_compute: bool = True
     max_cache_length: int = 2048
-    batch_size: int = 1
+    batch_size: int = 1  # Fixed at 1 for single-prompt optimization
 
     # Performance tuning
     enable_profiling: bool = False

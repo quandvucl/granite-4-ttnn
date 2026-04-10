@@ -1,26 +1,9 @@
-"""Base utilities for TTNN operations and tensor conversions."""
+"""Base utilities for TTNN tensor conversions."""
 
-from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
 import torch
 import ttnn
-
-
-class TTOperation(ABC):
-    """Base class for all TTNN operations."""
-
-    def __init__(self, device, dtype=ttnn.bfloat16):
-        self.device = device
-        self.dtype = dtype
-
-    @abstractmethod
-    def forward(self, *args, **kwargs):
-        """Forward pass of the operation."""
-        pass
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
 
 
 def to_tt_tensor(
@@ -67,6 +50,7 @@ def to_tt_tensor(
             dtype=dtype,
             layout=layout,
             device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,  # Explicitly use DRAM for weights
             mesh_mapper=mesh_mapper,
         )
     elif is_mesh:
@@ -78,6 +62,7 @@ def to_tt_tensor(
             dtype=dtype,
             layout=layout,
             device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,  # Explicitly use DRAM for weights
             mesh_mapper=auto_mapper,
         )
     else:
@@ -105,7 +90,7 @@ def to_torch_tensor(
     Note:
         TILE_LAYOUT may add padding, so always force reshape to
         expected shape after conversion.
-        For mesh tensors, extracts first shard.
+        For mesh tensors, properly gathers sharded tensors.
     """
     if tt_tensor is None:
         return None
@@ -113,9 +98,9 @@ def to_torch_tensor(
     # Check if this is a mesh tensor
     device = tt_tensor.device()
     if hasattr(device, "get_num_devices") and device.get_num_devices() > 1:
-        # All weights are replicated so all shards are identical — take first
-        shards = ttnn.get_device_tensors(tt_tensor)
-        torch_tensor = shards[0].cpu().to_torch()
+        # Use auto_compose to properly gather sharded tensors
+        from models.common.auto_compose import to_torch_auto_compose
+        torch_tensor = to_torch_auto_compose(tt_tensor, device=device)
     else:
         torch_tensor = tt_tensor.cpu().to_torch()
 
@@ -124,19 +109,3 @@ def to_torch_tensor(
         torch_tensor = torch_tensor.view(*target_shape)
 
     return torch_tensor
-
-
-def to_tile_layout(tt_tensor: ttnn.Tensor) -> ttnn.Tensor:
-    """
-    Convert TTNN tensor to TILE layout for optimal computation.
-
-    Args:
-        tt_tensor: Input TTNN tensor in ROW_MAJOR layout
-
-    Returns:
-        TTNN tensor in TILE layout
-    """
-    if tt_tensor is None:
-        return None
-
-    return ttnn.to_layout(tt_tensor, ttnn.TILE_LAYOUT)
