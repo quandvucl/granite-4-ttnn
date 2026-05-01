@@ -122,23 +122,3 @@ This PCIe round-trip happens for every Mamba layer (36 out of 40) on every decod
 The Mamba layers include a short depthwise convolution over the SSM input. Currently this runs on CPU as part of the `HybridMambaAttentionDynamicCache` logic. Moving it to TTNN (or fusing it with the nearest linear projection) would further reduce cross-boundary transfers.
 
 **Estimated gain**: Moderate; smaller than #1 and #2 but meaningful at high token rates.
-
-### 4. Prefill batch parallelism
-
-TTNN's prefill path processes the entire prompt as a single sequence. For long prompts (96–176 tokens), the sequence dimension is small enough that TT cores are underutilized. Adding chunked prefill (process the prompt in segments, reusing the Mamba chunk-scan kernel) would improve hardware utilization for medium-to-long contexts.
-
-**Estimated gain**: 2–5× prefill throughput at long_128/long_256 lengths, which would close the gap with A100.
-
----
-
-## Summary Table
-
-| Metric | TTNN tiny (4-dev) | TTNN small (8-dev) | A100 tiny | A100 small |
-|--------|:-----------------:|:------------------:|:---------:|:----------:|
-| Decode tok/s (avg) | 3.06 | 1.97 | 9.14 | 5.49 |
-| TTNN / A100 decode | 0.33× | 0.36× | — | — |
-| Prefill tok/s (long_256) | 27.1 | 4.72 | 503 | 178 |
-| TTNN / A100 prefill (long) | 0.05× | 0.03× | — | — |
-| Model load time | 23.2s | 117.0s | 4.1s | 175.5s |
-
-The primary bottleneck is PCIe data movement for MoE and Mamba layers. With native on-device reduce-scatter for MoE and a TTNN Mamba SSM decode kernel, TTNN throughput is expected to reach or exceed A100 decode performance, leveraging the Wormhole Galaxy's memory bandwidth advantage over a single A100.
