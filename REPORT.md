@@ -8,8 +8,8 @@ This report summarizes the porting of IBM Granite 4.0-H (tiny and small) to Tens
 
 | Model | Parameters | Architecture | Devices used |
 |-------|-----------|--------------|--------------|
-| granite-4.0-h-tiny | ~1.2B | 40-layer hybrid (4 attention + 36 Mamba), 72 MoE experts | 4 WH devices |
-| granite-4.0-h-small | ~3.3B | 40-layer hybrid (4 attention + 36 Mamba), 72 MoE experts | 8 WH devices |
+| granite-4.0-h-tiny | ~7B | 40-layer hybrid (4 attention + 36 Mamba), 72 MoE experts | 4 WH devices |
+| granite-4.0-h-small | ~32B | 40-layer hybrid (4 attention + 36 Mamba), 72 MoE experts | 8 WH devices |
 
 ---
 
