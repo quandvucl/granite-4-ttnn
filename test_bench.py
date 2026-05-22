@@ -25,7 +25,7 @@ from transformers.generation.logits_process import RepetitionPenaltyLogitsProces
 
 MODELS = {
     "tiny":  ("ibm-granite/granite-4.0-h-tiny",  4),
-    "small": ("ibm-granite/granite-4.0-h-small",  8),
+    "small": ("ibm-granite/granite-4.0-h-small", 8),
 }
 
 PROMPTS = {
@@ -69,10 +69,12 @@ REPETITION_PENALTY = 1.3
 
 
 MESH_SHAPE_MAP = {
-    1: ttnn.MeshShape(1, 1),
-    2: ttnn.MeshShape(1, 2),
-    4: ttnn.MeshShape(1, 4),
-    8: ttnn.MeshShape(2, 4),
+    1:  ttnn.MeshShape(1, 1),
+    2:  ttnn.MeshShape(1, 2),
+    4:  ttnn.MeshShape(1, 4),
+    8:  ttnn.MeshShape(2, 4),
+    16: ttnn.MeshShape(4, 4),
+    32: ttnn.MeshShape(4, 8),
 }
 
 
@@ -84,11 +86,20 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS):
 
     hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     num_kv_heads = hf_config.num_key_value_heads
-    num_devices = min(requested_devices, num_kv_heads)
+    num_experts  = getattr(hf_config, "num_local_experts", 1)
+    full_mesh_size = full_mesh.get_num_devices()
+
+    # Device count is limited to the largest power-of-2 (or supported mesh shape)
+    # that fits in the available mesh AND divides the expert count for EP sharding.
+    # Attention runs replicated when num_devices > num_kv_heads — no KV sharding needed.
+    # MoE effective_devices logic in moe_tt.py handles non-divisor counts gracefully.
+    num_devices = min(requested_devices, full_mesh_size)
+    # Snap to largest entry in MESH_SHAPE_MAP that does not exceed num_devices
+    num_devices = max(k for k in MESH_SHAPE_MAP if k <= num_devices)
 
     print(f"\n{'='*70}")
-    print(f"  Model : {model_id}")
-    print(f"  Devices: {num_devices}  (requested {requested_devices}, KV heads {num_kv_heads})")
+    print(f"  Model  : {model_id}")
+    print(f"  Devices: {num_devices}  (requested {requested_devices}, KV heads {num_kv_heads}, experts {num_experts})")
     print(f"  Decode : {decode_tokens} tokens per prompt")
     print(f"{'='*70}")
 
@@ -111,7 +122,7 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS):
             use_tt_attention=True,
             use_tt_mamba=True,
             use_tt_moe=True,
-            mamba_chunk_size=128 if num_devices >= 4 else None,
+            mamba_chunk_size=256 if num_devices >= 4 else None,  # chunked prefill at 4+ devices; 256 = model native chunk size
             max_cache_length=512,
         )
         load_s = time.time() - t_load0
@@ -218,11 +229,18 @@ def main():
 
     models = list(MODELS.keys()) if args.model == "all" else [args.model]
 
+    ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
     full_mesh = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(8, 4))
+    all_results = []
     try:
         all_results = [run_bench(m, full_mesh, args.decode_tokens) for m in models]
+        ttnn.synchronize_device(full_mesh)
     finally:
+        for submesh in full_mesh.get_submeshes():
+            ttnn.close_mesh_device(submesh)
         ttnn.close_mesh_device(full_mesh)
+        ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
+        del full_mesh
 
     for result in all_results:
         out_path = f"bench_results_{result['model']}.json"

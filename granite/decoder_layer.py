@@ -11,7 +11,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 from granite.cache import MambaCacheManager
 from mamba import TensorParallelMamba
 from models.common.rmsnorm import RMSNorm
-from models.common.modules.mlp.mlp_1d import MLP1D
 from granite.moe_tt import GraniteTTMoE
 from models.tt_transformers.tt.common import Mode
 
@@ -43,7 +42,7 @@ class TTGraniteDecoderLayer:
         layer_idx: int,
         config,
         hf_layer,
-        shared_mlp: MLP1D,
+        shared_mlp,
         is_attention_layer: bool,
         hf_config=None,
         dtype=ttnn.bfloat16,
@@ -147,7 +146,7 @@ class TTGraniteDecoderLayer:
         t0 = time.time()
         attn_t = mamba_t = mamba_pre_t = mamba_dec_t = mlp_t = 0.0
 
-        seq_len = hidden_states.shape[2]
+        seq_len = len(cache_position) if cache_position is not None else hidden_states.shape[2]
         mode = Mode.DECODE if seq_len == 1 else Mode.PREFILL
 
         if not hasattr(cache_manager, "hybrid_cache"):
@@ -290,3 +289,5 @@ class TTGraniteDecoderLayer:
                 layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=mesh_mapper,
             )
+        elif self.mamba is not None:
+            self.mamba.reset_state()

@@ -50,7 +50,25 @@ def segment_sum(input_tensor: torch.Tensor) -> torch.Tensor:
     return tensor_segsum
 
 
-def segment_sum_ttnn(input_tensor_tt, device, use_memory_efficient=True):
+def make_segment_sum_masks(chunk_size: int, device):
+    """
+    Pre-compute the two triangular masks used by segment_sum_ttnn.
+
+    Returns (mask_lower_tt, mask_diag_tt) — both [chunk_size, chunk_size] TTNN tensors.
+    Call once at model init and pass to segment_sum_ttnn via the masks= argument.
+    """
+    mesh_mapper = _make_mesh_mapper(device)
+    ones = torch.ones(chunk_size, chunk_size, dtype=torch.float32)
+    ones_tt = to_tt_tensor(ones, device, ttnn.bfloat16, ttnn.TILE_LAYOUT, mesh_mapper)
+    mask_lower = ttnn.tril(ones_tt, diagonal=-1)
+    # reuse ones_tt for second mask — same values, different tril
+    mask_diag = ttnn.tril(ones_tt, diagonal=0)
+    ones_tt.deallocate(True)
+    return mask_lower, mask_diag
+
+
+def segment_sum_ttnn(input_tensor_tt, device, use_memory_efficient=True,
+                     masks=None):
     """
     TTNN implementation of segment_sum for causal attention-like computation.
 
@@ -58,83 +76,42 @@ def segment_sum_ttnn(input_tensor_tt, device, use_memory_efficient=True):
     Input: [..., chunk_size]
     Output: [..., chunk_size, chunk_size]
 
-    All operations on device - fully parallelizable.
-
     Args:
         input_tensor_tt: Input tensor [..., chunk_size]
         device: TTNN device
-        use_memory_efficient: If True, use chunked computation to reduce peak memory
-                             (enables <16 device operation). Default: True.
+        use_memory_efficient: Ignored (kept for API compatibility).
+        masks: Optional (mask_lower_tt, mask_diag_tt) pre-computed by
+               make_segment_sum_masks().  When provided, avoids 2 PCIe
+               uploads per call — pass for performance-critical paths.
     """
-    # Get chunk size from last dimension
-    shape = input_tensor_tt.shape
-    chunk_size = shape[-1]
+    chunk_size = input_tensor_tt.shape[-1]
 
-    # Memory-efficient version for large chunk sizes
-    # Key insight: segment_sum creates a lower triangular matrix where
-    # result[..., i, j] = sum(input[..., 0:i+1]) if j <= i, else -inf
-    # We can compute this more efficiently by:
-    # 1. Computing cumsum once
-    # 2. Using gather/select operations to build the matrix
-    # However, TTNN broadcast semantics may still create the full tensor.
-    # The main memory savings come from changing the order of operations.
+    if masks is not None:
+        mask_lower, mask_diag = masks
+    else:
+        mask_lower, mask_diag = make_segment_sum_masks(chunk_size, device)
 
-    if use_memory_efficient and chunk_size > 128:
-        # For now, fall back to original - true memory savings require
-        # either smaller chunk_size or algorithmic changes
-        # TODO: Implement CPU-side chunking or kernel fusion
-        pass  # Fall through to original implementation
-
-    mesh_mapper = _make_mesh_mapper(device)
-
-    # Original implementation for small chunk sizes or when requested
-    # Step 1: Unsqueeze to add broadcast dimension: [..., chunk_size] -> [..., chunk_size, 1]
+    # Step 1: [..., chunk_size] → [..., chunk_size, 1]
     input_unsqueezed = ttnn.unsqueeze(input_tensor_tt, -1)
 
-    # Step 2: Create lower triangular mask (diagonal=-1)
-    ones_2d = torch.ones(chunk_size, chunk_size, dtype=torch.float32)
-    ones_2d_tt = to_tt_tensor(
-        ones_2d,
-        device,
-        ttnn.bfloat16,
-        layout=ttnn.TILE_LAYOUT,
-        mesh_mapper=mesh_mapper,
-    )
-    mask_lower = ttnn.tril(ones_2d_tt, diagonal=-1)
-    ones_2d_tt.deallocate(True)
-
-    # Step 3: Broadcast multiply (mask zeros out above-diagonal elements)
+    # Step 2: zero above-diagonal elements
     input_masked = ttnn.multiply(input_unsqueezed, mask_lower)
     input_unsqueezed.deallocate(True)
-    mask_lower.deallocate(True)
 
-    # Step 4: Cumsum along dim=-2 (fully parallelizable on device)
+    # Step 3: causal cumsum
     input_masked = ttnn.to_layout(input_masked, ttnn.TILE_LAYOUT)
     tensor_segsum = ttnn.cumsum(input_masked, dim=-2)
     input_masked.deallocate(True)
 
-    # Step 5: Apply second mask (diagonal=0) to create causal structure
-    ones_2d_2 = torch.ones(chunk_size, chunk_size, dtype=torch.float32)
-    ones_2d_2_tt = to_tt_tensor(
-        ones_2d_2,
-        device,
-        ttnn.bfloat16,
-        layout=ttnn.TILE_LAYOUT,
-        mesh_mapper=mesh_mapper,
-    )
-    mask_diag = ttnn.tril(ones_2d_2_tt, diagonal=0)
-    ones_2d_2_tt.deallocate(True)
-
-    # Create -inf for masking
-    neginf_value = -1e38
-    neginf_tt = ttnn.full_like(tensor_segsum, neginf_value)
-
-    # Apply mask: where mask==1, keep cumsum, else -inf
+    # Step 4: mask to −inf above diagonal
+    neginf_tt = ttnn.full_like(tensor_segsum, -1e38)
     result = ttnn.where(mask_diag, tensor_segsum, neginf_tt)
-
     tensor_segsum.deallocate(True)
-    mask_diag.deallocate(True)
     neginf_tt.deallocate(True)
+
+    if masks is None:
+        mask_lower.deallocate(True)
+        mask_diag.deallocate(True)
 
     return result
 

@@ -149,25 +149,76 @@ class AttentionNoPE:
 
         else:
             block_size = 32
-            num_blocks = (start_pos + seq_len + block_size - 1) // block_size
-            page_table_torch = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
-            page_table = ttnn.from_torch(
-                page_table_torch, device=self.device, layout=ttnn.ROW_MAJOR_LAYOUT,
-                mesh_mapper=self._mesh_mapper,
-            )
-            ttnn.experimental.paged_fill_cache(keys, k_heads, page_table, batch_idx=0)
-            ttnn.experimental.paged_fill_cache(values, v_heads, page_table, batch_idx=0)
-            ttnn.deallocate(page_table)
+            total_len = start_pos + seq_len
+            num_blocks = (total_len + block_size - 1) // block_size
 
-            attn_output = ttnn.transformer.scaled_dot_product_attention(
-                q_heads, k_heads, v_heads,
-                is_causal=True,
-                scale=self.scale,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
-            ttnn.deallocate(q_heads)
-            ttnn.deallocate(k_heads)
-            ttnn.deallocate(v_heads)
+            if start_pos == 0:
+                # First prefill chunk: fill from block 0, use local K/V for attention.
+                page_table_torch = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
+                page_table = ttnn.from_torch(
+                    page_table_torch, device=self.device, layout=ttnn.ROW_MAJOR_LAYOUT,
+                    mesh_mapper=self._mesh_mapper,
+                )
+                ttnn.experimental.paged_fill_cache(keys, k_heads, page_table, batch_idx=0)
+                ttnn.experimental.paged_fill_cache(values, v_heads, page_table, batch_idx=0)
+                ttnn.deallocate(page_table)
+                attn_output = ttnn.transformer.scaled_dot_product_attention(
+                    q_heads, k_heads, v_heads,
+                    is_causal=True,
+                    scale=self.scale,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+                ttnn.deallocate(q_heads)
+                ttnn.deallocate(k_heads)
+                ttnn.deallocate(v_heads)
+            else:
+                # Subsequent prefill chunk: fill only new K/V into cache at correct offset,
+                # then attend to full accumulated cache (positions 0..start_pos+seq_len-1).
+                first_new_block = start_pos // block_size
+                new_blocks = num_blocks - first_new_block
+                page_table_torch = torch.arange(
+                    first_new_block, first_new_block + new_blocks, dtype=torch.int32
+                ).unsqueeze(0)
+                page_table = ttnn.from_torch(
+                    page_table_torch, device=self.device, layout=ttnn.ROW_MAJOR_LAYOUT,
+                    mesh_mapper=self._mesh_mapper,
+                )
+                ttnn.experimental.paged_fill_cache(keys, k_heads, page_table, batch_idx=0)
+                ttnn.experimental.paged_fill_cache(values, v_heads, page_table, batch_idx=0)
+                ttnn.deallocate(page_table)
+                ttnn.deallocate(k_heads)
+                ttnn.deallocate(v_heads)
+
+                # Attend to full accumulated cache: slice [1, nKH, total_len, D].
+                # Build explicit mask: q[i] (at position start_pos+i) attends to k[j]
+                # iff j <= start_pos + i.  Shape: [1, 1, seq_len, total_len].
+                row = torch.arange(seq_len).unsqueeze(1)          # [seq_len, 1]
+                col = torch.arange(total_len).unsqueeze(0)        # [1, total_len]
+                mask_torch = (col <= (start_pos + row)).to(torch.bfloat16)  # [seq_len, total_len]
+                # TTNN uses -inf for masked positions; convert bool mask to additive mask
+                mask_add = torch.where(
+                    mask_torch.bool(),
+                    torch.zeros_like(mask_torch),
+                    torch.full_like(mask_torch, float("-inf")),
+                ).unsqueeze(0).unsqueeze(0)                       # [1, 1, seq_len, total_len]
+                mask_tt = ttnn.from_torch(
+                    mask_add, device=self.device, dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=self._mesh_mapper,
+                )
+                k_full = self.cache_k[:, :, :total_len, :]
+                v_full = self.cache_v[:, :, :total_len, :]
+                attn_output = ttnn.transformer.scaled_dot_product_attention(
+                    q_heads, k_full, v_full,
+                    attn_mask=mask_tt,
+                    is_causal=False,
+                    scale=self.scale,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+                ttnn.deallocate(mask_tt)
+                ttnn.deallocate(q_heads)
+                ttnn.deallocate(k_full)
+                ttnn.deallocate(v_full)
 
             attn_output = ttnn.reshape(attn_output, [1, self.num_heads, -1, self.head_dim])
             attn_output_concat = ttnn.experimental.nlp_concat_heads(

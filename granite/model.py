@@ -18,10 +18,30 @@ from granite import MambaCacheManager
 from models.common.modules.lm_head.lm_head_1d import LMHead1D
 from models.common.modules.embedding.embedding_1d import Embedding1D
 from models.common.rmsnorm import RMSNorm
-from models.common.modules.mlp.mlp_1d import MLP1D
 from models.common.modules.lazy_weight import LazyWeight
 from models.common.modules.tt_ccl import get_tt_ccl
 from models.tt_transformers.tt.common import Mode
+
+
+class ReplicatedMLP:
+    """Shared MLP with weights replicated across all devices — no all_reduce."""
+
+    def __init__(self, w1, w2, w3, dtype):
+        self.w1 = w1  # gate
+        self.w3 = w3  # up
+        self.w2 = w2  # down
+        self.dtype = dtype
+
+    def forward(self, x: "ttnn.Tensor", mode=None) -> "ttnn.Tensor":
+        gate = ttnn.linear(x, self.w1, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        up   = ttnn.linear(x, self.w3, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        gate = ttnn.silu(gate, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        mid  = ttnn.mul(gate, up, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        gate.deallocate(True)
+        up.deallocate(True)
+        out  = ttnn.linear(mid, self.w2, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        mid.deallocate(True)
+        return out
 
 
 class TTGraniteMoeHybridForCausalLM:
@@ -50,6 +70,7 @@ class TTGraniteMoeHybridForCausalLM:
         self.device = device
         self.mamba_chunk_size = mamba_chunk_size
         self.hf_model = hf_model
+        self.hf_config = hf_model.config
         self.config = config
         self.verbose = verbose
         self.use_tt_attention = use_tt_attention
@@ -159,21 +180,24 @@ class TTGraniteMoeHybridForCausalLM:
             up_weight = input_linear_t[:, actual_intermediate_size:].contiguous()
             down_weight = output_linear_weight_hf.T.contiguous()
 
-            # Shared MLP: always replicate weights — 1.5 GB for 40 layers fits easily,
-            # and avoids fabric (reduce_scatter) which requires ethernet ring init.
-            # Each device computes the full output independently; no reduce needed.
-            # IMPORTANT: pass device directly so LazyWeight uploads to the mesh, but
-            # pass mesh_device=single_device to MLP1DConfig so program configs are
-            # computed for num_devices=1 (matching the full replicated weight size).
+            # Shared MLP: weights replicated on every device; each device computes
+            # the full output independently — no all_reduce needed.
             use_tensor_parallel = is_mesh and device.get_num_devices() > 1
-            # Shared MLP: replicated weights, no reduce needed. skip_all_reduce=True
-            # tells MLP1D to use num_devices=1 for program configs (full weight per device).
-            w1_lazy = LazyWeight(source=gate_weight, device=device, dtype=config.get_ttnn_dtype())
-            w2_lazy = LazyWeight(source=down_weight, device=device, dtype=config.get_ttnn_dtype())
-            w3_lazy = LazyWeight(source=up_weight, device=device, dtype=config.get_ttnn_dtype())
+            dtype = config.get_ttnn_dtype()
 
-            layer_mlp = MLP1D(w1=w1_lazy, w2=w2_lazy, w3=w3_lazy, skip_all_reduce=True)
-            layer_mlp._use_tensor_parallel = False
+            def _upload_replicated(t):
+                return ttnn.from_torch(
+                    t, device=device, dtype=dtype,
+                    layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh else None,
+                )
+
+            layer_mlp = ReplicatedMLP(
+                w1=_upload_replicated(gate_weight),
+                w2=_upload_replicated(down_weight),
+                w3=_upload_replicated(up_weight),
+                dtype=dtype,
+            )
 
             layer = TTGraniteDecoderLayer(
                 device=device,
@@ -205,6 +229,11 @@ class TTGraniteMoeHybridForCausalLM:
             attention_layer_indices=config.attention_layer_indices,
         )
 
+        # Release HF model CPU tensors — all weights are now on TT devices.
+        # Keep only hf_config (already stored separately) for cache init.
+        del self.hf_model
+        self.hf_model = None
+
         if verbose:
             print(f"\n✓ Model initialized with {len(self.layers)} layers")
             print(f"  - {len(config.attention_layer_indices)} attention layers")
@@ -234,6 +263,7 @@ class TTGraniteMoeHybridForCausalLM:
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = True,
+        _state_only: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass.  hidden_states stays on TTNN for all 40 layers.
@@ -241,9 +271,18 @@ class TTGraniteMoeHybridForCausalLM:
         Boundary conversions:
           - CPU → TTNN: once after embedding
           - TTNN → CPU: once before final norm+lm_head (or never if lm_head is on TTNN)
+
+        For prefill with seq_len > mamba_chunk_size, the sequence is split into
+        segments of mamba_chunk_size tokens processed sequentially through all layers.
+        This reduces peak DRAM allocation, improving L1 reuse on long sequences.
         """
         batch_size, seq_len = input_ids.shape
         assert batch_size == 1, f"Only batch_size=1 supported, got {batch_size}"
+
+        # Chunked prefill: split long sequences into smaller segments.
+        chunk_sz = self.mamba_chunk_size
+        if chunk_sz is not None and seq_len > chunk_sz and seq_len > 1:
+            return self._forward_chunked(input_ids, position_ids, attention_mask, use_cache, chunk_sz)
 
         if position_ids is None:
             position_ids = torch.arange(
@@ -282,7 +321,7 @@ class TTGraniteMoeHybridForCausalLM:
                 HybridMambaAttentionDynamicCache,
             )
             self.cache_manager.hybrid_cache = HybridMambaAttentionDynamicCache(
-                config=self.hf_model.config,
+                config=self.hf_config,
                 batch_size=1,
                 dtype=hidden_states_cpu.dtype,
                 device=hidden_states_cpu.device,
@@ -324,6 +363,14 @@ class TTGraniteMoeHybridForCausalLM:
             "layer_count": len(self.layers), "seq_len": seq_len,
         }
 
+        if use_cache:
+            self.cache_manager.increment_position(seq_len)
+
+        # ── State-only path: skip norm + LM head (used by non-final prefill chunks) ──
+        if _state_only:
+            hidden_tt.deallocate(True)
+            return None
+
         # ── Final norm + LM head ─────────────────────────────────────
         mode = Mode.DECODE if seq_len == 1 else Mode.PREFILL
         hidden_tt = self.norm.forward(hidden_tt, mode=mode)
@@ -344,10 +391,42 @@ class TTGraniteMoeHybridForCausalLM:
         while logits.dim() > 3:
             logits = logits[0]
 
-        if use_cache:
-            self.cache_manager.increment_position(seq_len)
-
         return logits
+
+    def _forward_chunked(self, input_ids, position_ids, attention_mask, use_cache, chunk_sz):
+        """
+        Prefill long sequences in chunks of chunk_sz tokens.
+
+        Processes each chunk through all 40 layers sequentially.  Mamba SSM state
+        and attention KV cache accumulate naturally across chunks.  Only the final
+        chunk's last-token logits are returned (sufficient for greedy/sampling decode).
+        """
+        batch_size, seq_len = input_ids.shape
+        start_pos = self.cache_manager.get_position()
+
+        # Build chunks; last chunk may be shorter.
+        chunks = []
+        for offset in range(0, seq_len, chunk_sz):
+            end = min(offset + chunk_sz, seq_len)
+            chunk_ids = input_ids[:, offset:end]
+            chunk_pos = torch.arange(start_pos + offset, start_pos + end, dtype=torch.long).unsqueeze(0)
+            chunks.append((chunk_ids, chunk_pos, offset))
+
+        n = len(chunks)
+        last_logits = None
+        for i, (chunk_ids, chunk_pos, _) in enumerate(chunks):
+            is_last = (i == n - 1)
+            # Non-final chunks: skip norm + LM head (their hidden states are discarded).
+            # Final chunk: run full forward to get the logits we actually need.
+            last_logits = self.forward(
+                chunk_ids,
+                position_ids=chunk_pos,
+                attention_mask=None,
+                use_cache=use_cache,
+                _state_only=not is_last,
+            )
+
+        return last_logits
 
     def reset_cache(self):
         """Reset all caches for new generation/benchmark."""
