@@ -181,21 +181,27 @@ class GraniteTTMoE:
         routing_tt.deallocate(True)
 
         # ------------------------------------------------------------------
-        # 7 + 8. SUM over experts + EP reduce — all on CPU.
-        # weighted_tt: [1, E_local, S, H] per device.
-        # Gather to [N, E_local, S, H], reshape to [N*E_local, S, H], sum → [1, S, H].
+        # 7 + 8. SUM over experts + EP reduce.
+        # Sum [1,E_local,S,H] → [1,1,S,H] on device first — E_local× less data
+        # to download (9× for small, 16× for tiny) vs gathering before summing.
         # ------------------------------------------------------------------
+        local_sum_tt = ttnn.sum(
+            weighted_tt, dim=1, keepdim=True,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )  # [1, 1, S, H] per device
+        weighted_tt.deallocate(True)
+
         if self.effective_devices > 1:
-            all_weighted = ttnn.to_torch(
-                weighted_tt,
+            # Download [N, 1, S, H] — E_local× smaller than [N, E_local, S, H]
+            all_sums = ttnn.to_torch(
+                local_sum_tt,
                 mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0),
-            )  # [N, E_local, S, H]
-            weighted_tt.deallocate(True)
-            global_sum = all_weighted.sum(dim=(0, 1), keepdim=False).unsqueeze(0).unsqueeze(0)  # [1, 1, S, H]
+            )  # [N, 1, S, H]
+            local_sum_tt.deallocate(True)
+            global_sum = all_sums.sum(dim=0, keepdim=True)  # [1, 1, S, H]
         else:
-            local = ttnn.to_torch(weighted_tt)  # [1, E_local, S, H]
-            weighted_tt.deallocate(True)
-            global_sum = local.sum(dim=1, keepdim=True)  # [1, 1, S, H]
+            global_sum = ttnn.to_torch(local_sum_tt)  # [1, 1, S, H]
+            local_sum_tt.deallocate(True)
 
         result_tt = ttnn.from_torch(
             global_sum,
