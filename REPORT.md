@@ -123,12 +123,6 @@ The Mamba layers include a short depthwise convolution over the SSM input. Curre
 
 **Estimated gain**: Moderate; smaller than #1 and #2 but meaningful at high token rates.
 
-### 4. Prefill batch parallelism
-
-TTNN's prefill path processes the entire prompt as a single sequence. For long prompts (96–176 tokens), the sequence dimension is small enough that TT cores are underutilized. Adding chunked prefill (process the prompt in segments, reusing the Mamba chunk-scan kernel) would improve hardware utilization for medium-to-long contexts.
-
-**Estimated gain**: 2–5× prefill throughput at long_128/long_256 lengths, which would close the gap with A100.
-
 ---
 
 ## Summary Table

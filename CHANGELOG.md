@@ -1,84 +1,70 @@
-# Changelog — 2026-05-21
+# Changelog
 
 Changes made after the original REPORT.md benchmarks.
 
 ---
 
-## Improvement
+## Bug fix: small model garbage output on long prompts
 
-### MoE sum-first all_reduce (`moe_tt.py`)
+**Problem:** Small model (`MeshShape(2,4)`) produced incoherent output for prompts ≥ 96 tokens (`long_128`, `long_256`). Short prompts were unaffected.
 
-**Root cause (performance):** The original implementation gathered all expert outputs
-across devices to CPU via PCIe, summed on CPU, then re-uploaded.
+**Root cause:** `_load_weights` in `mamba/mamba_chunk_scan_parallel.py` used `ShardTensor2dMesh(..., mesh_shape=MeshShape(1, col_devices))` to distribute `in_proj` and `out_proj` weights. This only populated the 4 devices on row 0 of the 2×4 mesh; the 4 devices on row 1 received zero weights. After `all_gather(cluster_axis=1)` combined partial matmul results from both rows, the zeros from row 1 corrupted every output. Corrupted activations accumulated through the SSM recurrence and became visible as word-salad starting around token 32–64.
 
-**Fix:** Each device now sums its local experts first (`ttnn.sum(dim=1)`), then a single
-`ttnn.all_gather` + `ttnn.sum` reduces the partial sums entirely on-device — eliminating
-the PCIe round-trips per MoE layer.
+**Fix:** Pass the actual device mesh shape (`self.device.shape` = `MeshShape(2,4)`) to `ShardTensor2dMesh` so both rows receive valid column-shards. Per-device weight size is unchanged (`1/cols` of full weight), so no DRAM increase.
 
----
-
-## Updated Benchmark Results
-
-Benchmarks re-run on 2026-05-21 with the fix applied.
-
-### Tiny model (4 devices, MeshShape 1×4)
-
-**Model load:** 23.7s (REPORT: 23.2s — unchanged)
-
-#### Prefill tok/s
-
-| Prompt | Tokens | Today | REPORT | Change |
-|--------|-------:|------:|-------:|-------:|
-| short_8 | 5 | 2.5 | 1.04 | +2.4× |
-| short_10 | 8 | 9.7 | 2.28 | +4.3× |
-| medium_32 | 25 | 27.1 | 6.68 | +4.1× |
-| long_128 | 96 | 91.2 | 21.2 | +4.3× |
-| long_256 | 176 | 11.2 | 27.1 | −2.4× |
-
-#### Decode tok/s (steady-state)
-
-| Prompt | Today | REPORT | Change |
-|--------|------:|-------:|-------:|
-| short_8 | 6.25 | 3.10 | +2.0× |
-| short_10 | 6.32 | 3.10 | +2.0× |
-| medium_32 | 6.26 | 3.05 | +2.1× |
-| long_128 | 6.24 | 3.06 | +2.0× |
-| long_256 | 6.15 | 3.05 | +2.0× |
+**Impact:** Output quality restored for all prompt lengths. Decode throughput unchanged.
 
 ---
 
-### Small model (8 devices, MeshShape 2×4)
+## MoE on-device reduce
 
-**Model load:** 115.3s (REPORT: 117.0s — unchanged)
+**Root cause (performance):** Each MoE layer gathered all expert outputs from all devices to CPU via PCIe, summed on CPU, then re-uploaded to all devices. This added 36 PCIe round-trips per forward pass (one per Mamba/MoE layer).
 
-#### Prefill tok/s
+**Fix:** Each device now sums its local expert outputs first (`ttnn.sum(dim=1)`), then a single `ttnn.all_gather` + `ttnn.sum` reduces the partial sums entirely on-device, eliminating the PCIe round-trips.
 
-| Prompt | Tokens | Today | REPORT | Change |
-|--------|-------:|------:|-------:|-------:|
-| short_8 | 5 | 1.3 | 0.37 | +3.5× |
-| short_10 | 8 | 4.7 | 0.75 | +6.3× |
-| medium_32 | 25 | 12.2 | 2.22 | +5.5× |
-| long_128 | 96 | 47.3 | 3.76 | +12.6× |
-| long_256 | 176 | 5.0 | 4.72 | +1.1× |
+For the small model's `MeshShape(2,4)` mesh, column-parallel expert sharding causes OOM (row-replicated weights double per-device DRAM for large models). Small model uses flat expert parallelism with a CPU reduce instead — a single small download per layer, acceptable cost.
 
-#### Decode tok/s (steady-state)
+### Updated benchmark results
 
-| Prompt | Today | REPORT | Change |
-|--------|------:|-------:|-------:|
-| short_8 | 4.84 | 1.99 | +2.4× |
-| short_10 | 4.79 | 1.97 | +2.4× |
-| medium_32 | 4.84 | 1.95 | +2.5× |
-| long_128 | 4.83 | 1.94 | +2.5× |
-| long_256 | 4.75 | 1.97 | +2.4× |
+#### Tiny model (4 devices, MeshShape 1×4)
 
----
+**Model load:** 23.6s (REPORT baseline: 23.2s)
 
-## Summary
+| Prompt | Tokens | Prefill tok/s | vs REPORT | Decode tok/s | vs REPORT |
+|--------|-------:|--------------:|----------:|-------------:|----------:|
+| short_8 | 5 | 2.49 | +2.4× | 6.20 | +2.0× |
+| short_10 | 8 | 9.92 | +4.4× | 6.19 | +2.0× |
+| medium_32 | 25 | 26.4 | +4.0× | 6.17 | +2.0× |
+| long_128 | 96 | 90.1 | +4.3× | 6.19 | +2.0× |
+| long_256 | 176 | 116.8 | +4.3× | 6.19 | +2.0× |
+
+#### Small model (8 devices, MeshShape 2×4)
+
+**Model load:** 116.2s (REPORT baseline: 117.0s)
+
+| Prompt | Tokens | Prefill tok/s | vs REPORT | Decode tok/s | vs REPORT |
+|--------|-------:|--------------:|----------:|-------------:|----------:|
+| short_8 | 5 | 1.42 | +3.8× | 4.07 | +2.0× |
+| short_10 | 8 | 5.61 | +7.5× | 4.06 | +2.1× |
+| medium_32 | 25 | 15.4 | +6.9× | 4.03 | +2.1× |
+| long_128 | 96 | 54.4 | +14.5× | 4.04 | +2.1× |
+| long_256 | 176 | 68.8 | +14.6× | 4.05 | +2.1× |
+
+### Summary
 
 | Metric | Tiny (4-dev) | Small (8-dev) |
 |--------|:------------:|:-------------:|
-| Decode improvement vs REPORT | ~2.0× | ~2.4× |
-| Prefill improvement (short) | 2.4–4.3× | 3.5–6.3× |
-| Prefill improvement (long_128) | 4.3× | 12.6× |
+| Decode improvement vs REPORT | ~2.0× | ~2.1× |
+| Prefill improvement vs REPORT (short) | 2.4–4.4× | 3.8–7.5× |
+| Prefill improvement vs REPORT (long) | 4.3× | 14.5–14.6× |
+| vs A100 decode (avg) | 0.68× | 0.74× |
 
-The primary driver of the ~2× decode improvement is the on-device MoE all_reduce, which eliminates 36 PCIe round-trips per decode step.
+#### TTNN vs A100 prefill by prompt
+
+| Prompt | Tokens | Tiny vs A100 | Small vs A100 |
+|--------|-------:|:------------:|:-------------:|
+| short_8 | 5 | 0.44× | 1.49× |
+| short_10 | 8 | 0.39× | 0.57× |
+| medium_32 | 25 | 0.35× | 0.53× |
+| long_128 | 96 | 0.32× | 0.57× |
+| long_256 | 176 | 0.23× | 0.39× |

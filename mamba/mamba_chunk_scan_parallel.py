@@ -147,19 +147,19 @@ class TensorParallelMamba:
     def _load_weights(self):
         """Load weights across devices.
 
-        On a mesh, in_proj and out_proj are column-parallel sharded across the
-        last mesh axis (cluster_axis=1, e.g. 4-way for a 2×4 mesh).
-        Each device computes a partial matmul; all_gather(cluster_axis=1) gathers
-        on fabric without touching the host.  Conv weights are replicated (small).
+        Column-parallel: shard output dim across mesh columns, replicate across
+        rows so all devices hold a valid shard (not zeros).
+        all_gather(cluster_axis=1) gathers the 4 column-shards per row on fabric.
+        Per-device weight is 1/cols of the full weight — no OOM.
         """
         replicate_mapper = self.mesh_mapper
 
         if self.is_mesh and self.num_devices > 1:
-            # Shard output dim across the last mesh axis (cols of the 2D mesh).
+            # Use actual device mesh shape so row ≥ 1 also gets valid column-shards.
+            # MeshShape(1, cols) would leave row-1 devices with zeros/garbage.
             mesh_shape = self.device.shape  # e.g. MeshShape(2, 4)
-            col_devices = mesh_shape[1]     # number of devices along col axis
             col_mapper = ttnn.ShardTensor2dMesh(
-                self.device, dims=(None, -1), mesh_shape=ttnn.MeshShape(1, col_devices)
+                self.device, dims=(None, -1), mesh_shape=mesh_shape
             )
             in_t  = self.hf_mamba.in_proj.weight.T.contiguous().unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
             out_t = self.hf_mamba.out_proj.weight.T.contiguous().unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
@@ -182,6 +182,8 @@ class TensorParallelMamba:
                 self.device, self.dtype, layout=ttnn.TILE_LAYOUT,
                 mesh_mapper=replicate_mapper,
             )
+
+        self._use_col_parallel = self.is_mesh and self.num_devices > 1
 
         self.in_proj_weight_decode_tt = self.in_proj_weight_tt
         self.out_proj_weight_decode_tt = self.out_proj_weight_tt
@@ -357,7 +359,7 @@ class TensorParallelMamba:
         projected_tt = ttnn.matmul(hidden_tt, self.in_proj_weight_tt)
         if _owns_hidden_tt:
             hidden_tt.deallocate(True)
-        if self.is_mesh and self.num_devices > 1:
+        if self._use_col_parallel:
             projected_tt = ttnn.all_gather(
                 projected_tt, dim=3, cluster_axis=1,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -500,7 +502,7 @@ class TensorParallelMamba:
         # ===================================================================
         output_tt = ttnn.matmul(gated_tt, self.out_proj_weight_tt)
         gated_tt.deallocate(True)
-        if self.is_mesh and self.num_devices > 1:
+        if self._use_col_parallel:
             output_tt = ttnn.all_gather(
                 output_tt, dim=3, cluster_axis=1,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -892,7 +894,7 @@ class TensorParallelMamba:
             hidden_states_tt, self.in_proj_weight_decode_tt,
             dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        if self.is_mesh and self.num_devices > 1:
+        if self._use_col_parallel:
             projected_tt = ttnn.all_gather(
                 projected_tt, dim=3, cluster_axis=1,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -980,7 +982,7 @@ class TensorParallelMamba:
             dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         scan_tt.deallocate(True)
-        if self.is_mesh and self.num_devices > 1:
+        if self._use_col_parallel:
             output_tt = ttnn.all_gather(
                 output_tt, dim=3, cluster_axis=1,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
