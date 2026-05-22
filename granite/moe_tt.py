@@ -1,10 +1,11 @@
 """
-TTNN MoE for GraniteMoeHybrid — expert-parallel sharding across devices.
+TTNN MoE for GraniteMoeHybrid — expert-parallel sharding across mesh columns.
 
-Each device owns num_experts/effective_devices experts.
+Each mesh column owns num_experts/col_devices experts.
+Rows replicate the same experts (no cross-row communication needed).
 Router runs on CPU (one linear layer, negligible cost).
-Expert compute: batched matmul with broadcast hidden — no ttnn.repeat.
-EP all_reduce at the end (sum local first, then all_gather small result).
+EP all_reduce: local expert sum → all_gather(cluster_axis=1) → sum on device.
+No PCIe round-trips in the expert-compute hot path.
 """
 
 import torch
@@ -28,16 +29,52 @@ class GraniteTTMoE:
         self.intermediate_size = hf_moe.hidden_size
         self.top_k = hf_moe.router.top_k
 
-        effective_devices = self.num_devices
-        while effective_devices > 1 and self.num_experts % effective_devices != 0:
-            effective_devices -= 1
-        self.effective_devices = effective_devices
-        self.padded_experts = self.num_experts
-        self.experts_per_device = self.num_experts // effective_devices
+        # EP sharding strategy depends on mesh shape:
+        #
+        # Single-row mesh (e.g. tiny, MeshShape(1,4)):
+        #   Shard across all 4 devices; use all_gather(cluster_axis=1) for on-device reduce.
+        #   No row replication overhead.
+        #
+        # Multi-row mesh (e.g. small, MeshShape(2,4)):
+        #   Replicated row sharding doubles per-device weight DRAM → OOM for large models.
+        #   Fall back to flat num_devices-way EP + CPU reduce (original approach).
+        #   The CPU reduce is a single small download per layer (already optimised with
+        #   local sum first), so the cost is acceptable.
+        if self.is_mesh and self.num_devices > 1:
+            mesh_shape = device.shape
+            self._mesh_rows = mesh_shape[0]
+            self._mesh_cols = mesh_shape[1]
+        else:
+            self._mesh_rows = 1
+            self._mesh_cols = 1
 
-        self._ep_mapper = ttnn.ShardTensorToMesh(
-            self.device, dim=1
-        ) if self.effective_devices > 1 else None
+        self._use_col_parallel = (self._mesh_rows == 1) and self.num_devices > 1
+
+        if self._use_col_parallel:
+            # Single-row: shard across all columns, on-device all_gather reduce.
+            effective_cols = self._mesh_cols
+            while effective_cols > 1 and self.num_experts % effective_cols != 0:
+                effective_cols -= 1
+            self.effective_cols = effective_cols
+            self.experts_per_device = self.num_experts // effective_cols
+            self._ep_mapper = ttnn.ShardTensor2dMesh(
+                self.device, dims=(None, 1),
+                mesh_shape=ttnn.MeshShape(1, effective_cols),
+            ) if effective_cols > 1 else (
+                ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None
+            )
+        else:
+            # Multi-row: flat EP across all devices, CPU reduce.
+            effective_devices = self.num_devices
+            while effective_devices > 1 and self.num_experts % effective_devices != 0:
+                effective_devices -= 1
+            self.effective_cols = effective_devices  # reuse field name for experts_per_device calc
+            self.experts_per_device = self.num_experts // effective_devices
+            self._ep_mapper = ttnn.ShardTensorToMesh(
+                self.device, dim=1
+            ) if effective_devices > 1 else (
+                ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None
+            )
 
         self._load_weights()
         self._load_router_weight()
@@ -78,12 +115,12 @@ class GraniteTTMoE:
         Caller must NOT deallocate — also needed for shared MLP.
         Returns: TTNN [1, 1, S, H] replicated.
         """
-        I        = self.intermediate_size
-        E        = self.num_experts
-        E_local  = self.experts_per_device
-        S        = hidden_states_tt.shape[2]
+        I       = self.intermediate_size
+        E       = self.num_experts
+        E_local = self.experts_per_device
+        S       = hidden_states_tt.shape[2]
 
-        # ── 1. ROUTER ────────────────────────────────────────────────────────
+        # ── 1. ROUTER (CPU) ───────────────────────────────────────────────────
         logits_tt = ttnn.linear(
             hidden_states_tt, self.router_weight_tt,
             dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -108,7 +145,7 @@ class GraniteTTMoE:
         )
         # per device: routing_tt [1, E_local, S, 1]
 
-        # ── 2. GATE+UP — expand hidden across local experts ──────────────────
+        # ── 2. GATE+UP ────────────────────────────────────────────────────────
         hidden_exp = ttnn.repeat(
             hidden_states_tt, ttnn.Shape([1, E_local, 1, 1]),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -141,33 +178,43 @@ class GraniteTTMoE:
         expert_out_tt.deallocate(True)
         routing_tt.deallocate(True)
 
-        # ── 6. Sum local experts on device, then reduce across devices on CPU ───
-        # Sum [1,E_local,S,H] → [1,1,S,H] on device first — E_local× less data
-        # to download (9× for small, 16× for tiny) vs gathering before summing.
+        # ── 6. Local sum on device, then all_gather + sum across columns ──────
+        # Sum [1, E_local, S, H] → [1, 1, S, H] per device.
         local_sum_tt = ttnn.sum(
             weighted_tt, dim=1, keepdim=True,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )  # [1, 1, S, H] per device
+        )  # [1, 1, S, H]
         weighted_tt.deallocate(True)
 
-        if self.effective_devices > 1:
-            # Download [N, 1, S, H] — E_local× smaller than [N, E_local, S, H]
+        if self._use_col_parallel and self.effective_cols > 1:
+            # Single-row mesh: all_gather on fabric across columns, sum on device.
+            gathered_tt = ttnn.all_gather(
+                local_sum_tt, dim=1, cluster_axis=1,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            local_sum_tt.deallocate(True)
+            result_tt = ttnn.sum(
+                gathered_tt, dim=1, keepdim=True,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            gathered_tt.deallocate(True)
+        elif not self._use_col_parallel and self.effective_cols > 1:
+            # Multi-row mesh: CPU reduce (avoids OOM from row-replicated weights).
             all_sums = ttnn.to_torch(
                 local_sum_tt,
                 mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0),
             )  # [N, 1, S, H]
             local_sum_tt.deallocate(True)
             global_sum = all_sums.sum(dim=0, keepdim=True)  # [1, 1, S, H]
+            result_tt = ttnn.from_torch(
+                global_sum,
+                device=self.device,
+                dtype=self.act_dtype,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None,
+            )
         else:
-            global_sum = ttnn.to_torch(local_sum_tt)  # [1, 1, S, H]
-            local_sum_tt.deallocate(True)
+            result_tt = local_sum_tt
 
-        result_tt = ttnn.from_torch(
-            global_sum,
-            device=self.device,
-            dtype=self.act_dtype,
-            layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None,
-        )
         return result_tt
