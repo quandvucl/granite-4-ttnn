@@ -1,16 +1,14 @@
 """
 TTNN MoE for GraniteMoeHybrid — expert-parallel sharding across mesh columns.
 
-Each mesh column owns num_experts/col_devices experts.
-Rows replicate the same experts (no cross-row communication needed).
+Single-row mesh (tiny, 1×4): shard experts across cols; all_gather(axis=1)+sum on device.
+Multi-row mesh (small, 2×4): flat EP across 8 devices; local sum then CPU reduce.
+  Two-axis on-device reduce was tried but row-axis all_gather latency hurt prefill (-53%).
 Router runs on CPU (one linear layer, negligible cost).
-EP all_reduce: local expert sum → all_gather(cluster_axis=1) → sum on device.
-No PCIe round-trips in the expert-compute hot path.
 """
 
 import torch
 import ttnn
-from utils import to_torch_tensor
 from utils.device import _is_mesh_device
 
 
@@ -29,17 +27,6 @@ class GraniteTTMoE:
         self.intermediate_size = hf_moe.hidden_size
         self.top_k = hf_moe.router.top_k
 
-        # EP sharding strategy depends on mesh shape:
-        #
-        # Single-row mesh (e.g. tiny, MeshShape(1,4)):
-        #   Shard across all 4 devices; use all_gather(cluster_axis=1) for on-device reduce.
-        #   No row replication overhead.
-        #
-        # Multi-row mesh (e.g. small, MeshShape(2,4)):
-        #   Replicated row sharding doubles per-device weight DRAM → OOM for large models.
-        #   Fall back to flat num_devices-way EP + CPU reduce (original approach).
-        #   The CPU reduce is a single small download per layer (already optimised with
-        #   local sum first), so the cost is acceptable.
         if self.is_mesh and self.num_devices > 1:
             mesh_shape = device.shape
             self._mesh_rows = mesh_shape[0]
@@ -48,10 +35,17 @@ class GraniteTTMoE:
             self._mesh_rows = 1
             self._mesh_cols = 1
 
+        # EP sharding strategy:
+        #
+        # Single-row (tiny, 1×4): shard across 4 cols; all_gather(axis=1) + sum on device.
+        #
+        # Multi-row (small, 2×4): flat EP across 8 devices (9 experts/device).
+        #   CPU reduce: download partial sums, sum on CPU, re-upload.
+        #   Two-axis on-device reduce tested but reverted: row-axis all_gather latency
+        #   dominates for long sequences, hurting prefill (-53%) despite decode gains (+14%).
         self._use_col_parallel = (self._mesh_rows == 1) and self.num_devices > 1
 
         if self._use_col_parallel:
-            # Single-row: shard across all columns, on-device all_gather reduce.
             effective_cols = self._mesh_cols
             while effective_cols > 1 and self.num_experts % effective_cols != 0:
                 effective_cols -= 1
@@ -68,10 +62,10 @@ class GraniteTTMoE:
             effective_devices = self.num_devices
             while effective_devices > 1 and self.num_experts % effective_devices != 0:
                 effective_devices -= 1
-            self.effective_cols = effective_devices  # reuse field name for experts_per_device calc
+            self.effective_cols = effective_devices
             self.experts_per_device = self.num_experts // effective_devices
             self._ep_mapper = ttnn.ShardTensorToMesh(
-                self.device, dim=1
+                self.device, dim=1,
             ) if effective_devices > 1 else (
                 ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None
             )
@@ -125,7 +119,10 @@ class GraniteTTMoE:
             hidden_states_tt, self.router_weight_tt,
             dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        logits_cpu = to_torch_tensor(logits_tt, target_shape=None)
+        if self.is_mesh:
+            logits_cpu = ttnn.to_torch(logits_tt, mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0))[0:1]
+        else:
+            logits_cpu = logits_tt.cpu().to_torch()
         logits_tt.deallocate(True)
         logits_SE = logits_cpu.reshape(-1, E)[:S]                          # [S, E]
 
@@ -187,7 +184,7 @@ class GraniteTTMoE:
         weighted_tt.deallocate(True)
 
         if self._use_col_parallel and self.effective_cols > 1:
-            # Single-row mesh: all_gather on fabric across columns, sum on device.
+            # Single-row mesh: all_gather across columns, then sum.
             gathered_tt = ttnn.all_gather(
                 local_sum_tt, dim=1, cluster_axis=1,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -199,13 +196,13 @@ class GraniteTTMoE:
             )
             gathered_tt.deallocate(True)
         elif not self._use_col_parallel and self.effective_cols > 1:
-            # Multi-row mesh: CPU reduce (avoids OOM from row-replicated weights).
+            # Multi-row mesh: CPU reduce.
             all_sums = ttnn.to_torch(
                 local_sum_tt,
                 mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0),
-            )  # [N, 1, S, H]
+            )
             local_sum_tt.deallocate(True)
-            global_sum = all_sums.sum(dim=0, keepdim=True)  # [1, 1, S, H]
+            global_sum = all_sums.sum(dim=0, keepdim=True)
             result_tt = ttnn.from_torch(
                 global_sum,
                 device=self.device,

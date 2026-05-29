@@ -122,8 +122,11 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS):
             use_tt_attention=True,
             use_tt_mamba=True,
             use_tt_moe=True,
-            mamba_chunk_size=256 if num_devices >= 4 else None,  # chunked prefill at 4+ devices; 256 = model native chunk size
+            mamba_chunk_size=256 if num_devices >= 4 else None,
             max_cache_length=512,
+            # tiny: bfloat8_b gives +5-7% throughput at fast load (small weights).
+            # small: bfloat16 avoids 375s CPU quantization of 2.9 GB expert weights.
+            moe_weight_dtype=ttnn.bfloat8_b if num_devices <= 4 else ttnn.bfloat16,
         )
         load_s = time.time() - t_load0
         print(f"\nModel load: {load_s:.1f} s\n")

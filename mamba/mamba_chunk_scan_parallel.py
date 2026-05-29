@@ -17,7 +17,6 @@ import ttnn
 from models.common.tensor_utils import pad_dim_to_size
 from models.common.utility_functions import roundup
 from mamba.utils import segment_sum_ttnn
-from models.common.auto_compose import to_torch_auto_compose
 
 from utils import to_torch_tensor, to_tt_tensor
 from utils.device import (
@@ -54,6 +53,7 @@ class TensorParallelMamba:
         dtype=ttnn.bfloat16,
         tensor_parallel=True,
         chunk_size_override=None,
+        weight_dtype=None,
     ):
         """
         Initialize tensor-parallel Mamba layer.
@@ -70,6 +70,7 @@ class TensorParallelMamba:
         self.hf_mamba = hf_mamba
         self.device = device
         self.dtype = dtype
+        self.weight_dtype = weight_dtype if weight_dtype is not None else dtype
         self.tensor_parallel = tensor_parallel
         self.layer_idx = hf_mamba.layer_idx
 
@@ -164,22 +165,22 @@ class TensorParallelMamba:
             in_t  = self.hf_mamba.in_proj.weight.T.contiguous().unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
             out_t = self.hf_mamba.out_proj.weight.T.contiguous().unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
             self.in_proj_weight_tt = ttnn.from_torch(
-                in_t, dtype=self.dtype, layout=ttnn.TILE_LAYOUT,
+                in_t, dtype=self.weight_dtype, layout=ttnn.TILE_LAYOUT,
                 device=self.device, mesh_mapper=col_mapper,
             )
             self.out_proj_weight_tt = ttnn.from_torch(
-                out_t, dtype=self.dtype, layout=ttnn.TILE_LAYOUT,
+                out_t, dtype=self.weight_dtype, layout=ttnn.TILE_LAYOUT,
                 device=self.device, mesh_mapper=col_mapper,
             )
         else:
             self.in_proj_weight_tt = to_tt_tensor(
                 self.hf_mamba.in_proj.weight.T.contiguous(),
-                self.device, self.dtype, layout=ttnn.TILE_LAYOUT,
+                self.device, self.weight_dtype, layout=ttnn.TILE_LAYOUT,
                 mesh_mapper=replicate_mapper,
             )
             self.out_proj_weight_tt = to_tt_tensor(
                 self.hf_mamba.out_proj.weight.T.contiguous(),
-                self.device, self.dtype, layout=ttnn.TILE_LAYOUT,
+                self.device, self.weight_dtype, layout=ttnn.TILE_LAYOUT,
                 mesh_mapper=replicate_mapper,
             )
 
@@ -479,9 +480,9 @@ class TensorParallelMamba:
             C_tt = ttnn.reshape(ttnn.repeat(ttnn.unsqueeze(C_tt, 3), ttnn.Shape([1, 1, 1, group_repeat, 1])), [batch_size, seq_len, H, N])
 
         # ===================================================================
-        # 5. CHUNK-SCAN SSM — passes TTNN tensors, returns TTNN y_tt + cpu ssm_state
+        # 5. CHUNK-SCAN SSM — updates self._ssm_state_tt on device, returns Y_tt
         # ===================================================================
-        y_tt, ssm_state = self._chunk_scan_ssm_ttnn(
+        y_tt = self._chunk_scan_ssm_ttnn(
             x_tt, B_tt, C_tt, dt_tt, cache_params
         )
         x_tt.deallocate(True); B_tt.deallocate(True)
@@ -512,7 +513,7 @@ class TensorParallelMamba:
         # decoder_layer._mamba_forward checks isinstance(out, ttnn.Tensor) and returns it.
         # Reshape to [1,1,S,H] so it matches the hidden_states layout in decoder_layer.forward.
         output_tt = ttnn.reshape(output_tt, [1, 1, seq_len, self.hidden_size])
-        return output_tt, ssm_state
+        return output_tt
 
     def _chunk_scan_ssm_ttnn(self, x_tt, B_tt, C_tt, dt_tt, cache_params):
         """
@@ -682,14 +683,9 @@ class TensorParallelMamba:
         new_states_tt.deallocate(True)
         ssm_state_tt = ttnn.reshape(ssm_state_tt, [B_sz, H, Dh, N])
 
-        if self.is_mesh and self.num_devices > 1:
-            ssm_state = ttnn.to_torch(
-                ssm_state_tt, mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0)
-            )[0:1].reshape(B_sz, H, Dh, N).to(torch.bfloat16)
-        else:
-            ssm_state = to_torch_tensor(ssm_state_tt,
-                                        target_shape=(B_sz, H, Dh, N)).to(torch.bfloat16)
-        ssm_state_tt.deallocate(True)
+        # Update on-device state directly — no PCIe round-trip.
+        self._ssm_state_tt.deallocate(True)
+        self._ssm_state_tt = ssm_state_tt                              # stays on device
 
         # states: [B,H,C_n,D,N] → [B,C_n,H,D,N]
         states_tt = ttnn.permute(states_tt, [0, 2, 1, 3, 4])
@@ -738,7 +734,7 @@ class TensorParallelMamba:
             Y_tt = Y_tt[:, :seq_len, :, :]
         Y_tt = ttnn.reshape(Y_tt, [B_sz, seq_len, H * Dh])
 
-        return Y_tt, ssm_state
+        return Y_tt
 
     def forward(
         self, hidden_states, cache_params=None, cache_position=None, attention_mask=None
@@ -760,29 +756,33 @@ class TensorParallelMamba:
         if seq_len == 1:
             return self.forward_decode(hidden_states, cache_params)
         else:
-            output, ssm_state = self.forward_prefill_chunk_scan(
+            output = self.forward_prefill_chunk_scan(
                 hidden_states, cache_params, real_seq_len=seq_len
             )
 
-            # Seed on-device SSM state and conv cache from prefill result
-            self._seed_state(ssm_state, cache_params)
-
-            # Also write back to cache so callers that inspect cache_params stay consistent
-            if cache_params is not None and hasattr(cache_params, "ssm_states"):
-                cache_params.ssm_states[self.layer_idx] = ssm_state
+            # _ssm_state_tt is already updated on device by _chunk_scan_ssm_ttnn.
+            # Seed the conv cache and, if needed, write ssm state back to cache_params.
+            self._seed_state(cache_params)
 
             return output
 
-    def _seed_state(self, ssm_state: torch.Tensor, cache_params=None):
-        """Upload SSM state and seed conv cache from cache_params after prefill."""
-        self._ssm_state_tt.deallocate(True)
-        self._ssm_state_tt = ttnn.from_torch(
-            ssm_state.reshape(1, self.num_heads, self.head_dim, self.ssm_state_size)
-                     .to(torch.bfloat16),
-            device=self.device, dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=self.mesh_mapper,
-        )
+    def _seed_state(self, cache_params=None):
+        """Seed conv cache after prefill. SSM state is already on device."""
+        # Write ssm state back to cache_params for any callers that inspect it.
+        if cache_params is not None and hasattr(cache_params, "ssm_states"):
+            B_sz = 1
+            H, Dh, N = self.num_heads, self.head_dim, self.ssm_state_size
+            if self.is_mesh and self.num_devices > 1:
+                ssm_state = ttnn.to_torch(
+                    self._ssm_state_tt,
+                    mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0)
+                )[0:1].reshape(B_sz, H, Dh, N).to(torch.bfloat16)
+            else:
+                ssm_state = to_torch_tensor(
+                    self._ssm_state_tt, target_shape=(B_sz, H, Dh, N)
+                ).to(torch.bfloat16)
+            cache_params.ssm_states[self.layer_idx] = ssm_state
+
         # Seed the on-device conv cache from cache_params (set during prefill).
         if cache_params is not None and hasattr(cache_params, "conv_states"):
             conv_state = cache_params.conv_states[self.layer_idx]  # [B, C, K]
@@ -795,8 +795,7 @@ class TensorParallelMamba:
                 layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=self.mesh_mapper,
             )
-            # Update prefill conv pad so the next chunk sees the correct causal context.
-            # conv_state[:, :, :K-1] holds the last K-1 input tokens; use them as left-pad.
+            # Update prefill conv pad so the next chunk sees correct causal context.
             pad = conv_state[:, :, :K - 1].to(torch.bfloat16).reshape(1, 1, C, K - 1)
             new_pad_tt = ttnn.from_torch(
                 pad,
@@ -809,33 +808,9 @@ class TensorParallelMamba:
 
     def reset_state(self):
         """Zero SSM state and conv cache (call between sequences)."""
-        kernel_size = self.hf_mamba.conv1d.weight.shape[2]
-        conv_dim = self.hf_mamba.conv_dim
-
-        self._ssm_state_tt.deallocate(True)
-        self._ssm_state_tt = ttnn.from_torch(
-            torch.zeros(1, self.num_heads, self.head_dim, self.ssm_state_size,
-                        dtype=torch.bfloat16),
-            device=self.device, dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=self.mesh_mapper,
-        )
-        self._conv_cache_tt.deallocate(True)
-        self._conv_cache_tt = ttnn.from_torch(
-            torch.zeros(1, 1, conv_dim, kernel_size, dtype=torch.bfloat16),
-            device=self.device, dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=self.mesh_mapper,
-        )
-        # Reset prefill conv pad to zeros for the next sequence.
-        new_pad = ttnn.from_torch(
-            torch.zeros(1, 1, conv_dim, kernel_size - 1, dtype=torch.bfloat16),
-            device=self.device, dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=self.mesh_mapper,
-        )
-        self._prefill_conv_pad_tt.deallocate(True)
-        self._prefill_conv_pad_tt = new_pad
+        self._ssm_state_tt = ttnn.zeros_like(self._ssm_state_tt)
+        self._conv_cache_tt = ttnn.zeros_like(self._conv_cache_tt)
+        self._prefill_conv_pad_tt = ttnn.zeros_like(self._prefill_conv_pad_tt)
 
     def _conv1d_decode_tt(self, xBC_tt):
         """
@@ -988,154 +963,3 @@ class TensorParallelMamba:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
         return output_tt   # TTNN [1,1,1,H] replicated
-
-    def _gather_column_parallel_output(
-        self, projected_tt, batch_size, seq_len, expected_size
-    ):
-        """Gather column-parallel projected output using auto_compose."""
-        # Use automatic composition from models/common
-        gathered = to_torch_auto_compose(projected_tt, device=self.device)
-
-        # Handle padding and reshape to expected dimensions
-        if gathered.dim() == 4:
-            gathered = gathered.squeeze(2)
-
-        # Trim to expected size
-        gathered = gathered[..., :expected_size]
-
-        return gathered.view(batch_size, seq_len, expected_size)
-
-    def _conv1d_decode(self, hidden_states_B_C, cache_params):
-        """Conv1d decode step on CPU — state is 67KB, not worth PCIe round-trip."""
-        # Roll cache and insert new token
-        conv_cache = cache_params.conv_states[self.layer_idx]  # [B, C, kernel]
-        conv_cache = conv_cache.roll(shifts=-1, dims=-1)
-        conv_cache[:, :, -1] = hidden_states_B_C[:, 0, :]
-        cache_params.conv_states[self.layer_idx] = conv_cache
-
-        # Pointwise depthwise conv: sum(state * weight) + bias, then silu
-        conv_weight = self.hf_mamba.conv1d.weight.squeeze(1)   # [C, kernel]
-        out = (conv_cache * conv_weight.unsqueeze(0)).sum(dim=-1)  # [B, C]
-        if self.hf_mamba.use_conv_bias:
-            out = out + self.hf_mamba.conv1d.bias
-        out = torch.nn.functional.silu(out)
-
-        return out.unsqueeze(1)  # [B, 1, C]
-
-    def _ssm_step_tt(self, x_cpu, B_cpu, C_cpu, dt_cpu, batch_size):
-        """
-        SSM decode step — 4 PCIe uploads (already-shaped bfloat16 tensors), all ops on device.
-        x_cpu is uploaded once and reused for the D residual (was uploaded twice before).
-        Returns y_tt [B,1,H*D]; self._ssm_state_tt stays on device.
-
-        Args:
-            x_cpu:  [B, H, D]  bfloat16
-            B_cpu:  [B, H, N]  bfloat16, already expanded from n_groups
-            C_cpu:  [B, H, N]  bfloat16, already expanded from n_groups
-            dt_cpu: [B, H, D]  bfloat16, already expanded from [B, H, 1]
-        """
-        mapper = self.mesh_mapper
-        H = self.num_heads
-        D = self.head_dim
-        N = self.ssm_state_size
-
-        # Upload all 4 inputs (4 PCIe transactions, down from 5 before — x used once not twice)
-        x_tt  = to_tt_tensor(x_cpu,  self.device, ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper)
-        B_tt  = to_tt_tensor(B_cpu,  self.device, ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper)
-        C_tt  = to_tt_tensor(C_cpu,  self.device, ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper)
-        dt_tt = to_tt_tensor(dt_cpu, self.device, ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper)
-
-        # softplus(dt + bias) + clamp
-        dt_tt = ttnn.add(dt_tt, self._ssm_dt_bias_tt)
-        dt_tt = ttnn.softplus(dt_tt, beta=1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        dt_tt = ttnn.clip(dt_tt,
-                          self.hf_mamba.time_step_limit[0],
-                          self.hf_mamba.time_step_limit[1])
-
-        # dA = exp(dt * A): [B, H, D, N]
-        dt_exp = ttnn.unsqueeze(dt_tt, -1)                       # [B, H, D, 1]
-        dA_tt  = ttnn.exp(ttnn.mul(dt_exp, self._ssm_A_tt))      # [B, H, D, N]
-        dt_exp.deallocate(True)
-
-        # dBx = (dt * x)[..., None] * B[..., None, :]: [B, H, D, N]
-        dtx_tt = ttnn.mul(dt_tt, x_tt)                           # [B, H, D]
-        dt_tt.deallocate(True)
-        dtx_tt = ttnn.unsqueeze(dtx_tt, -1)                      # [B, H, D, 1]
-        B_tt   = ttnn.unsqueeze(B_tt, -2)                        # [B, H, 1, N]
-        dBx_tt = ttnn.mul(dtx_tt, B_tt)                          # [B, H, D, N]
-        dtx_tt.deallocate(True); B_tt.deallocate(True)
-
-        # state update: new_state = dA * old_state + dBx
-        new_state_tt = ttnn.add(ttnn.mul(dA_tt, self._ssm_state_tt), dBx_tt)
-        dA_tt.deallocate(True); dBx_tt.deallocate(True)
-        self._ssm_state_tt.deallocate(True)
-        self._ssm_state_tt = new_state_tt
-
-        # y = sum(new_state * C, dim=-1) + D * x: [B, H, D]
-        # Use matmul with ones instead of ttnn.sum(dim=-1) which crashes on mesh.
-        # new_state: [B, H, D, N],  C_tt: [B, H, 1, N]
-        C_tt = ttnn.unsqueeze(C_tt, -2)                          # [B, H, 1, N]
-        y_unred = ttnn.mul(self._ssm_state_tt, C_tt)             # [B, H, D, N]
-        C_tt.deallocate(True)
-        # matmul [B, H, D, N] @ [1, H, N, 1] → [B, H, D, 1]
-        y_tt = ttnn.matmul(y_unred, self._ones_N_tt,
-                           memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [B, H, D, 1]
-        y_unred.deallocate(True)
-        y_tt = ttnn.squeeze(y_tt, dim=-1)                        # [B, H, D]
-        y_tt = ttnn.add(y_tt, ttnn.mul(self._ssm_D_tt, x_tt))   # D residual
-        x_tt.deallocate(True)
-
-        y_tt = ttnn.reshape(y_tt, [batch_size, 1, H * D])
-        return y_tt
-
-    def _gated_norm_ttnn(self, y, gate):
-        """Gated RMS normalization on TTNN device."""
-        batch_size, seq_len, hidden_size = y.shape
-        replicate_mapper = self.mesh_mapper
-
-        # Convert to TTNN
-        y_tt = to_tt_tensor(
-            y,
-            self.device,
-            self.dtype,
-            layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=replicate_mapper,
-        )
-        gate_tt = to_tt_tensor(
-            gate,
-            self.device,
-            self.dtype,
-            layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=replicate_mapper,
-        )
-
-        # Apply SiLU to gate and multiply with y
-        gated_tt = ttnn.mul(
-            y_tt, gate_tt, input_tensor_b_activations=[ttnn.UnaryOpType.SILU]
-        )
-        y_tt.deallocate(True)
-        gate_tt.deallocate(True)
-
-        # RMS Norm
-        norm_weight = self.hf_mamba.norm.weight
-        norm_eps = self.hf_mamba.norm.variance_epsilon
-        weight_reshaped = norm_weight.unsqueeze(0).unsqueeze(0)
-        weight_tt = to_tt_tensor(
-            weight_reshaped,
-            self.device,
-            self.dtype,
-            layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=replicate_mapper,
-        )
-
-        normed_tt = ttnn.rms_norm(gated_tt, epsilon=norm_eps, weight=weight_tt)
-        gated_tt.deallocate(True)
-        weight_tt.deallocate(True)
-
-        # Convert back to torch
-        scan_output = to_torch_tensor(
-            normed_tt, target_shape=(batch_size, seq_len, hidden_size)
-        )
-        normed_tt.deallocate(True)
-
-        return scan_output

@@ -127,11 +127,9 @@ class AttentionNoPE:
             cur_pos_tt = _idx_tensor(start_pos)
             ttnn.experimental.paged_update_cache(keys, k_heads, update_idxs_tensor=cur_pos_tt, batch_offset=0)
             ttnn.experimental.paged_update_cache(values, v_heads, update_idxs_tensor=cur_pos_tt, batch_offset=0)
-            cur_pos_tt.deallocate(True)
             ttnn.deallocate(k_heads)
             ttnn.deallocate(v_heads)
 
-            cur_pos_tt = _idx_tensor(start_pos)
             attn_output = ttnn.transformer.scaled_dot_product_attention_decode(
                 q_heads, keys, values,
                 cur_pos_tensor=cur_pos_tt,

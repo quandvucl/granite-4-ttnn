@@ -66,6 +66,8 @@ class TTGraniteMoeHybridForCausalLM:
         use_tt_mamba: bool = False,
         use_tt_moe: bool = True,
         mamba_chunk_size: int = None,
+        moe_weight_dtype=None,
+        mamba_weight_dtype=None,
     ):
         self.device = device
         self.mamba_chunk_size = mamba_chunk_size
@@ -76,6 +78,8 @@ class TTGraniteMoeHybridForCausalLM:
         self.use_tt_attention = use_tt_attention
         self.use_tt_mamba = use_tt_mamba
         self.use_tt_moe = use_tt_moe
+        self.moe_weight_dtype = moe_weight_dtype if moe_weight_dtype is not None else ttnn.bfloat8_b
+        self.mamba_weight_dtype = mamba_weight_dtype  # None means use activation dtype (bfloat16)
         self.last_layer_family_timing = {
             "attention_total": 0.0,
             "mamba_total": 0.0,
@@ -214,6 +218,8 @@ class TTGraniteMoeHybridForCausalLM:
                 use_tt_mamba=self.use_tt_mamba,
                 use_tt_moe=self.use_tt_moe,
                 mamba_chunk_size=self.mamba_chunk_size,
+                moe_weight_dtype=self.moe_weight_dtype,
+                mamba_weight_dtype=self.mamba_weight_dtype,
             )
 
             self.layers.append(layer)
@@ -506,6 +512,8 @@ class TTGraniteMoeHybridForCausalLM:
         use_tt_moe: bool = True,
         mamba_chunk_size: int = None,
         max_cache_length: int = None,
+        moe_weight_dtype=None,
+        mamba_weight_dtype=None,
     ):
         if verbose:
             print(f"\n=== Loading {model_name} ===")
@@ -538,6 +546,8 @@ class TTGraniteMoeHybridForCausalLM:
             use_tt_mamba=use_tt_mamba,
             use_tt_moe=use_tt_moe,
             mamba_chunk_size=mamba_chunk_size,
+            moe_weight_dtype=moe_weight_dtype,
+            mamba_weight_dtype=mamba_weight_dtype,
         )
 
         return tt_model

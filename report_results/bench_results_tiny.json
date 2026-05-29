@@ -1,47 +1,47 @@
 {
   "model": "tiny",
-  "load_s": 23.835296154022217,
+  "load_s": 99.16102862358093,
   "num_devices": 4,
   "results": [
     {
       "prompt": "short_8",
       "tokens": 5,
-      "prefill_toks": 2.47499953678259,
-      "decode_toks": 6.296819232928763,
+      "prefill_toks": 2.521301469534498,
+      "decode_toks": 6.472493166835291,
       "prompt_text": "The capital of France is",
-      "response": " Paris, the city that never sleep. The Eiffel Tower and Louver are some famous places in"
+      "response": " Paris, the city that never sleep. The Eiffel Tower and Louver are some famous places to"
     },
     {
       "prompt": "short_10",
       "tokens": 8,
-      "prefill_toks": 10.102423538819494,
-      "decode_toks": 6.2728462809084675,
+      "prefill_toks": 10.512804188775625,
+      "decode_toks": 6.501363469270178,
       "prompt_text": "The largest planet in our solar system is",
-      "response": " ___________.\n\n**Answer:**\nJupiter\n\n### Question 4\nWhich of the following statements"
+      "response": " ___________ (a) / the Sun, which makes up more than 99.8% of"
     },
     {
       "prompt": "medium_32",
       "tokens": 25,
-      "prefill_toks": 26.70773186922234,
-      "decode_toks": 6.268781323050737,
+      "prefill_toks": 28.100972863690277,
+      "decode_toks": 6.442876309475927,
       "prompt_text": "Artificial intelligence is transforming many industries. Machine learning models can now perform tasks that previously required human expertise, such as image recognition",
-      "response": " and natural language processing.\n\nAI has the potential to revolutionize healthcare by improving diagnostic accuracy through machine vision systems"
+      "response": " and natural language processing.\n\nHowever, these systems are often considered \"black boxes\" because their decision making process"
     },
     {
       "prompt": "long_128",
       "tokens": 96,
-      "prefill_toks": 89.4750057497764,
-      "decode_toks": 6.254447610534832,
+      "prefill_toks": 94.71551673239344,
+      "decode_toks": 6.482969223218649,
       "prompt_text": "Large language models have become increasingly capable over recent years. These models are trained on vast amounts of text data and can generate coherent, contextually appropriate responses across a wide range of topics. They are used in applications ranging from customer service chatbots to code generation tools, scientific research assistants, and creative writing aids. The architecture underlying most of these models is the transformer, which uses self-attention mechanisms to capture long-range dependencies in text. Recent hybrid architectures combine transformers with state-space models",
-      "response": " for example , BERT or GPT.\n\nThe key idea behind this type associated with model would be that"
+      "response": " like GPT-4 or LLaMA.\n\nHowever, despite their impressive capabilities, large language models still"
     },
     {
       "prompt": "long_256",
       "tokens": 176,
-      "prefill_toks": 117.77040564240528,
-      "decode_toks": 6.18850564858427,
+      "prefill_toks": 123.04557051950175,
+      "decode_toks": 6.428815942398319,
       "prompt_text": "The field of natural language processing has undergone a remarkable transformation with the advent of large-scale pretrained language models. These systems, trained on hundreds of billions of tokens of text from the internet and other sources, have demonstrated surprising emergent capabilities including multi-step reasoning, in-context learning, and instruction following. The scaling laws governing these models suggest that performance on many tasks continues to improve predictably with increases in model size, dataset size, and compute budget. This has motivated the development of increasingly large models, from hundreds of millions to hundreds of billions of parameters. However, serving these models efficiently at inference time presents significant engineering challenges, particularly for applications requiring low latency responses. Speculative decoding, quantization, and hardware-specific optimizations are among the techniques used to address these challenges. Hybrid architectures that combine attention layers with state-space models like Mamba offer promising tradeoffs between computational efficiency and modeling capability",
-      "response": ".\n\nIn summary: Large scale pretrainned languages models process huge amounts of data quickly by increasing their parameter"
+      "response": ".\n\nThis overview provides an introduction to some key concepts related to modern NLP:\n\n1) Pretrain-"
     }
   ]
 }

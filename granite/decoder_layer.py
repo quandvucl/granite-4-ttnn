@@ -52,6 +52,8 @@ class TTGraniteDecoderLayer:
         use_tt_mamba=True,
         use_tt_moe=True,
         mamba_chunk_size=None,
+        moe_weight_dtype=ttnn.bfloat8_b,
+        mamba_weight_dtype=None,
     ):
         self.device = device
         self.layer_idx = layer_idx
@@ -67,6 +69,7 @@ class TTGraniteDecoderLayer:
         self.use_tt_mamba = use_tt_mamba
         self.use_tt_moe = use_tt_moe
         self.mamba_chunk_size = mamba_chunk_size
+        self.mamba_weight_dtype = mamba_weight_dtype
 
         self.residual_multiplier = config.residual_multiplier if hasattr(config, "residual_multiplier") else 1.0
         self.is_mesh = hasattr(device, "get_num_devices") and device.get_num_devices() > 1
@@ -89,7 +92,7 @@ class TTGraniteDecoderLayer:
 
         if use_tt_moe and hasattr(hf_layer, "block_sparse_moe"):
             self.tt_moe = GraniteTTMoE(hf_layer.block_sparse_moe, device,
-                                       weight_dtype=ttnn.bfloat16, act_dtype=dtype)
+                                       weight_dtype=moe_weight_dtype, act_dtype=dtype)
         else:
             self.tt_moe = None
 
@@ -123,6 +126,7 @@ class TTGraniteDecoderLayer:
                     dtype=dtype,
                     tensor_parallel=tensor_parallel,
                     chunk_size_override=mamba_chunk_size,
+                    weight_dtype=mamba_weight_dtype,
                 )
             else:
                 self.mamba = None
