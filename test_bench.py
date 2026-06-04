@@ -78,7 +78,7 @@ MESH_SHAPE_MAP = {
 }
 
 
-def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS):
+def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather=True):
     from granite.model import TTGraniteMoeHybridForCausalLM
     from utils import to_torch_tensor
 
@@ -127,6 +127,7 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS):
             # tiny: bfloat8_b gives +5-7% throughput at fast load (small weights).
             # small: bfloat16 avoids 375s CPU quantization of 2.9 GB expert weights.
             moe_weight_dtype=ttnn.bfloat8_b if num_devices <= 4 else ttnn.bfloat16,
+            moe_use_all_gather=use_all_gather,
         )
         load_s = time.time() - t_load0
         print(f"\nModel load: {load_s:.1f} s\n")
@@ -228,21 +229,46 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark Granite models")
     parser.add_argument("--model", choices=list(MODELS.keys()) + ["all"], default="all")
     parser.add_argument("--decode-tokens", type=int, default=DECODE_TOKENS)
+    parser.add_argument("--mesh", default="8x4", help="Mesh shape, e.g. 8x4 (default) or 1x1")
     args = parser.parse_args()
 
     models = list(MODELS.keys()) if args.model == "all" else [args.model]
 
-    ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
-    full_mesh = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(8, 4))
+    rows, cols = (int(x) for x in args.mesh.split("x"))
+    use_fabric = rows * cols > 1
+    fabric_ok = False
+    # Galaxy fabric requires the full 8x4 mesh to be opened — fabric sync is system-wide.
+    # Always open full mesh, then carve out the requested submesh inside run_bench.
+    GALAXY_SHAPE = ttnn.MeshShape(8, 4)
+    full_mesh = None
+    if use_fabric:
+        try:
+            ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+            full_mesh = ttnn.open_mesh_device(mesh_shape=GALAXY_SHAPE)
+            fabric_ok = True
+            print("[info] fabric enabled")
+        except Exception as e:
+            print(f"[warn] fabric open failed ({type(e).__name__}), retrying without fabric")
+            try:
+                ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
+            except Exception:
+                pass
+            full_mesh = ttnn.open_mesh_device(mesh_shape=GALAXY_SHAPE)
+    if full_mesh is None:
+        full_mesh = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(rows, cols))
     all_results = []
     try:
-        all_results = [run_bench(m, full_mesh, args.decode_tokens) for m in models]
+        all_results = [run_bench(m, full_mesh, args.decode_tokens, use_all_gather=fabric_ok) for m in models]
         ttnn.synchronize_device(full_mesh)
     finally:
         for submesh in full_mesh.get_submeshes():
             ttnn.close_mesh_device(submesh)
         ttnn.close_mesh_device(full_mesh)
-        ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
+        if use_fabric:
+            try:
+                ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
+            except Exception:
+                pass
         del full_mesh
 
     for result in all_results:

@@ -68,9 +68,11 @@ class TTGraniteMoeHybridForCausalLM:
         mamba_chunk_size: int = None,
         moe_weight_dtype=None,
         mamba_weight_dtype=None,
+        moe_use_all_gather=True,
     ):
         self.device = device
         self.mamba_chunk_size = mamba_chunk_size
+        self.moe_use_all_gather = moe_use_all_gather
         self.hf_model = hf_model
         self.hf_config = hf_model.config
         self.config = config
@@ -186,7 +188,7 @@ class TTGraniteMoeHybridForCausalLM:
 
             # Shared MLP: weights replicated on every device; each device computes
             # the full output independently — no all_reduce needed.
-            use_tensor_parallel = is_mesh and device.get_num_devices() > 1
+            use_tensor_parallel = is_mesh and device.get_num_devices() > 1 and self.moe_use_all_gather
             dtype = config.get_ttnn_dtype()
 
             def _upload_replicated(t):
@@ -220,6 +222,7 @@ class TTGraniteMoeHybridForCausalLM:
                 mamba_chunk_size=self.mamba_chunk_size,
                 moe_weight_dtype=self.moe_weight_dtype,
                 mamba_weight_dtype=self.mamba_weight_dtype,
+                moe_use_all_gather=self.moe_use_all_gather,
             )
 
             self.layers.append(layer)
@@ -227,6 +230,33 @@ class TTGraniteMoeHybridForCausalLM:
             if verbose and (layer_idx < 5 or layer_idx % 10 == 0):
                 layer_type = "Attention" if is_attention else "Mamba"
                 print(f"  Initialized layer {layer_idx} ({layer_type})")
+
+        # Stack all MoE router weights into one batched tensor for fast decode routing.
+        # Shape: [1, n_moe_layers, H, E] replicated — one matmul covers all layers.
+        self._batched_router_tt = None
+        self._moe_layer_indices = []  # indices into self.layers that have tt_moe
+        moe_router_weights = []
+        for i, layer in enumerate(self.layers):
+            if hasattr(layer, 'tt_moe') and layer.tt_moe is not None:
+                self._moe_layer_indices.append(i)
+                # router_weight_tt is [H, E] replicated — extract cpu copy
+                H = config.hidden_size
+                if is_mesh:
+                    w_cpu = ttnn.to_torch(
+                        layer.tt_moe.router_weight_tt,
+                        mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0)
+                    )[0:H].unsqueeze(0)  # [H, E] → [1, H, E]
+                else:
+                    w_cpu = layer.tt_moe.router_weight_tt.cpu().to_torch().unsqueeze(0)
+                moe_router_weights.append(w_cpu)
+        if moe_router_weights:
+            stacked = torch.stack(moe_router_weights, dim=1)  # [1, n_moe, H, E]
+            mapper = ttnn.ReplicateTensorToMesh(device) if is_mesh else None
+            self._batched_router_tt = ttnn.from_torch(
+                stacked, device=device, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=mapper,
+            )
 
         # Initialize Mamba cache manager (Attention1D manages its own KV cache)
         self.cache_manager = MambaCacheManager(
@@ -338,11 +368,39 @@ class TTGraniteMoeHybridForCausalLM:
         if cache_position[0].item() > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
             mamba_mask = None
 
+        # ── Pre-compute all MoE routing in one batched pass (decode only) ──────
+        # One [1,n_moe,H,E] matmul + one to_torch replaces 40 separate router calls.
+        all_routing_tt = {}
+        if seq_len == 1 and self._batched_router_tt is not None and self._moe_layer_indices:
+            # [1,1,1,H] broadcast × [1,n_moe,H,E] → [1,n_moe,1,E]
+            h_rep = ttnn.repeat(hidden_tt, ttnn.Shape([1, len(self._moe_layer_indices), 1, 1]),
+                                memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            all_logits_tt = ttnn.matmul(h_rep, self._batched_router_tt,
+                                        dtype=ttnn.bfloat16,
+                                        memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            h_rep.deallocate(True)
+            if self.is_mesh:
+                all_logits_cpu = ttnn.to_torch(
+                    all_logits_tt,
+                    mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0)
+                )[0:1]  # [1, n_moe, 1, E]
+            else:
+                all_logits_cpu = all_logits_tt.cpu().to_torch()
+            all_logits_tt.deallocate(True)
+            # Compute per-layer routing on CPU and upload
+            for slot, layer_idx in enumerate(self._moe_layer_indices):
+                moe = self.layers[layer_idx].tt_moe
+                logits_SE = all_logits_cpu[0, slot, :1, :]  # [1, E]
+                all_routing_tt[layer_idx] = moe._routing_from_logits(logits_SE, S=1)
+
         # ── 40-layer loop — hidden_tt stays on device ────────────────
         attention_total = mamba_total = mamba_prefill_total = mamba_decode_total = 0.0
         mlp_total = layer_total = 0.0
 
         for layer_idx, layer in enumerate(self.layers):
+            # Hand precomputed routing to MoE layers so they skip their own router call.
+            if hasattr(layer, 'tt_moe') and layer.tt_moe is not None:
+                layer.tt_moe._precomputed_routing = all_routing_tt.get(layer_idx)
             layer_mask = mamba_mask if layer_idx not in self.config.attention_layer_indices else attention_mask
             hidden_tt = layer.forward(
                 hidden_tt,
@@ -514,6 +572,7 @@ class TTGraniteMoeHybridForCausalLM:
         max_cache_length: int = None,
         moe_weight_dtype=None,
         mamba_weight_dtype=None,
+        moe_use_all_gather=True,
     ):
         if verbose:
             print(f"\n=== Loading {model_name} ===")
@@ -548,6 +607,7 @@ class TTGraniteMoeHybridForCausalLM:
             mamba_chunk_size=mamba_chunk_size,
             moe_weight_dtype=moe_weight_dtype,
             mamba_weight_dtype=mamba_weight_dtype,
+            moe_use_all_gather=moe_use_all_gather,
         )
 
         return tt_model

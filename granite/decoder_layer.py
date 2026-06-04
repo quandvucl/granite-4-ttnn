@@ -54,6 +54,7 @@ class TTGraniteDecoderLayer:
         mamba_chunk_size=None,
         moe_weight_dtype=ttnn.bfloat8_b,
         mamba_weight_dtype=None,
+        moe_use_all_gather=True,
     ):
         self.device = device
         self.layer_idx = layer_idx
@@ -92,7 +93,8 @@ class TTGraniteDecoderLayer:
 
         if use_tt_moe and hasattr(hf_layer, "block_sparse_moe"):
             self.tt_moe = GraniteTTMoE(hf_layer.block_sparse_moe, device,
-                                       weight_dtype=moe_weight_dtype, act_dtype=dtype)
+                                       weight_dtype=moe_weight_dtype, act_dtype=dtype,
+                                       use_all_gather=moe_use_all_gather)
         else:
             self.tt_moe = None
 
@@ -178,10 +180,9 @@ class TTGraniteDecoderLayer:
 
         normed.deallocate(True)
 
-        scaled = ttnn.mul(mixer_out, self.residual_multiplier_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        hidden_states = ttnn.mac(mixer_out, self.residual_multiplier_tt, residual,
+                                 memory_config=ttnn.DRAM_MEMORY_CONFIG)
         mixer_out.deallocate(True)
-        hidden_states = ttnn.add(residual, scaled, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        scaled.deallocate(True)
         residual.deallocate(True)
 
         residual = hidden_states
@@ -192,10 +193,9 @@ class TTGraniteDecoderLayer:
         normed2.deallocate(True)
         mlp_t = time.time() - t2
 
-        scaled2 = ttnn.mul(mlp_out, self.residual_multiplier_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        hidden_states = ttnn.mac(mlp_out, self.residual_multiplier_tt, residual,
+                                 memory_config=ttnn.DRAM_MEMORY_CONFIG)
         mlp_out.deallocate(True)
-        hidden_states = ttnn.add(residual, scaled2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        scaled2.deallocate(True)
         residual.deallocate(True)
 
         self.last_timing = {

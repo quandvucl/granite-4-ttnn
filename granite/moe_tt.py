@@ -13,7 +13,8 @@ from utils.device import _is_mesh_device
 
 
 class GraniteTTMoE:
-    def __init__(self, hf_moe, device, weight_dtype=ttnn.bfloat8_b, act_dtype=ttnn.bfloat16):
+    def __init__(self, hf_moe, device, weight_dtype=ttnn.bfloat8_b, act_dtype=ttnn.bfloat16,
+                 use_all_gather=True):
         self.hf_moe = hf_moe
         self.device = device
         self.dtype = weight_dtype
@@ -43,7 +44,7 @@ class GraniteTTMoE:
         #   CPU reduce: download partial sums, sum on CPU, re-upload.
         #   Two-axis on-device reduce tested but reverted: row-axis all_gather latency
         #   dominates for long sequences, hurting prefill (-53%) despite decode gains (+14%).
-        self._use_col_parallel = (self._mesh_rows == 1) and self.num_devices > 1
+        self._use_col_parallel = (self._mesh_rows == 1) and self.num_devices > 1 and use_all_gather
 
         if self._use_col_parallel:
             effective_cols = self._mesh_cols
@@ -103,18 +104,13 @@ class GraniteTTMoE:
             mesh_mapper=self._ep_mapper,
         )
 
-    def forward(self, hidden_states_tt):
+    def compute_routing_cpu(self, hidden_states_tt):
         """
-        hidden_states_tt: TTNN [1, 1, S, H] replicated.
-        Caller must NOT deallocate — also needed for shared MLP.
-        Returns: TTNN [1, 1, S, H] replicated.
+        Compute routing weights on CPU from device logits.
+        Returns routing_tt [1, E_local, S, 1] on device.
         """
-        I       = self.intermediate_size
-        E       = self.num_experts
-        E_local = self.experts_per_device
-        S       = hidden_states_tt.shape[2]
-
-        # ── 1. ROUTER (CPU) ───────────────────────────────────────────────────
+        E = self.num_experts
+        S = hidden_states_tt.shape[2]
         logits_tt = ttnn.linear(
             hidden_states_tt, self.router_weight_tt,
             dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -124,22 +120,40 @@ class GraniteTTMoE:
         else:
             logits_cpu = logits_tt.cpu().to_torch()
         logits_tt.deallocate(True)
-        logits_SE = logits_cpu.reshape(-1, E)[:S]                          # [S, E]
+        return self._routing_from_logits(logits_cpu.reshape(-1, E)[:S], S)
 
-        top_k_logits, top_k_indices = logits_SE.topk(self.top_k, dim=1)   # [S, top_k]
+    def _routing_from_logits(self, logits_SE, S):
+        """CPU: logits_SE [S, E] → routing_tt [1, E_local, S, 1] on device."""
+        E = self.num_experts
+        top_k_logits, top_k_indices = logits_SE.topk(self.top_k, dim=1)
         top_k_weights = torch.softmax(top_k_logits.float(), dim=1).to(torch.bfloat16)
-
         routing_SE = torch.zeros(S, E, dtype=torch.bfloat16)
         routing_SE.scatter_add_(1, top_k_indices, top_k_weights)
-        routing_4d = routing_SE.T.unsqueeze(-1).unsqueeze(0)              # [1, E, S, 1]
-
-        routing_tt = ttnn.from_torch(
-            routing_4d,
-            device=self.device, dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        routing_4d = routing_SE.T.unsqueeze(-1).unsqueeze(0)  # [1, E, S, 1]
+        return ttnn.from_torch(
+            routing_4d, device=self.device, dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._ep_mapper,
         )
+
+    def forward(self, hidden_states_tt, routing_tt=None):
+        """
+        hidden_states_tt: TTNN [1, 1, S, H] replicated.
+        routing_tt: optional precomputed [1, E_local, S, 1] — skips router if provided.
+        Caller must NOT deallocate hidden_states_tt — also needed for shared MLP.
+        Returns: TTNN [1, 1, S, H] replicated.
+        """
+        I       = self.intermediate_size
+        E       = self.num_experts
+        E_local = self.experts_per_device
+        S       = hidden_states_tt.shape[2]
+
+        # ── 1. ROUTER (CPU) ───────────────────────────────────────────────────
+        if routing_tt is None:
+            routing_tt = getattr(self, '_precomputed_routing', None)
+        self._precomputed_routing = None  # consume it
+        if routing_tt is None:
+            routing_tt = self.compute_routing_cpu(hidden_states_tt)
         # per device: routing_tt [1, E_local, S, 1]
 
         # ── 2. GATE+UP ────────────────────────────────────────────────────────
