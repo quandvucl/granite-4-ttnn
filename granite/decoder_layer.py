@@ -126,7 +126,9 @@ class TTGraniteDecoderLayer:
                     hf_mamba=hf_layer.mamba,
                     device=device,
                     dtype=dtype,
-                    tensor_parallel=tensor_parallel,
+                    # TP all_gather latency (2×36=72 per step) exceeds compute savings
+                    # for H=1536 (tiny). Keep tensor_parallel=False until model is larger.
+                    tensor_parallel=False,
                     chunk_size_override=mamba_chunk_size,
                     weight_dtype=mamba_weight_dtype,
                 )

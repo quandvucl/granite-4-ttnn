@@ -4,7 +4,8 @@ TTNN MoE for GraniteMoeHybrid — expert-parallel sharding across mesh columns.
 Single-row mesh (tiny, 1×4): shard experts across cols; all_gather(axis=1)+sum on device.
 Multi-row mesh (small, 2×4): flat EP across 8 devices; local sum then CPU reduce.
   Two-axis on-device reduce was tried but row-axis all_gather latency hurt prefill (-53%).
-Router runs on CPU (one linear layer, negligible cost).
+Decode router runs fully on-device (topk+softmax+embedding, no PCIe round-trip).
+Prefill router runs on CPU (PCIe cost amortized over S tokens).
 """
 
 import torch
@@ -45,6 +46,9 @@ class GraniteTTMoE:
         #   Two-axis on-device reduce tested but reverted: row-axis all_gather latency
         #   dominates for long sequences, hurting prefill (-53%) despite decode gains (+14%).
         self._use_col_parallel = (self._mesh_rows == 1) and self.num_devices > 1 and use_all_gather
+        # Multi-row decode: all_gather across rows (cluster_axis=0) for S=1 only.
+        # Prefill still uses CPU reduce (row all_gather latency dominates long sequences).
+        self._use_row_reduce = (self._mesh_rows > 1) and use_all_gather
 
         if self._use_col_parallel:
             effective_cols = self._mesh_cols
@@ -59,7 +63,9 @@ class GraniteTTMoE:
                 ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None
             )
         else:
-            # Multi-row: flat EP across all devices, CPU reduce.
+            # Multi-row: flat EP across all devices.
+            # Decode: on-device row all_gather + col all_gather (if use_row_reduce).
+            # Prefill: CPU reduce (PCIe cheaper than row all_gather for long S).
             effective_devices = self.num_devices
             while effective_devices > 1 and self.num_experts % effective_devices != 0:
                 effective_devices -= 1
@@ -83,6 +89,24 @@ class GraniteTTMoE:
             layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=replicate_mapper,
+        )
+        self._load_routing_matrices(replicate_mapper)
+
+    def _load_routing_matrices(self, replicate_mapper):
+        E = self.num_experts
+        eye = torch.eye(E, dtype=torch.bfloat16)
+        # Replicated [E, E] identity in ROW_MAJOR for embedding lookup (all devices need all rows)
+        self._routing_eye_tt = ttnn.from_torch(
+            eye, device=self.device, dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=replicate_mapper,
+        )
+        # Column-sharded [E, E_local] identity for routing projection: [1,E] @ [E,E_local] = [1,E_local]
+        # Using _ep_mapper ensures the col sharding matches the expert weight sharding.
+        self._routing_proj_tt = ttnn.from_torch(
+            eye, device=self.device, dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._ep_mapper,
         )
 
     def _load_weights(self):
@@ -136,6 +160,60 @@ class GraniteTTMoE:
             mesh_mapper=self._ep_mapper,
         )
 
+    def compute_routing_device(self, hidden_states_tt):
+        """
+        Fully on-device routing for decode (S=1). Returns [1, E_local, 1, 1] per device.
+        Uses topk + softmax + embedding-scatter to avoid PCIe round-trip.
+        """
+        E       = self.num_experts
+        E_local = self.experts_per_device
+        L1 = ttnn.L1_MEMORY_CONFIG
+
+        logits_tt = ttnn.linear(
+            hidden_states_tt, self.router_weight_tt,
+            dtype=ttnn.bfloat16, memory_config=L1,
+        )
+
+        vals_tt, idxs_tt = ttnn.topk(logits_tt, k=self.top_k, dim=3)
+        logits_tt.deallocate(True)
+
+        weights_tt = ttnn.softmax(vals_tt, dim=3, memory_config=L1)
+        vals_tt.deallocate(True)
+
+        idxs_u32 = ttnn.typecast(idxs_tt, ttnn.uint32)
+        idxs_tt.deallocate(True)
+
+        idxs_2d = ttnn.reshape(idxs_u32, [1, self.top_k])
+        idxs_u32.deallocate(True)
+
+        onehot_tt = ttnn.embedding(
+            idxs_2d, self._routing_eye_tt,
+            layout=ttnn.TILE_LAYOUT, memory_config=L1,
+        )
+        idxs_2d.deallocate(True)
+
+        weights_3d = ttnn.reshape(weights_tt, [1, self.top_k, 1])
+        weights_tt.deallocate(True)
+
+        scaled_tt = ttnn.mul(onehot_tt, weights_3d, memory_config=L1)
+        onehot_tt.deallocate(True)
+        weights_3d.deallocate(True)
+
+        scaled_4d = ttnn.reshape(scaled_tt, [1, 1, self.top_k, E])
+        scaled_tt.deallocate(True)
+        routing_4d = ttnn.sum(scaled_4d, dim=2, keepdim=True, memory_config=L1)
+        scaled_4d.deallocate(True)
+
+        routing_local = ttnn.linear(
+            routing_4d, self._routing_proj_tt,
+            dtype=ttnn.bfloat16, memory_config=L1,
+        )
+        routing_4d.deallocate(True)
+
+        routing_tt = ttnn.reshape(routing_local, [1, E_local, 1, 1])
+        routing_local.deallocate(True)
+        return routing_tt
+
     def forward(self, hidden_states_tt, routing_tt=None):
         """
         hidden_states_tt: TTNN [1, 1, S, H] replicated.
@@ -147,84 +225,90 @@ class GraniteTTMoE:
         E       = self.num_experts
         E_local = self.experts_per_device
         S       = hidden_states_tt.shape[2]
+        MC      = ttnn.DRAM_MEMORY_CONFIG
 
-        # ── 1. ROUTER (CPU) ───────────────────────────────────────────────────
+        # ── 1. ROUTER ─────────────────────────────────────────────────────────
         if routing_tt is None:
             routing_tt = getattr(self, '_precomputed_routing', None)
         self._precomputed_routing = None  # consume it
         if routing_tt is None:
-            routing_tt = self.compute_routing_cpu(hidden_states_tt)
+            if S == 1 and self._use_col_parallel:
+                # Decode with fabric: fully on-device routing avoids PCIe round-trip.
+                routing_tt = self.compute_routing_device(hidden_states_tt)
+            else:
+                # Prefill or no-fabric: CPU routing (PCIe cost amortized, or fabric unavailable).
+                routing_tt = self.compute_routing_cpu(hidden_states_tt)
         # per device: routing_tt [1, E_local, S, 1]
 
         # ── 2. GATE+UP ────────────────────────────────────────────────────────
         hidden_exp = ttnn.repeat(
             hidden_states_tt, ttnn.Shape([1, E_local, 1, 1]),
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=MC,
         )
         gate_up_out = ttnn.matmul(hidden_exp, self.gate_up_proj,
-                                  dtype=self.act_dtype,
-                                  memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                                  dtype=self.act_dtype, memory_config=MC)
         hidden_exp.deallocate(True)
-        # [1, E_local, S, 2I]
 
         # ── 3. ACTIVATION ────────────────────────────────────────────────────
         gate_tt = gate_up_out[:, :, :, :I]
         up_tt   = gate_up_out[:, :, :, I:]
         gate_up_out.deallocate(True)
 
-        activated_tt = ttnn.mul(ttnn.silu(gate_tt), up_tt,
-                                memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        activated_tt = ttnn.mul(ttnn.silu(gate_tt, memory_config=MC), up_tt, memory_config=MC)
         gate_tt.deallocate(True)
         up_tt.deallocate(True)
 
         # ── 4. DOWN PROJECTION ───────────────────────────────────────────────
         expert_out_tt = ttnn.matmul(activated_tt, self.down_proj,
-                                    dtype=self.act_dtype,
-                                    memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                                    dtype=self.act_dtype, memory_config=MC)
         activated_tt.deallocate(True)
 
         # ── 5. WEIGHT by routing ─────────────────────────────────────────────
-        weighted_tt = ttnn.mul(expert_out_tt, routing_tt,
-                               memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        weighted_tt = ttnn.mul(expert_out_tt, routing_tt, memory_config=MC)
         expert_out_tt.deallocate(True)
         routing_tt.deallocate(True)
 
-        # ── 6. Local sum on device, then all_gather + sum across columns ──────
-        # Sum [1, E_local, S, H] → [1, 1, S, H] per device.
-        local_sum_tt = ttnn.sum(
-            weighted_tt, dim=1, keepdim=True,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )  # [1, 1, S, H]
+        # ── 6. Local sum then all_gather + sum across columns ─────────────────
+        local_sum_tt = ttnn.sum(weighted_tt, dim=1, keepdim=True, memory_config=MC)
         weighted_tt.deallocate(True)
 
         if self._use_col_parallel and self.effective_cols > 1:
-            # Single-row mesh: all_gather across columns, then sum.
             gathered_tt = ttnn.all_gather(
-                local_sum_tt, dim=1, cluster_axis=1,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                local_sum_tt, dim=1, cluster_axis=1, memory_config=MC,
             )
             local_sum_tt.deallocate(True)
-            result_tt = ttnn.sum(
-                gathered_tt, dim=1, keepdim=True,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
+            result_tt = ttnn.sum(gathered_tt, dim=1, keepdim=True, memory_config=MC)
             gathered_tt.deallocate(True)
         elif not self._use_col_parallel and self.effective_cols > 1:
-            # Multi-row mesh: CPU reduce.
-            all_sums = ttnn.to_torch(
-                local_sum_tt,
-                mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0),
-            )
-            local_sum_tt.deallocate(True)
-            global_sum = all_sums.sum(dim=0, keepdim=True)
-            result_tt = ttnn.from_torch(
-                global_sum,
-                device=self.device,
-                dtype=self.act_dtype,
-                layout=ttnn.TILE_LAYOUT,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None,
-            )
+            if self._use_row_reduce and S == 1:
+                row_gathered = ttnn.all_gather(
+                    local_sum_tt, dim=1, cluster_axis=0, memory_config=MC,
+                )
+                local_sum_tt.deallocate(True)
+                col_sum_tt = ttnn.sum(row_gathered, dim=1, keepdim=True, memory_config=MC)
+                row_gathered.deallocate(True)
+                col_gathered = ttnn.all_gather(
+                    col_sum_tt, dim=1, cluster_axis=1, memory_config=MC,
+                )
+                col_sum_tt.deallocate(True)
+                result_tt = ttnn.sum(col_gathered, dim=1, keepdim=True, memory_config=MC)
+                col_gathered.deallocate(True)
+            else:
+                # Multi-row mesh prefill or no-fabric: CPU reduce.
+                all_sums = ttnn.to_torch(
+                    local_sum_tt,
+                    mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0),
+                )
+                local_sum_tt.deallocate(True)
+                global_sum = all_sums.sum(dim=0, keepdim=True)
+                result_tt = ttnn.from_torch(
+                    global_sum,
+                    device=self.device,
+                    dtype=self.act_dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None,
+                )
         else:
             result_tt = local_sum_tt
 

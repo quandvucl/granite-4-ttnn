@@ -196,6 +196,13 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             tok_s  = 1000.0 / avg_ms
 
             print(f"  Prefill: {actual_len*1000/prefill_ms:.1f} tok/s  |  Decode: {tok_s:.2f} tok/s")
+            t = getattr(tt_model, "last_layer_family_timing", None)
+            if t and t.get("seq_len") == 1:
+                total_ms = t["layer_total"] * 1000
+                print(f"    timing → attn={t['attention_total']*1000:.1f}ms  "
+                      f"mamba={t['mamba_decode_total']*1000:.1f}ms  "
+                      f"mlp={t['mlp_total']*1000:.1f}ms  "
+                      f"layers={total_ms:.1f}ms")
 
             results.append({
                 "prompt": prompt_label,

@@ -44,6 +44,38 @@ class ReplicatedMLP:
         return out
 
 
+class ColumnParallelMLP:
+    """Column-parallel gate+up (shard F across cols), row-parallel down (shard F across rows).
+
+    Each device holds gate/up: [H, F/N] and down: [F/N, H].
+    After the down projection each device has a partial sum [1,1,S,H].
+    all_gather(col-axis) + sum completes the all-reduce. Requires fabric.
+    """
+
+    def __init__(self, w1, w2, w3, num_cols, dtype):
+        self.w1 = w1
+        self.w3 = w3
+        self.w2 = w2
+        self.num_cols = num_cols
+        self.dtype = dtype
+
+    def forward(self, x, mode=None):
+        gate = ttnn.linear(x, self.w1, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        up   = ttnn.linear(x, self.w3, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        gate = ttnn.silu(gate, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        mid  = ttnn.mul(gate, up, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        gate.deallocate(True)
+        up.deallocate(True)
+        out = ttnn.linear(mid, self.w2, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        mid.deallocate(True)
+        if self.num_cols > 1:
+            gathered = ttnn.all_gather(out, dim=1, cluster_axis=1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            out.deallocate(True)
+            out = ttnn.sum(gathered, dim=1, keepdim=True, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            gathered.deallocate(True)
+        return out
+
+
 class TTGraniteMoeHybridForCausalLM:
     """
     Tenstorrent-accelerated Granite MoE Hybrid model for causal language modeling.
@@ -96,33 +128,24 @@ class TTGraniteMoeHybridForCausalLM:
         # Extract HF components
         self.embed_tokens = hf_model.model.embed_tokens
 
-        # Initialize production-ready LM Head from models/common/
         if verbose:
-            print("  Initializing LM head (LMHead1D)...")
+            print("  Initializing LM head...")
 
-        # Prepare LM head weights as LazyWeights
         lm_head_weight = hf_model.lm_head.weight.T.contiguous()  # [hidden, vocab]
         vocab_size = lm_head_weight.shape[1]
-        padded_vocab_size = ((vocab_size + 31) // 32) * 32  # Pad to multiple of 32
-
-        # Pad if needed
-        if vocab_size < padded_vocab_size:
-            padding = torch.zeros(
-                lm_head_weight.shape[0],
-                padded_vocab_size - vocab_size,
-                dtype=lm_head_weight.dtype
-            )
-            lm_head_weight = torch.cat([lm_head_weight, padding], dim=-1)
-
-        # Split into chunks for L1 fitting (simple approach: single weight for now)
-        lm_head_lazy = LazyWeight(
-            source=lm_head_weight,
-            device=device,
-            dtype=config.get_ttnn_dtype(),
-        )
-
-        self.lm_head = LMHead1D([lm_head_lazy])
         self.logits_scaling = config.logits_scaling
+
+        padded_vocab_size = ((vocab_size + 31) // 32) * 32
+        if vocab_size < padded_vocab_size:
+            lm_head_weight = torch.cat([
+                lm_head_weight,
+                torch.zeros(lm_head_weight.shape[0], padded_vocab_size - vocab_size,
+                            dtype=lm_head_weight.dtype)
+            ], dim=-1)
+        lm_head_lazy = LazyWeight(
+            source=lm_head_weight, device=device, dtype=config.get_ttnn_dtype(),
+        )
+        self.lm_head = LMHead1D([lm_head_lazy])
 
         if verbose:
             print("\n=== Initializing TTGraniteMoeHybridForCausalLM ===")
@@ -186,24 +209,65 @@ class TTGraniteMoeHybridForCausalLM:
             up_weight = input_linear_t[:, actual_intermediate_size:].contiguous()
             down_weight = output_linear_weight_hf.T.contiguous()
 
-            # Shared MLP: weights replicated on every device; each device computes
-            # the full output independently — no all_reduce needed.
-            use_tensor_parallel = is_mesh and device.get_num_devices() > 1 and self.moe_use_all_gather
+            use_tensor_parallel = False  # ColumnParallelMLP disabled — correctness issue under investigation
             dtype = config.get_ttnn_dtype()
 
-            def _upload_replicated(t):
-                return ttnn.from_torch(
-                    t, device=device, dtype=dtype,
-                    layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh else None,
-                )
+            if use_tensor_parallel:
+                mesh_shape = device.shape
+                num_cols = mesh_shape[1]
+                num_rows = mesh_shape[0]
+                # Column-parallel: shard gate/up on F-dim, down on F-dim (row-parallel).
+                # F must be divisible by num_cols — if not, fall back to replicated.
+                F = gate_weight.shape[1]
+                if F % num_cols == 0:
+                    col_mapper = ttnn.ShardTensor2dMesh(
+                        device, dims=(None, 1),
+                        mesh_shape=ttnn.MeshShape(num_rows, num_cols),
+                    )
+                    row_mapper = ttnn.ShardTensor2dMesh(
+                        device, dims=(None, 0),
+                        mesh_shape=ttnn.MeshShape(num_rows, num_cols),
+                    )
 
-            layer_mlp = ReplicatedMLP(
-                w1=_upload_replicated(gate_weight),
-                w2=_upload_replicated(down_weight),
-                w3=_upload_replicated(up_weight),
-                dtype=dtype,
-            )
+                    def _upload_col(t):
+                        return ttnn.from_torch(
+                            t, device=device, dtype=dtype,
+                            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                            mesh_mapper=col_mapper,
+                        )
+
+                    def _upload_row(t):
+                        # down: [F, H] — shard F-dim (dim 0) across mesh cols
+                        return ttnn.from_torch(
+                            t, device=device, dtype=dtype,
+                            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                            mesh_mapper=row_mapper,
+                        )
+
+                    layer_mlp = ColumnParallelMLP(
+                        w1=_upload_col(gate_weight),
+                        w2=_upload_row(down_weight),
+                        w3=_upload_col(up_weight),
+                        num_cols=num_cols,
+                        dtype=dtype,
+                    )
+                else:
+                    use_tensor_parallel = False  # fallthrough to replicated
+
+            if not use_tensor_parallel:
+                def _upload_replicated(t):
+                    return ttnn.from_torch(
+                        t, device=device, dtype=dtype,
+                        layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh else None,
+                    )
+
+                layer_mlp = ReplicatedMLP(
+                    w1=_upload_replicated(gate_weight),
+                    w2=_upload_replicated(down_weight),
+                    w3=_upload_replicated(up_weight),
+                    dtype=dtype,
+                )
 
             layer = TTGraniteDecoderLayer(
                 device=device,
@@ -230,33 +294,6 @@ class TTGraniteMoeHybridForCausalLM:
             if verbose and (layer_idx < 5 or layer_idx % 10 == 0):
                 layer_type = "Attention" if is_attention else "Mamba"
                 print(f"  Initialized layer {layer_idx} ({layer_type})")
-
-        # Stack all MoE router weights into one batched tensor for fast decode routing.
-        # Shape: [1, n_moe_layers, H, E] replicated — one matmul covers all layers.
-        self._batched_router_tt = None
-        self._moe_layer_indices = []  # indices into self.layers that have tt_moe
-        moe_router_weights = []
-        for i, layer in enumerate(self.layers):
-            if hasattr(layer, 'tt_moe') and layer.tt_moe is not None:
-                self._moe_layer_indices.append(i)
-                # router_weight_tt is [H, E] replicated — extract cpu copy
-                H = config.hidden_size
-                if is_mesh:
-                    w_cpu = ttnn.to_torch(
-                        layer.tt_moe.router_weight_tt,
-                        mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0)
-                    )[0:H].unsqueeze(0)  # [H, E] → [1, H, E]
-                else:
-                    w_cpu = layer.tt_moe.router_weight_tt.cpu().to_torch().unsqueeze(0)
-                moe_router_weights.append(w_cpu)
-        if moe_router_weights:
-            stacked = torch.stack(moe_router_weights, dim=1)  # [1, n_moe, H, E]
-            mapper = ttnn.ReplicateTensorToMesh(device) if is_mesh else None
-            self._batched_router_tt = ttnn.from_torch(
-                stacked, device=device, dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=mapper,
-            )
 
         # Initialize Mamba cache manager (Attention1D manages its own KV cache)
         self.cache_manager = MambaCacheManager(
@@ -368,39 +405,11 @@ class TTGraniteMoeHybridForCausalLM:
         if cache_position[0].item() > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
             mamba_mask = None
 
-        # ── Pre-compute all MoE routing in one batched pass (decode only) ──────
-        # One [1,n_moe,H,E] matmul + one to_torch replaces 40 separate router calls.
-        all_routing_tt = {}
-        if seq_len == 1 and self._batched_router_tt is not None and self._moe_layer_indices:
-            # [1,1,1,H] broadcast × [1,n_moe,H,E] → [1,n_moe,1,E]
-            h_rep = ttnn.repeat(hidden_tt, ttnn.Shape([1, len(self._moe_layer_indices), 1, 1]),
-                                memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            all_logits_tt = ttnn.matmul(h_rep, self._batched_router_tt,
-                                        dtype=ttnn.bfloat16,
-                                        memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            h_rep.deallocate(True)
-            if self.is_mesh:
-                all_logits_cpu = ttnn.to_torch(
-                    all_logits_tt,
-                    mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0)
-                )[0:1]  # [1, n_moe, 1, E]
-            else:
-                all_logits_cpu = all_logits_tt.cpu().to_torch()
-            all_logits_tt.deallocate(True)
-            # Compute per-layer routing on CPU and upload
-            for slot, layer_idx in enumerate(self._moe_layer_indices):
-                moe = self.layers[layer_idx].tt_moe
-                logits_SE = all_logits_cpu[0, slot, :1, :]  # [1, E]
-                all_routing_tt[layer_idx] = moe._routing_from_logits(logits_SE, S=1)
-
         # ── 40-layer loop — hidden_tt stays on device ────────────────
         attention_total = mamba_total = mamba_prefill_total = mamba_decode_total = 0.0
         mlp_total = layer_total = 0.0
 
         for layer_idx, layer in enumerate(self.layers):
-            # Hand precomputed routing to MoE layers so they skip their own router call.
-            if hasattr(layer, 'tt_moe') and layer.tt_moe is not None:
-                layer.tt_moe._precomputed_routing = all_routing_tt.get(layer_idx)
             layer_mask = mamba_mask if layer_idx not in self.config.attention_layer_indices else attention_mask
             hidden_tt = layer.forward(
                 hidden_tt,
@@ -455,6 +464,7 @@ class TTGraniteMoeHybridForCausalLM:
         while logits.dim() > 3:
             logits = logits[0]
 
+        # Trim padding from vocab dim if lm_head was padded
         return logits
 
     def _forward_chunked(self, input_ids, position_ids, attention_mask, use_cache, chunk_sz):
