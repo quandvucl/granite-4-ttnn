@@ -456,7 +456,9 @@ class TTGraniteMoeHybridForCausalLM:
         # ── TTNN → CPU (once) ────────────────────────────────────────
         # Logits: [1, 1, S, vocab] → [1, S, vocab]
         if self.is_mesh:
-            logits = ttnn.to_torch(logits_tt, mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0))[0:1]
+            # LMHead1D shards vocab across devices on dim=-1.
+            # Gather along dim=3 (vocab) to reconstruct full logits on device 0.
+            logits = ttnn.to_torch(logits_tt, mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=3))[0:1]
         else:
             logits = logits_tt.cpu().to_torch()
         logits_tt.deallocate(True)

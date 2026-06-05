@@ -290,9 +290,11 @@ class TensorParallelMamba:
             tail_tt.deallocate(True)
             tail_t = tail_cpu.transpose(1, 2)
             conv_state = torch.nn.functional.pad(tail_t, (kernel_size - 1 - tail_len, 0))
+            # Store as [0, xBC[-K+1], ..., xBC[-1]] so position K-1 = most recent,
+            # matching the seeding convention in _seed_state (_conv_pos=0, newest=col[K-1]).
             cache_params.conv_states[self.hf_mamba.layer_idx].copy_(
-                torch.cat([conv_state,
-                           torch.zeros(batch_size, conv_d, 1, dtype=conv_state.dtype)],
+                torch.cat([torch.zeros(batch_size, conv_d, 1, dtype=conv_state.dtype),
+                           conv_state],
                           dim=-1)[:, :, -(kernel_size):]
             )
 
@@ -610,11 +612,11 @@ class TensorParallelMamba:
         self._conv_cache_cols[self._conv_pos] = xBC_tt
         self._conv_pos = (self._conv_pos + 1) % K
 
-        # Weighted sum: w[0]*newest + w[1]*2nd-newest + ... + w[K-1]*oldest
-        # Newest is at (self._conv_pos - 1) % K, oldest at self._conv_pos.
+        # w[0]*oldest + w[1]*2nd-oldest + ... + w[K-1]*newest
+        # Oldest slot is at self._conv_pos (just written over is now newest = _conv_pos-1).
         out = None
         for k in range(K):
-            col_idx = (self._conv_pos - 1 - k) % K
+            col_idx = (self._conv_pos + k) % K
             term = ttnn.mul(self._conv_w_cols[k], self._conv_cache_cols[col_idx],
                             memory_config=ttnn.DRAM_MEMORY_CONFIG)
             if out is None:
