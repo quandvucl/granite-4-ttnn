@@ -19,6 +19,7 @@ from utils.device import (
 from mamba.config import Mamba2Config
 from mamba.device_manager import TTNNDeviceManager
 from mamba.ssm_utils import extract_ssm_parameters
+from kernel.ssm_update.op import ssm_update as _ssm_update_kernel
 
 class TensorParallelMamba:
 
@@ -85,7 +86,6 @@ class TensorParallelMamba:
             layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self.mesh_mapper,
         )
-
         kernel_size = self.hf_mamba.conv1d.weight.shape[2]
         conv_dim = self.hf_mamba.conv_dim
         # K separate [1,1,C,1] column tensors; _conv_pos is the next write slot.
@@ -663,7 +663,6 @@ class TensorParallelMamba:
         projected_tt.deallocate(True)
 
         xBC_tt = ttnn.reshape(xBC_tt, [1, 1, conv_dim, 1])
-        # _conv1d_decode_tt takes ownership of xBC_tt (stores it in cache cols).
         conv_out_tt = self._conv1d_decode_tt(xBC_tt)
 
         x_tt     = conv_out_tt[:, :, :inter, :]
@@ -698,8 +697,11 @@ class TensorParallelMamba:
         dBx_tt = ttnn.mul(dtx_tt, B_tt)
         dtx_tt.deallocate(True); B_tt.deallocate(True)
 
+        # SSM state update: h = dA*state + dBx,  y = sum_n(h * C)
+        # The fused Metal kernel (ssm_update) does this in one DRAM pass and will be
+        # used once Metal trace is unblocked (trace eliminates the per-call Python
+        # wrapper cost that currently makes the kernel slower than TTNN at decode).
         C_tt = ttnn.unsqueeze(C_tt, -2)   # [B, H, N] -> [B, H, 1, N]
-
         new_state = ttnn.addcmul(dBx_tt, dA_tt, self._ssm_state_tt,
                                  memory_config=ttnn.DRAM_MEMORY_CONFIG)
         dA_tt.deallocate(True); dBx_tt.deallocate(True)
@@ -708,9 +710,10 @@ class TensorParallelMamba:
 
         y_unred = ttnn.mul(new_state, C_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         C_tt.deallocate(True)
-
         y_tt = ttnn.sum(y_unred, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         y_unred.deallocate(True)
+
+        y_tt = ttnn.reshape(y_tt, [batch_size, H, D])
         y_tt = ttnn.addcmul(y_tt, self._ssm_D_tt, x_tt,
                             memory_config=ttnn.DRAM_MEMORY_CONFIG)
         x_tt.deallocate(True)

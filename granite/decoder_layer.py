@@ -156,7 +156,6 @@ class TTGraniteDecoderLayer:
 
         seq_len = len(cache_position) if cache_position is not None else hidden_states.shape[2]
         mode = Mode.DECODE if seq_len == 1 else Mode.PREFILL
-
         if not hasattr(cache_manager, "hybrid_cache"):
             raise RuntimeError("hybrid_cache must be initialized before decoder layer forward")
 
