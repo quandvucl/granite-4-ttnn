@@ -1,45 +1,45 @@
 {
   "model": "tiny",
-  "load_s": 102.21019434928894,
+  "load_s": 99.61586999893188,
   "num_devices": 4,
   "results": [
     {
       "prompt": "short_8",
       "tokens": 5,
-      "prefill_toks": 2.373850104664826,
-      "decode_toks": 8.37012148536779,
+      "prefill_toks": 2.521160221884489,
+      "decode_toks": 10.351298159162212,
       "prompt_text": "The capital of France is",
       "response": " Paris. The Eiffel Tower, a symbol of the city and one of its most recognizable landmarks.\n\n"
     },
     {
       "prompt": "short_10",
       "tokens": 8,
-      "prefill_toks": 10.57554972199906,
-      "decode_toks": 8.779767916981758,
+      "prefill_toks": 9.968320080140055,
+      "decode_toks": 10.292847813509391,
       "prompt_text": "The largest planet in our solar system is",
       "response": " Jupiter. It has a diameter of about 88,846 miles (142,984 kilometers), which makes"
     },
     {
       "prompt": "medium_32",
       "tokens": 25,
-      "prefill_toks": 27.065159456051664,
-      "decode_toks": 8.787287221227071,
+      "prefill_toks": 26.33467705377385,
+      "decode_toks": 10.466452473554666,
       "prompt_text": "Artificial intelligence is transforming many industries. Machine learning models can now perform tasks that previously required human expertise, such as image recognition",
       "response": " and language translation.\n\nHowever, the development of AI systems has been largely driven by large tech companies with significant"
     },
     {
       "prompt": "long_128",
       "tokens": 96,
-      "prefill_toks": 76.68218783892773,
-      "decode_toks": 8.886453305845302,
+      "prefill_toks": 83.21952626938484,
+      "decode_toks": 10.429610352149727,
       "prompt_text": "Large language models have become increasingly capable over recent years. These models are trained on vast amounts of text data and can generate coherent, contextually appropriate responses across a wide range of topics. They are used in applications ranging from customer service chatbots to code generation tools, scientific research assistants, and creative writing aids. The architecture underlying most of these models is the transformer, which uses self-attention mechanisms to capture long-range dependencies in text. Recent hybrid architectures combine transformers with state-space models",
       "response": " like LSTMs or Transformers-XL for improved performance.\n\nHowever, despite their impressive capabilities, large language"
     },
     {
       "prompt": "long_256",
       "tokens": 176,
-      "prefill_toks": 98.22970419345914,
-      "decode_toks": 8.79373344866782,
+      "prefill_toks": 102.40488659681692,
+      "decode_toks": 10.484435569095023,
       "prompt_text": "The field of natural language processing has undergone a remarkable transformation with the advent of large-scale pretrained language models. These systems, trained on hundreds of billions of tokens of text from the internet and other sources, have demonstrated surprising emergent capabilities including multi-step reasoning, in-context learning, and instruction following. The scaling laws governing these models suggest that performance on many tasks continues to improve predictably with increases in model size, dataset size, and compute budget. This has motivated the development of increasingly large models, from hundreds of millions to hundreds of billions of parameters. However, serving these models efficiently at inference time presents significant engineering challenges, particularly for applications requiring low latency responses. Speculative decoding, quantization, and hardware-specific optimizations are among the techniques used to address these challenges. Hybrid architectures that combine attention layers with state-space models like Mamba offer promising tradeoffs between computational efficiency and modeling capability",
       "response": ".\n\nHowever, despite their impressive abilities across various benchmarks, there remain concerns about safety issues such as hallucinations"
     }

@@ -1,11 +1,14 @@
 """
 TTNN MoE for GraniteMoeHybrid — expert-parallel sharding across mesh columns.
 
-Single-row mesh (tiny, 1×4): shard experts across cols; all_gather(axis=1)+sum on device.
+Single-row mesh (tiny, 1×4): shard experts across cols; all_gather_async(axis=1)+sum.
 Multi-row mesh (small, 2×4): flat EP across 8 devices; local sum then CPU reduce.
   Two-axis on-device reduce was tried but row-axis all_gather latency hurt prefill (-53%).
 Decode router runs fully on-device (topk+softmax+embedding, no PCIe round-trip).
 Prefill router runs on CPU (PCIe cost amortized over S tokens).
+Decode trace: all_gather_async with persistent_output_buffer=None; output allocated in
+  trace region so no host write during capture. Warmup step 1 compiles the program;
+  trace capture (step 2) gets a cache hit.
 """
 
 import torch
@@ -15,11 +18,12 @@ from utils.device import _is_mesh_device
 
 class GraniteTTMoE:
     def __init__(self, hf_moe, device, weight_dtype=ttnn.bfloat8_b, act_dtype=ttnn.bfloat16,
-                 use_all_gather=True):
+                 use_all_gather=True, tt_ccl=None):
         self.hf_moe = hf_moe
         self.device = device
         self.dtype = weight_dtype
         self.act_dtype = act_dtype
+        self.tt_ccl = tt_ccl
 
         self.is_mesh = _is_mesh_device(device)
         self.num_devices = device.get_num_devices() if self.is_mesh else 1
@@ -214,6 +218,24 @@ class GraniteTTMoE:
         routing_local.deallocate(True)
         return routing_tt
 
+    def _all_gather(self, x, dim, cluster_axis, memory_config):
+        if self.tt_ccl is not None:
+            return ttnn.experimental.all_gather_async(
+                x,
+                persistent_output_buffer=None,
+                dim=dim,
+                cluster_axis=cluster_axis,
+                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis),
+                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
+                num_links=self.tt_ccl.get_num_links(cluster_axis),
+                memory_config=memory_config,
+                topology=ttnn.Topology.Linear,
+                chunks_per_sync=10,
+                num_workers_per_link=2,
+                num_buffers_per_channel=2,
+            )
+        return ttnn.all_gather(x, dim=dim, cluster_axis=cluster_axis, memory_config=memory_config)
+
     def forward(self, hidden_states_tt, routing_tt=None):
         """
         hidden_states_tt: TTNN [1, 1, S, H] replicated.
@@ -273,23 +295,17 @@ class GraniteTTMoE:
         weighted_tt.deallocate(True)
 
         if self._use_col_parallel and self.effective_cols > 1:
-            gathered_tt = ttnn.all_gather(
-                local_sum_tt, dim=1, cluster_axis=1, memory_config=MC,
-            )
+            gathered_tt = self._all_gather(local_sum_tt, dim=1, cluster_axis=1, memory_config=MC)
             local_sum_tt.deallocate(True)
             result_tt = ttnn.sum(gathered_tt, dim=1, keepdim=True, memory_config=MC)
             gathered_tt.deallocate(True)
         elif not self._use_col_parallel and self.effective_cols > 1:
             if self._use_row_reduce and S == 1:
-                row_gathered = ttnn.all_gather(
-                    local_sum_tt, dim=1, cluster_axis=0, memory_config=MC,
-                )
+                row_gathered = self._all_gather(local_sum_tt, dim=1, cluster_axis=0, memory_config=MC)
                 local_sum_tt.deallocate(True)
                 col_sum_tt = ttnn.sum(row_gathered, dim=1, keepdim=True, memory_config=MC)
                 row_gathered.deallocate(True)
-                col_gathered = ttnn.all_gather(
-                    col_sum_tt, dim=1, cluster_axis=1, memory_config=MC,
-                )
+                col_gathered = self._all_gather(col_sum_tt, dim=1, cluster_axis=1, memory_config=MC)
                 col_sum_tt.deallocate(True)
                 result_tt = ttnn.sum(col_gathered, dim=1, keepdim=True, memory_config=MC)
                 col_gathered.deallocate(True)

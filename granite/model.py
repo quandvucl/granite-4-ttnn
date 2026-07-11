@@ -49,15 +49,16 @@ class ColumnParallelMLP:
 
     Each device holds gate/up: [H, F/N] and down: [F/N, H].
     After the down projection each device has a partial sum [1,1,S,H].
-    all_gather(col-axis) + sum completes the all-reduce. Requires fabric.
+    all_gather_async(col-axis) + sum completes the all-reduce. Requires fabric.
     """
 
-    def __init__(self, w1, w2, w3, num_cols, dtype):
+    def __init__(self, w1, w2, w3, num_cols, dtype, tt_ccl=None):
         self.w1 = w1
         self.w3 = w3
         self.w2 = w2
         self.num_cols = num_cols
         self.dtype = dtype
+        self.tt_ccl = tt_ccl
 
     def forward(self, x, mode=None):
         gate = ttnn.linear(x, self.w1, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
@@ -279,7 +280,7 @@ class TTGraniteMoeHybridForCausalLM:
                 hf_config=hf_model.config,
                 dtype=config.get_ttnn_dtype(),
                 tensor_parallel=use_tensor_parallel,
-                tt_ccl=self.tt_ccl if use_tensor_parallel else None,
+                tt_ccl=self.tt_ccl,
                 use_tt_attention=self.use_tt_attention,
                 use_tt_mamba=self.use_tt_mamba,
                 use_tt_moe=self.use_tt_moe,
@@ -301,6 +302,19 @@ class TTGraniteMoeHybridForCausalLM:
             batch_size=config.batch_size,
             attention_layer_indices=config.attention_layer_indices,
         )
+
+        # Decode trace state (captured explicitly via capture_decode_trace() after warmup)
+        self._decode_trace_id = None
+        self._decode_trace_input = None   # persistent DRAM: updated with embeddings before replay
+        self._decode_trace_output = None  # tensor in trace region: logits output
+        self._trace_zeros = None          # persistent DRAM zeros: addend for copy-via-add inside trace
+        self._in_trace = False            # True only during begin/end_trace_capture and execute_trace
+        if self.tt_ccl is not None: self.tt_ccl._in_trace = False
+
+        # Set sub-device stall group at init so all ops use the trace-compatible dispatch path.
+        _trace_supported_init = (self.tt_ccl is not None and self.is_mesh)
+        if _trace_supported_init:
+            self.device.set_sub_device_stall_group([ttnn.SubDeviceId(0)])
 
         # Release HF model CPU tensors — all weights are now on TT devices.
         # Keep only hf_config (already stored separately) for cache init.
@@ -373,12 +387,6 @@ class TTGraniteMoeHybridForCausalLM:
         # Shape [1, seq, H] → [1, 1, seq, H]
         hs4d = hidden_states_cpu.reshape(1, 1, seq_len, self.config.hidden_size)
         mapper = ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None
-        hidden_tt = ttnn.from_torch(
-            hs4d, device=self.device, dtype=self.config.get_ttnn_dtype(),
-            layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=mapper,
-        )
 
         # ── Shared position metadata (CPU, cheap) ───────────────────
         position_embeddings = None  # Granite 4H uses NoPE — no RoPE needed
@@ -405,9 +413,53 @@ class TTGraniteMoeHybridForCausalLM:
         if cache_position[0].item() > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
             mamba_mask = None
 
+        is_decode = (seq_len == 1)
+        start_pos = position_ids[0, 0].item()
+
+        # ── Update attention position buffers outside any trace ───────
+        if is_decode:
+            for layer in self.layers:
+                if layer.is_attention_layer and layer.simple_attention is not None:
+                    layer.simple_attention.update_decode_pos(start_pos)
+
+        # ── Decode trace replay (fast path) ─────────────────────────
+        _trace_supported = (self.tt_ccl is not None and self.moe_use_all_gather
+                            and not getattr(self, '_disable_trace', False))
+        _TRACE_DEBUG = getattr(self, '_trace_debug', False)
+        if is_decode and not _state_only and _trace_supported and self._decode_trace_id is not None:
+            new_input = ttnn.from_torch(
+                hs4d, device=self.device, dtype=self.config.get_ttnn_dtype(),
+                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=mapper,
+            )
+            ttnn.assign(new_input, self._decode_trace_input)
+            new_input.deallocate(True)
+            # Sync so copy_host_to_device_tensor (_cur_pos_tt) is flushed before replay.
+            ttnn.synchronize_device(self.device)
+            self._in_trace = True
+            if self.tt_ccl is not None: self.tt_ccl._in_trace = True
+            ttnn.execute_trace(self.device, self._decode_trace_id, cq_id=0, blocking=False)
+            ttnn.synchronize_device(self.device)
+            self._in_trace = False
+            if self.tt_ccl is not None: self.tt_ccl._in_trace = False
+            trace_logits = self._extract_logits(self._decode_trace_output)
+            if _TRACE_DEBUG:
+                import sys
+                print(f"[TRACE] top5: {trace_logits[0, -1].float().topk(5).indices.tolist()}", file=sys.stderr, flush=True)
+            if use_cache:
+                self.cache_manager.increment_position(seq_len)
+            return trace_logits
+
         # ── 40-layer loop — hidden_tt stays on device ────────────────
         attention_total = mamba_total = mamba_prefill_total = mamba_decode_total = 0.0
         mlp_total = layer_total = 0.0
+
+        hidden_tt = ttnn.from_torch(
+            hs4d, device=self.device, dtype=self.config.get_ttnn_dtype(),
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=mapper,
+        )
 
         for layer_idx, layer in enumerate(self.layers):
             layer_mask = mamba_mask if layer_idx not in self.config.attention_layer_indices else attention_mask
@@ -454,6 +506,100 @@ class TTGraniteMoeHybridForCausalLM:
             logits_tt = ttnn.multiply(logits_tt, 1.0 / self.logits_scaling)
 
         # ── TTNN → CPU (once) ────────────────────────────────────────
+        result = self._extract_logits(logits_tt)
+        if _TRACE_DEBUG and is_decode:
+            import sys
+            print(f"[NOTRACE] top5: {result[0, -1].float().topk(5).indices.tolist()}", file=sys.stderr, flush=True)
+        return result
+
+    def capture_decode_trace(self):
+        """Capture the decode trace using a dummy token at the current position.
+
+        Must be called after prefill + at least one non-trace decode step (to warm up
+        all lazy weight uploads and compile kernels). The trace captures the 40-layer
+        decode forward; subsequent forward() calls with seq_len==1 will replay it.
+
+        Trace capture runs in bypass mode (ops recorded but not dispatched to device),
+        so this does NOT advance KV cache or SSM state. The current position is NOT
+        incremented. Call this once after warmup; forward() will auto-replay.
+        """
+        _trace_supported = (self.tt_ccl is not None and self.moe_use_all_gather
+                            and not getattr(self, '_disable_trace', False))
+        if not _trace_supported or self._decode_trace_id is not None:
+            return
+
+        start_pos = self.cache_manager.get_position()
+        mapper = ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None
+
+        # Use current position for attention position tensors during capture
+        for layer in self.layers:
+            if layer.is_attention_layer and layer.simple_attention is not None:
+                layer.simple_attention.update_decode_pos(start_pos)
+
+        # Flush pending writes before capture
+        ttnn.synchronize_device(self.device)
+
+        # Dummy embedding (zeros — capture only records ops, doesn't affect device state)
+        dummy_hs = torch.zeros(1, 1, 1, self.config.hidden_size, dtype=torch.bfloat16)
+
+        self._decode_trace_input = ttnn.from_torch(
+            dummy_hs, device=self.device, dtype=self.config.get_ttnn_dtype(),
+            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=mapper,
+        )
+        self._trace_zeros = ttnn.from_torch(
+            torch.zeros(1, 1, 1, self.config.hidden_size, dtype=torch.bfloat16),
+            device=self.device, dtype=self.config.get_ttnn_dtype(),
+            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=mapper,
+        )
+
+        self._in_trace = True
+        if self.tt_ccl is not None: self.tt_ccl._in_trace = True
+        _trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
+
+        hidden_tt = ttnn.add(self._decode_trace_input, self._trace_zeros,
+                             memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+        position_ids = torch.tensor([[start_pos]], dtype=torch.long)
+        cache_position = torch.arange(start_pos, start_pos + 1)
+        has_previous_state = start_pos > 0
+
+        if not hasattr(self.cache_manager, "hybrid_cache"):
+            from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
+                HybridMambaAttentionDynamicCache,
+            )
+            self.cache_manager.hybrid_cache = HybridMambaAttentionDynamicCache(
+                config=self.hf_config, batch_size=1,
+                dtype=torch.bfloat16, device=torch.device("cpu"),
+            )
+        self.cache_manager.hybrid_cache.has_previous_state = has_previous_state
+
+        for layer_idx, layer in enumerate(self.layers):
+            hidden_tt = layer.forward(
+                hidden_tt, self.cache_manager, position_ids,
+                attention_mask=None,
+                position_embeddings=None,
+                cache_position=cache_position,
+                has_previous_state=has_previous_state,
+            )
+
+        mode = Mode.DECODE
+        hidden_tt = self.norm.forward(hidden_tt, mode=mode)
+        logits_tt = self.lm_head.forward(hidden_tt)
+        hidden_tt.deallocate(True)
+
+        if self.logits_scaling != 1.0:
+            logits_tt = ttnn.multiply(logits_tt, 1.0 / self.logits_scaling)
+
+        self._decode_trace_output = logits_tt
+        ttnn.end_trace_capture(self.device, _trace_id, cq_id=0)
+        self._decode_trace_id = _trace_id
+        self._in_trace = False
+        if self.tt_ccl is not None: self.tt_ccl._in_trace = False
+
+    def _extract_logits(self, logits_tt):
+        """Convert TTNN logits tensor to CPU torch tensor."""
         # Logits: [1, 1, S, vocab] → [1, S, vocab]
         if self.is_mesh:
             # LMHead1D shards vocab across devices on dim=-1.
@@ -461,7 +607,8 @@ class TTGraniteMoeHybridForCausalLM:
             logits = ttnn.to_torch(logits_tt, mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=3))[0:1]
         else:
             logits = logits_tt.cpu().to_torch()
-        logits_tt.deallocate(True)
+        if logits_tt is not self._decode_trace_output:
+            logits_tt.deallocate(True)
         # Collapse any extra leading dims to [batch, seq, vocab]
         while logits.dim() > 3:
             logits = logits[0]
@@ -517,6 +664,16 @@ class TTGraniteMoeHybridForCausalLM:
         for layer in self.layers:
             if hasattr(layer, 'reset_cache'):
                 layer.reset_cache()
+
+        # Release decode trace — caller must call capture_decode_trace() again after warmup.
+        if self._decode_trace_id is not None:
+            ttnn.release_trace(self.device, self._decode_trace_id)
+            self._decode_trace_id = None
+            self._decode_trace_input = None
+            self._decode_trace_output = None
+            self._trace_zeros = None
+        self._in_trace = False
+        if self.tt_ccl is not None: self.tt_ccl._in_trace = False
 
     def reset_reduction_stats(self):
         """Reset MLP reduction counters across all layers."""

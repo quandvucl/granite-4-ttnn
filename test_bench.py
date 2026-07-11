@@ -168,7 +168,8 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             context_ids = input_ids[0].tolist()
             next_id = pick_next(logits, context_ids)
 
-            # Decode loop
+            # Decode loop — steps 1-2 are warmup (compile + kernel upload),
+            # then capture trace; steps 3+ replay trace at full speed.
             decode_times = []
             generated_ids = [next_id]
             next_tensor = torch.zeros((1, 1), dtype=input_ids.dtype)
@@ -181,8 +182,12 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
                 decode_times.append(step_ms)
 
                 next_id = pick_next(logits, context_ids + generated_ids)
-
                 generated_ids.append(next_id)
+
+                # After 2 warmup steps, capture trace for subsequent steps
+                if step == 1:
+                    tt_model.capture_decode_trace()
+
                 if next_id == tokenizer.eos_token_id:
                     break
 
@@ -190,8 +195,8 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             print(f"  Prompt   : {prompt_text}")
             print(f"  Response : {response}")
 
-            # Stats — skip warmup (first decode step)
-            steady = decode_times[1:] if len(decode_times) > 1 else decode_times
+            # Stats — skip steps 1-2 (warmup) and step 3 (first trace replay, slower due to alloc)
+            steady = decode_times[3:] if len(decode_times) > 3 else decode_times
             avg_ms = sum(steady) / len(steady)
             tok_s  = 1000.0 / avg_ms
 
@@ -251,7 +256,7 @@ def main():
     if use_fabric:
         try:
             ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
-            full_mesh = ttnn.open_mesh_device(mesh_shape=GALAXY_SHAPE)
+            full_mesh = ttnn.open_mesh_device(mesh_shape=GALAXY_SHAPE, trace_region_size=268435456)
             fabric_ok = True
             print("[info] fabric enabled")
         except Exception as e:

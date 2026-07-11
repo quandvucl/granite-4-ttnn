@@ -94,7 +94,7 @@ class TTGraniteDecoderLayer:
         if use_tt_moe and hasattr(hf_layer, "block_sparse_moe"):
             self.tt_moe = GraniteTTMoE(hf_layer.block_sparse_moe, device,
                                        weight_dtype=moe_weight_dtype, act_dtype=dtype,
-                                       use_all_gather=moe_use_all_gather)
+                                       use_all_gather=moe_use_all_gather, tt_ccl=tt_ccl)
         else:
             self.tt_moe = None
 
@@ -131,6 +131,7 @@ class TTGraniteDecoderLayer:
                     tensor_parallel=False,
                     chunk_size_override=mamba_chunk_size,
                     weight_dtype=mamba_weight_dtype,
+                    tt_ccl=tt_ccl,
                 )
             else:
                 self.mamba = None
@@ -277,22 +278,12 @@ class TTGraniteDecoderLayer:
     def reset_cache(self):
         if self.is_attention_layer and self.simple_attention is not None:
             attn = self.simple_attention
-            mesh_mapper = attn._mesh_mapper
-            k_shape = list(attn.cache_k.shape)
-            v_shape = list(attn.cache_v.shape)
-            attn.cache_k.deallocate(True)
-            attn.cache_v.deallocate(True)
-            attn.cache_k = ttnn.from_torch(
-                torch.zeros(k_shape, dtype=torch.bfloat16),
-                device=self.device, dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=mesh_mapper,
-            )
-            attn.cache_v = ttnn.from_torch(
-                torch.zeros(v_shape, dtype=torch.bfloat16),
-                device=self.device, dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=mesh_mapper,
-            )
+            # In-place zero so device addresses stay fixed (trace bakes in addresses).
+            zeros_k = ttnn.zeros_like(attn.cache_k)
+            ttnn.assign(zeros_k, attn.cache_k)
+            zeros_k.deallocate(True)
+            zeros_v = ttnn.zeros_like(attn.cache_v)
+            ttnn.assign(zeros_v, attn.cache_v)
+            zeros_v.deallocate(True)
         elif self.mamba is not None:
             self.mamba.reset_state()

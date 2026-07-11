@@ -36,12 +36,9 @@ import torch
 import ttnn
 from transformers import AutoTokenizer
 
-print("Opening mesh (no fabric)...", flush=True)
-try:
-    ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
-except Exception:
-    pass
-full_mesh = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(8, 4))
+print("Opening mesh with fabric...", flush=True)
+ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+full_mesh = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(8, 4), trace_region_size=268435456)
 print("  mesh ok", flush=True)
 
 device = full_mesh.create_submeshes(ttnn.MeshShape(1, 4))[0]
@@ -58,7 +55,7 @@ tt_model = TTGraniteMoeHybridForCausalLM.from_pretrained(
     mamba_chunk_size=256,
     max_cache_length=512,
     moe_weight_dtype=ttnn.bfloat8_b,
-    moe_use_all_gather=False,  # disable fabric all_gather to test NOC conflict hypothesis
+    moe_use_all_gather=True,
 )
 print("Model loaded.", flush=True)
 
@@ -100,18 +97,31 @@ else:
     next_id2 = logits2[0, -1, :].float().argmax().item()
 next_tensor[0, 0] = next_id2
 
-print("Decode step 2...", flush=True)
-_watchdog_deadline[0] = time.time() + 120  # kernels compiled, 120s is ample
+print("Decode step 2 (trace capture)...", flush=True)
+_watchdog_deadline[0] = time.time() + 120
 logits3 = tt_model.forward(next_tensor)
 ttnn.synchronize_device(device)
-print("Decode step 2 done — PASS", flush=True)
+print("Decode step 2 done.", flush=True)
+_watchdog_deadline[0] = time.time() + 120
+
+if isinstance(logits3, ttnn.Tensor):
+    last3 = logits3[0, 0, -1, :]
+    if last3.dtype == ttnn.bfloat8_b:
+        last3 = ttnn.typecast(last3, ttnn.bfloat16)
+    next_id3 = to_torch_tensor(last3).float().argmax().item()
+else:
+    next_id3 = logits3[0, -1, :].float().argmax().item()
+next_tensor[0, 0] = next_id3
+
+print("Decode step 3 (trace replay)...", flush=True)
+_watchdog_deadline[0] = time.time() + 120
+logits4 = tt_model.forward(next_tensor)
+ttnn.synchronize_device(device)
+print("Decode step 3 done — PASS", flush=True)
 _watchdog_deadline[0] = time.time() + 600
 
 ttnn.close_mesh_device(device)
 for sm in full_mesh.get_submeshes():
     ttnn.close_mesh_device(sm)
 ttnn.close_mesh_device(full_mesh)
-try:
-    ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
-except Exception:
-    pass
+ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)

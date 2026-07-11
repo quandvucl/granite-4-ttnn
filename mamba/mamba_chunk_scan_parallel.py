@@ -31,6 +31,7 @@ class TensorParallelMamba:
         tensor_parallel=True,
         chunk_size_override=None,
         weight_dtype=None,
+        tt_ccl=None,
     ):
         self.hf_mamba = hf_mamba
         self.device = device
@@ -38,6 +39,7 @@ class TensorParallelMamba:
         self.weight_dtype = weight_dtype if weight_dtype is not None else dtype
         self.tensor_parallel = tensor_parallel
         self.layer_idx = hf_mamba.layer_idx
+        self.tt_ccl = tt_ccl
 
         self.is_mesh = _is_mesh_device(device)
         self.num_devices = device.get_num_devices() if self.is_mesh else 1
@@ -236,6 +238,9 @@ class TensorParallelMamba:
             self.device, ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
         )
 
+    def _all_gather(self, x, dim, cluster_axis, memory_config):
+        return ttnn.all_gather(x, dim=dim, cluster_axis=cluster_axis, memory_config=memory_config)
+
     def forward_prefill_chunk_scan(self, hidden_states, cache_params=None, real_seq_len=None):
         replicate_mapper = self.mesh_mapper
         inter   = self.hf_mamba.intermediate_size
@@ -259,10 +264,8 @@ class TensorParallelMamba:
         if _owns_hidden_tt:
             hidden_tt.deallocate(True)
         if self._use_col_parallel:
-            projected_tt = ttnn.all_gather(
-                projected_tt, dim=3, cluster_axis=1,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
+            projected_tt = self._all_gather(projected_tt, dim=3, cluster_axis=1,
+                                            memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
         padded_s = projected_tt.shape[2]
         if padded_s != seq_len:
@@ -358,10 +361,8 @@ class TensorParallelMamba:
         output_tt = ttnn.matmul(gated_tt, self.out_proj_weight_tt)
         gated_tt.deallocate(True)
         if self._use_col_parallel:
-            output_tt = ttnn.all_gather(
-                output_tt, dim=3, cluster_axis=1,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
+            output_tt = self._all_gather(output_tt, dim=3, cluster_axis=1,
+                                         memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
         output_tt = ttnn.reshape(output_tt, [1, 1, seq_len, self.hidden_size])
         return output_tt
@@ -573,19 +574,17 @@ class TensorParallelMamba:
             conv_state = cache_params.conv_states[self.layer_idx]
             K = conv_state.shape[-1]
             C = self.hf_mamba.conv_dim
-            for col in self._conv_cache_cols:
-                col.deallocate(True)
-            # conv_state is [1, C, K] — col k is the k-th time step (0=oldest)
-            self._conv_cache_cols = [
-                ttnn.from_torch(
+            # conv_state is [1, C, K] — k=0 oldest, k=K-1 newest.
+            # Shift-register convention: _conv_cache_cols[0]=oldest, [K-1]=newest.
+            for k in range(K):
+                new_col = ttnn.from_torch(
                     conv_state[0, :, k].reshape(1, 1, C, 1).to(torch.bfloat16),
                     device=self.device, dtype=ttnn.bfloat16,
                     layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     mesh_mapper=self.mesh_mapper,
                 )
-                for k in range(K)
-            ]
-            # Next write replaces oldest (col 0), so pos = 0 after loading.
+                ttnn.assign(new_col, self._conv_cache_cols[k])
+                new_col.deallocate(True)
             self._conv_pos = 0
             pad = conv_state[:, :, :K - 1].to(torch.bfloat16).reshape(1, 1, C, K - 1)
             new_pad_tt = ttnn.from_torch(
@@ -594,30 +593,44 @@ class TensorParallelMamba:
                 layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=self.mesh_mapper,
             )
-            self._prefill_conv_pad_tt.deallocate(True)
-            self._prefill_conv_pad_tt = new_pad_tt
+            ttnn.assign(new_pad_tt, self._prefill_conv_pad_tt)
+            new_pad_tt.deallocate(True)
 
     def reset_state(self):
-        """Zero SSM state and conv cache between sequences."""
-        self._ssm_state_tt = ttnn.zeros_like(self._ssm_state_tt)
-        self._conv_cache_cols = [ttnn.zeros_like(col) for col in self._conv_cache_cols]
+        """Zero SSM state and conv cache between sequences (trace-safe: in-place zeros)."""
+        zero_state = ttnn.zeros_like(self._ssm_state_tt)
+        ttnn.assign(zero_state, self._ssm_state_tt)
+        zero_state.deallocate(True)
+        for col in self._conv_cache_cols:
+            z = ttnn.zeros_like(col)
+            ttnn.assign(z, col)
+            z.deallocate(True)
         self._conv_pos = 0
-        self._prefill_conv_pad_tt = ttnn.zeros_like(self._prefill_conv_pad_tt)
+        zero_pad = ttnn.zeros_like(self._prefill_conv_pad_tt)
+        ttnn.assign(zero_pad, self._prefill_conv_pad_tt)
+        zero_pad.deallocate(True)
 
     def _conv1d_decode_tt(self, xBC_tt):
-        """xBC_tt: [1,1,C,1]. Updates conv cache cols in-place. Returns [1,1,C,1]."""
-        K = len(self._conv_cache_cols)
-        # Write new input into the oldest slot and advance the write pointer.
-        self._conv_cache_cols[self._conv_pos].deallocate(True)
-        self._conv_cache_cols[self._conv_pos] = xBC_tt
-        self._conv_pos = (self._conv_pos + 1) % K
+        """xBC_tt: [1,1,C,1]. Updates conv cache cols in-place. Returns [1,1,C,1].
 
-        # w[0]*oldest + w[1]*2nd-oldest + ... + w[K-1]*newest
-        # Oldest slot is at self._conv_pos (just written over is now newest = _conv_pos-1).
+        Trace-safe shift-register: col[0]=oldest, col[K-1]=newest.
+        Each step: shift left (col[i] ← col[i+1]) then assign col[K-1] ← new input.
+        The convolution is always col[k]*w_cols[k]: both indexed oldest→newest.
+        Buffer addresses are fixed; no dynamic indexing so this is trace-replay safe.
+        """
+        K = len(self._conv_cache_cols)
+        # Shift left: drop oldest at col[0], shift col[i] ← col[i+1]
+        for i in range(K - 1):
+            ttnn.assign(self._conv_cache_cols[i + 1], self._conv_cache_cols[i])
+        # Insert new input at col[K-1] (newest)
+        ttnn.assign(xBC_tt, self._conv_cache_cols[K - 1])
+        xBC_tt.deallocate(True)
+
+        # col[0]=oldest, col[K-1]=newest; w_cols[k] = conv_w[:,k] = lag-k weight
+        # (w_cols[0] is oldest-lag, w_cols[K-1] is newest-lag → paired correctly)
         out = None
         for k in range(K):
-            col_idx = (self._conv_pos + k) % K
-            term = ttnn.mul(self._conv_w_cols[k], self._conv_cache_cols[col_idx],
+            term = ttnn.mul(self._conv_w_cols[k], self._conv_cache_cols[k],
                             memory_config=ttnn.DRAM_MEMORY_CONFIG)
             if out is None:
                 out = term
@@ -653,10 +666,8 @@ class TensorParallelMamba:
             dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         if self._use_col_parallel:
-            projected_tt = ttnn.all_gather(
-                projected_tt, dim=3, cluster_axis=1,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
+            projected_tt = self._all_gather(projected_tt, dim=3, cluster_axis=1,
+                                            memory_config=ttnn.DRAM_MEMORY_CONFIG)
         gate_tt = projected_tt[:, :, :, :inter]
         xBC_tt  = projected_tt[:, :, :, inter:inter + conv_dim]
         dt_tt   = projected_tt[:, :, :, inter + conv_dim:]
@@ -698,17 +709,15 @@ class TensorParallelMamba:
         dtx_tt.deallocate(True); B_tt.deallocate(True)
 
         # SSM state update: h = dA*state + dBx,  y = sum_n(h * C)
-        # The fused Metal kernel (ssm_update) does this in one DRAM pass and will be
-        # used once Metal trace is unblocked (trace eliminates the per-call Python
-        # wrapper cost that currently makes the kernel slower than TTNN at decode).
+        # Trace-safe: assign new state into the fixed-address buffer (no dealloc+reallocate).
         C_tt = ttnn.unsqueeze(C_tt, -2)   # [B, H, N] -> [B, H, 1, N]
         new_state = ttnn.addcmul(dBx_tt, dA_tt, self._ssm_state_tt,
                                  memory_config=ttnn.DRAM_MEMORY_CONFIG)
         dA_tt.deallocate(True); dBx_tt.deallocate(True)
-        self._ssm_state_tt.deallocate(True)
-        self._ssm_state_tt = new_state
+        ttnn.assign(new_state, self._ssm_state_tt)
+        new_state.deallocate(True)
 
-        y_unred = ttnn.mul(new_state, C_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        y_unred = ttnn.mul(self._ssm_state_tt, C_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         C_tt.deallocate(True)
         y_tt = ttnn.sum(y_unred, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         y_unred.deallocate(True)
@@ -733,8 +742,6 @@ class TensorParallelMamba:
         )
         scan_tt.deallocate(True)
         if self._use_col_parallel:
-            output_tt = ttnn.all_gather(
-                output_tt, dim=3, cluster_axis=1,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
+            output_tt = self._all_gather(output_tt, dim=3, cluster_axis=1,
+                                         memory_config=ttnn.DRAM_MEMORY_CONFIG)
         return output_tt

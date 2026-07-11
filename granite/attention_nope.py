@@ -67,6 +67,21 @@ class AttentionNoPE:
         self._mesh_mapper = mesh_mapper
         self._is_mesh = is_mesh
 
+        # Pre-allocated position tensor for trace-safe decode (avoids new alloc each step).
+        self._cur_pos_tt = ttnn.from_torch(
+            torch.zeros(1, dtype=torch.int32), device=device,
+            layout=ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=mesh_mapper,
+        )
+
+    def update_decode_pos(self, pos: int):
+        """Update the pre-allocated position tensor. Must be called OUTSIDE any trace."""
+        host_tt = ttnn.from_torch(
+            torch.tensor([pos], dtype=torch.int32),
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+        )
+        ttnn.copy_host_to_device_tensor(host_tt, self._cur_pos_tt)
+
     def forward(
         self,
         hidden_states,
@@ -116,27 +131,20 @@ class AttentionNoPE:
         # KV Cache Update
         keys, values = self.cache_k, self.cache_v
 
-        def _idx_tensor(val):
-            return ttnn.from_torch(
-                torch.tensor([val], dtype=torch.int32),
-                device=self.device, layout=ttnn.ROW_MAJOR_LAYOUT,
-                mesh_mapper=self._mesh_mapper,
-            )
-
         if is_decode:
-            cur_pos_tt = _idx_tensor(start_pos)
-            ttnn.experimental.paged_update_cache(keys, k_heads, update_idxs_tensor=cur_pos_tt, batch_offset=0)
-            ttnn.experimental.paged_update_cache(values, v_heads, update_idxs_tensor=cur_pos_tt, batch_offset=0)
+            # _cur_pos_tt must be updated by caller (update_decode_pos) before this
+            # forward call so that copy_host_to_device_tensor runs outside any trace.
+            ttnn.experimental.paged_update_cache(keys, k_heads, update_idxs_tensor=self._cur_pos_tt, batch_offset=0)
+            ttnn.experimental.paged_update_cache(values, v_heads, update_idxs_tensor=self._cur_pos_tt, batch_offset=0)
             ttnn.deallocate(k_heads)
             ttnn.deallocate(v_heads)
 
             attn_output = ttnn.transformer.scaled_dot_product_attention_decode(
                 q_heads, keys, values,
-                cur_pos_tensor=cur_pos_tt,
+                cur_pos_tensor=self._cur_pos_tt,
                 scale=self.scale,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
-            cur_pos_tt.deallocate(True)
             ttnn.deallocate(q_heads)
 
             attn_output = ttnn.transpose(attn_output, 1, 2)

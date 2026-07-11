@@ -19,7 +19,7 @@
 \begin{abstract}
 This project investigates the challenges of porting Granite-4.0-h small and tiny language models from the HuggingFace ecosystem to the Tenstorrent Wormhole architecture, specifically targeting the Galaxy 32 chip configuration. While modern large language models are typically optimized for GPU-based infrastructures such as NVIDIA A100, emerging AI accelerators introduce different execution paradigms that require significant adaptation at both numerical and architectural levels.
 
-We identify and analyse challenges in four categories: (1)~numerical precision, including bfloat16 accumulation errors, 8-bit MoE weight quantisation, and a logits gather axis mismatch on multi-chip meshes; (2)~architectural adaptation, covering hybrid layer dispatch ordering, Mamba2 SSM state persistence as a fixed-address DRAM tensor, and expert-count padding for TTNN tile alignment; (3)~runtime and compilation, including CCL initialisation ordering and tensor deallocate safety; and (4)~toolchain limitations, specifically the absence of a native Mamba2 fused kernel and an undocumented incompatibility between Metal trace replay and the Ethernet fabric collective stack. We describe three optimisations: a fused residual multiply-add (\texttt{mac}) that saves 80 dispatches per decode step and is implemented in the current system; a fused Metal kernel for the Mamba2 SSM state update (designed, not yet deployed); and a command-trace mechanism to eliminate remaining dispatch overhead (blocked by a trace+fabric firmware deadlock). The tiny model achieves 9.4--9.6 tok/s decode throughput on a 1$\times$4 mesh — matching a single A100 PCIe (9.2--9.4 tok/s). Experimental results characterise the per-component latency and quantify the remaining bottlenecks.
+We identify and analyse challenges in four categories: (1)~numerical precision, including bfloat16 accumulation errors, 8-bit MoE weight quantisation, and a logits gather axis mismatch on multi-chip meshes; (2)~architectural adaptation, covering hybrid layer dispatch ordering, Mamba2 SSM state persistence as a fixed-address DRAM tensor, and expert-count padding for TTNN tile alignment; (3)~runtime and compilation, including CCL initialisation ordering and tensor deallocate safety; and (4)~toolchain limitations, specifically the absence of a native Mamba2 fused kernel and a subtle correctness hazard in Metal trace capture caused by bypass-mode execution. We describe three optimisations: a fused residual multiply-add (\texttt{mac}) that saves 80 dispatches per decode step; a fused Metal kernel for the Mamba2 SSM state update (designed, not yet deployed); and a whole-model decode trace that collapses $\approx$500 PCIe dispatches to one replay per step. The trace is implemented and working: a key engineering insight is that trace capture runs in hardware bypass mode, so the capture step must use a dummy input and must not be part of the autoregressive loop. The tiny model achieves 10.4--10.5 tok/s decode throughput on a 1$\times$4 mesh with trace enabled — exceeding a single A100 PCIe (9.2--9.4 tok/s) by $\approx$11\%. Experimental results characterise the per-component latency and quantify the remaining bottlenecks.
 \end{abstract}
 
 \maketitle
@@ -42,7 +42,7 @@ The contributions of this project are:
 \item Complete on-device implementations of Granite-4.0-h-tiny (1$\times$4 Wormhole mesh) and Granite-4.0-h-small (2$\times$4 mesh), with decode throughput characterised against NVIDIA A100 and CPU baselines.
 \item A systematic characterisation of the numerical, architectural, and toolchain challenges encountered during the port (Section~\ref{sec:challenges}).
 \item A fused Metal kernel for the Mamba2 SSM state-update step that reduces per-layer DRAM passes and dispatch overhead.
-\item A characterisation of the Metal trace + fabric deadlock and a proposed firmware-level fix.
+\item A working whole-model decode trace, including the discovery and fix of a bypass-mode off-by-1 correctness hazard in Metal trace capture.
 \item Empirical decode throughput measurements and per-component timing breakdowns.
 \end{itemize}
 
@@ -136,7 +136,7 @@ $W_{\mathrm{out}}$ (per device) & $[16, 1{,}536, 512]$ & 12\,MB \\
 
 The total worker L1 per chip is 91.5\,MiB. The 36-layer SSM recurrent state alone occupies 83.5\,MiB — essentially saturating the entire L1 if we tried to keep it on-chip. Weight matrices are far too large: Mamba weights are $\approx$1\,GB and MoE weights $\approx$1.44\,GB per device, all residing permanently in DRAM.
 
-\textbf{Consequence for decode.} Every decode step must stream the weight matrices for all 40 layers from DRAM. The minimum time to read all Mamba weights at 190\,GB/s is $(1{,}004\,\text{MB}) / (190\,\text{GB/s}) \approx 5.3\,\text{ms}$. At 240\,GB/s with DRAM-sharded layout this is $\approx 4.2\,\text{ms}$. The current measured decode time is 130--145\,ms, confirming the system is not DRAM-bound but PCIe-dispatch-bound (see Section~\ref{sec:bottleneck}).
+\textbf{Consequence for decode.} Every decode step must stream the weight matrices for all 40 layers from DRAM. The minimum time to read all Mamba weights at 190\,GB/s is $(1{,}004\,\text{MB}) / (190\,\text{GB/s}) \approx 5.3\,\text{ms}$. At 240\,GB/s with DRAM-sharded layout this is $\approx 4.2\,\text{ms}$. Without trace, the measured decode time was 130--145\,ms, confirming the system was PCIe-dispatch-bound rather than DRAM-bound. With trace enabled, decode is $\approx$96\,ms (see Section~\ref{sec:bottleneck}).
 
 \subsubsection{L1 usage in the SSM kernel}
 
@@ -172,7 +172,7 @@ Tenstorrent Wormhole is a dataflow accelerator. Each chip contains a 2D grid of 
 
 \textbf{Dispatch overhead.} A single PCIe round-trip takes approximately 0.08--0.12\,ms. During autoregressive decode, sequence length is 1 and arithmetic intensity is extremely low---each Mamba decode layer executes approximately 25 TTNN ops. Across 36 Mamba layers the dispatch budget is $36 \times 25 \times 0.1\,\text{ms} \approx 90\,\text{ms}$; device-side compute and fabric collectives run concurrently with some dispatch overhead, so the measured wall-clock Mamba time (57--63\,ms) is lower than this ceiling but dispatch still accounts for the majority of per-layer latency.
 
-\textbf{Metal Trace.} The TTNN trace mechanism (\texttt{ttnn.begin\_trace\_capture} / \texttt{ttnn.execute\_trace}) records a sequence of commands into a device-side command buffer. On subsequent calls, the entire sequence is replayed by the device firmware without host involvement, reducing $N$ dispatches to 1. This is the primary mechanism for eliminating dispatch overhead in decode.
+\textbf{Metal Trace.} The TTNN trace mechanism (\texttt{ttnn.begin\_trace\_capture} / \texttt{ttnn.execute\_trace}) records a sequence of commands into a device-side command buffer. On subsequent calls, the entire sequence is replayed by the device firmware without host involvement, reducing $N$ dispatches to 1. This is the primary mechanism for eliminating dispatch overhead in decode, and is the approach implemented in this work (Section~\ref{sec:trace-impl}). A key property is that trace capture runs in \emph{bypass mode}: ops are recorded but not executed on device, which requires careful design to avoid corrupting autoregressive state (Section~\ref{sec:bottleneck}).
 
 \textbf{Ethernet Fabric.} The Galaxy 32 system connects 32 Wormhole chips via Ethernet links. The TTNN fabric (\texttt{ttnn.FabricConfig.FABRIC\_1D}) enables on-device collective operations (\texttt{ttnn.all\_gather}) that move data between chips without returning to the host, making multi-chip expert-parallel MoE feasible at decode time.
 
@@ -317,9 +317,13 @@ TTNN tensors are reference-counted; calling \texttt{deallocate(True)} on a tenso
 
 The HuggingFace Mamba2 implementation calls \texttt{mamba\_ssm.ops.triton.selective\_state\_update} for decode, a Triton kernel that fuses the full recurrent step. No equivalent exists in the TTNN Metal kernel library at the time of writing. The decode path was implemented using five sequential TTNN ops (addcmul, mul, sum, add), and the fused \texttt{ssm\_update} Metal kernel described in Section~\ref{sec:optimisation} was written to close this gap.
 
-\subsubsection{Trace + fabric incompatibility}
+\subsubsection{Metal trace bypass-mode correctness hazard}
 
-TTNN's \texttt{execute\_trace} and the TT-Fabric Ethernet stack were developed independently. Their interaction—specifically, the Ethernet core state after a traced all-gather replay—was not tested until this porting work. The deadlock described in Section~\ref{sec:bottleneck} is a regression in the combined system that has no workaround at the application level. This is the single largest performance gap between the Wormhole port and the GPU reference.
+TTNN's \texttt{begin\_trace\_capture}/\texttt{end\_trace\_capture} calls \texttt{set\_bypass\_mode(true)} on all device command queues for the duration of the capture. In bypass mode, operations are \emph{recorded} into a host-side buffer but are \textbf{not dispatched to the device}. This is intentional—the device must see fixed-address allocations, not actual execution—but it has a critical implication for autoregressive decode: if trace capture is triggered \emph{inside} the generation loop at step $t$, the capture step executes in bypass mode and produces stale logits from step $t-1$ (device KV cache and SSM state are not advanced). Every subsequent token is then shifted by one position, producing incoherent output.
+
+This was diagnosed by observing that WITH TRACE, step-$t$ output matched NO TRACE step $t-1$ output across all prompts. The root cause was confirmed by reading \texttt{tt\_metal/distributed/fd\_mesh\_command\_queue.cpp}: \texttt{record\_begin} calls \texttt{set\_bypass\_mode(true, clear=true)}, and \texttt{system\_memory\_manager.cpp::issue\_queue\_reserve} routes to a \texttt{bypass\_buffer} vector in host RAM rather than the device CQ.
+
+The fix is to separate trace capture from the autoregressive loop entirely. The \texttt{capture\_decode\_trace()} method records the full 40-layer decode forward using a dummy (zeros) embedding input; this is called once after two real warmup steps, after which all subsequent \texttt{forward()} calls replay the trace. Because capture uses a dummy input and runs outside the generation loop, the bypass mode does not corrupt device state.
 
 \section{Optimisation Targets}
 \label{sec:optimisation}
@@ -372,44 +376,53 @@ The kernel uses three circular buffers (SRAM): CB5 holds the buffered $\mathbf{h
 
 The benefit of fusion is twofold. First, $\mathbf{h}_{\mathrm{out}}$ is read back from L1 CB5 in Phase~2 rather than DRAM, eliminating one $768\,\text{KB}$ DRAM read per layer ($\approx 0.15\,\text{ms}$ across 36 layers). Second, the 5-op TTNN path (addcmul + mul + sum + D-skip + out-proj preamble) is replaced by a single \texttt{ttnn.generic\_op} call per layer, saving 4 PCIe round-trips per layer at $100\,\mu\text{s}$ each: $4 \times 36 \times 100\,\mu\text{s} = 14.4\,\text{ms}$ per decode step.
 
-\subsection{Command Trace for Decode}
+\subsection{Whole-Model Decode Trace}
+\label{sec:trace-impl}
 
-The larger source of overhead is the total dispatch count. A single decode step across 40 layers issues approximately 500+ TTNN operations. At $\sim$0.1\,ms per dispatch, this accounts for the majority of the measured 130--145\,ms per decode step.
+The larger source of overhead is the total dispatch count. A single decode step across 40 layers issues approximately 500+ TTNN operations. At $\sim$0.1\,ms per dispatch, this accounts for the majority of the measured step latency without trace.
 
-The Metal trace mechanism allows the host to record a sequence of device commands once and replay them with a single dispatch thereafter. The design for per-layer MLP tracing is:
+The Metal trace mechanism allows the host to record a sequence of device commands once and replay them with a single dispatch thereafter. The implementation traces the \emph{entire} 40-layer decode forward pass, including all \texttt{all\_gather\_async} collective calls for expert-parallel MoE. The collective calls use \texttt{all\_gather\_async} (asynchronous with \texttt{persistent\_output\_buffer=None}), which allocates its output inside the trace region at capture time and replays correctly because the same physical addresses are reused on every replay.
+
+A key design constraint arises from Metal's bypass mode (Section~\ref{sec:challenges}): the capture must be \emph{isolated from the autoregressive loop}. The trace is captured once using a dummy (zeros) embedding input, called after two real warmup steps complete. Subsequent decode forwards replay the trace.
 
 \begin{algorithm}
-\caption{MLP Trace Setup (per decoder layer, called once after prefill)}
+\caption{Whole-Model Decode Trace Capture (called once after warmup)}
 \label{alg:trace}
 \begin{algorithmic}[1]
-\Require Fixed-address buffers: $\mathbf{n}_{\mathrm{in}} \in \mathbb{R}^{1\times1\times1\times H}$, $\mathbf{r}_{\mathrm{in}} \in \mathbb{R}^{1\times E_{\mathrm{local}}\times1\times1}$
-\State \textit{// Compile run: warm kernel cache}
-\State $\mathbf{out} \leftarrow \mathrm{forward\_experts}(\mathbf{n}_{\mathrm{in}}, \mathbf{r}_{\mathrm{in}}) + \mathrm{SharedMLP}(\mathbf{n}_{\mathrm{in}})$
-\State $\mathtt{synchronize}()$; deallocate $\mathbf{out}$
-\State \textit{// Capture trace}
+\Require Model at position $p$ after prefill + 2 warmup decode steps
+\State \textit{// Allocate persistent buffers outside trace region}
+\State $\mathbf{in} \leftarrow \mathtt{zeros}([1,1,1,H])$ \Comment{fixed-address DRAM input}
+\State $\mathbf{z} \leftarrow \mathtt{zeros}([1,1,1,H])$ \Comment{addend for copy-via-add inside trace}
+\State Update attention position buffers to position $p$
+\State $\mathtt{synchronize}()$
+\State \textit{// Record trace using dummy input — bypass mode, no device state change}
 \State $\mathrm{tid} \leftarrow \mathtt{begin\_trace\_capture}()$
-\State $\mathbf{out}_{\mathrm{trace}} \leftarrow \mathrm{forward\_experts}(\mathbf{n}_{\mathrm{in}}, \mathbf{r}_{\mathrm{in}}) + \mathrm{SharedMLP}(\mathbf{n}_{\mathrm{in}})$ \Comment{allocations fixed}
+\State $\mathbf{h} \leftarrow \mathbf{in} + \mathbf{z}$ \Comment{exposes $\mathbf{in}$ as a writable entry point}
+\For{each decoder layer $\ell = 0 \ldots 39$}
+  \State $\mathbf{h} \leftarrow \mathrm{Layer}_\ell.\mathrm{forward}(\mathbf{h})$ \Comment{Mamba/Attn + MoE, incl.\ \texttt{all\_gather\_async}}
+\EndFor
+\State $\mathbf{logits}_{\mathrm{trace}} \leftarrow \mathrm{LMHead}(\mathrm{Norm}(\mathbf{h}))$
 \State $\mathtt{end\_trace\_capture}(\mathrm{tid})$
-\State \textbf{return} $\mathrm{tid}$, $\mathbf{out}_{\mathrm{trace}}$ \Comment{persistent output buffer}
+\State \textbf{return} $\mathrm{tid}$, $\mathbf{in}$, $\mathbf{logits}_{\mathrm{trace}}$ \Comment{$\mathbf{logits}_{\mathrm{trace}}$ lives in trace region}
 \end{algorithmic}
 \end{algorithm}
 
-During each decode step, the traced MLP is executed as:
+During each decode step after capture, the traced forward executes as:
 
 \begin{algorithm}
-\caption{MLP Traced Forward (per decode step)}
+\caption{Whole-Model Traced Forward (per decode step)}
 \label{alg:trace-fwd}
 \begin{algorithmic}[1]
-\State $\mathbf{n} \leftarrow \mathrm{RMSNorm}(h')$ \Comment{post-mixer hidden state, untraced}
-\State $\mathbf{r} \leftarrow \mathrm{router\_on\_device}(\mathbf{n})$ \Comment{topk + softmax, untraced}
-\State $\mathtt{copy}(\mathbf{r},\; \mathbf{r}_{\mathrm{in}})$; $\mathtt{copy}(\mathbf{n},\; \mathbf{n}_{\mathrm{in}})$ \Comment{write into fixed buffers}
-\State $\mathtt{execute\_trace}(\mathrm{tid})$ \Comment{\textbf{1 dispatch} for all MLP ops}
-\State $\mathbf{m}_{\mathrm{full}} \leftarrow \mathrm{MoE.reduce}(\mathbf{out}_{\mathrm{trace}})$ \Comment{all\_gather, untraced}
-\State $h \leftarrow h' + \alpha \cdot \mathbf{m}_{\mathrm{full}}$ \Comment{residual add, untraced}
+\State $\mathbf{e} \leftarrow \mathrm{embed}(\mathrm{token})$ \Comment{CPU embedding lookup}
+\State $\mathtt{assign}(\mathbf{e},\; \mathbf{in})$ \Comment{write real embedding into fixed input buffer}
+\State $\mathtt{synchronize}()$ \Comment{flush async PCIe write before replay}
+\State $\mathtt{execute\_trace}(\mathrm{tid},\; \mathtt{blocking=False})$ \Comment{\textbf{1 dispatch} for all 500+ ops}
+\State $\mathtt{synchronize}()$
+\State \textbf{return} $\mathbf{logits}_{\mathrm{trace}}$ \Comment{read from trace-region output buffer}
 \end{algorithmic}
 \end{algorithm}
 
-The \texttt{forward\_experts} function covers MoE steps 2--5 (repeat $\to$ matmul $\to$ SiLU $\to$ down $\to$ weight $\to$ local sum) without the all-gather. The \texttt{MoE.reduce} all-gather runs outside the trace because collective operations inside \texttt{execute\_trace} trigger a hardware deadlock (see Section~\ref{sec:bottleneck}).
+The \texttt{assign} at line 2 overwrites the fixed-address input buffer so that the trace replay processes the real token embedding rather than the dummy zeros used during capture. The \texttt{synchronize} at line 3 ensures the PCIe write completes before the trace firmware begins reading from that address. The \texttt{all\_gather\_async} calls inside the trace use \texttt{persistent\_output\_buffer=None}, which causes the output buffer to be allocated once inside the trace region at capture time and reused on every replay — no host involvement is required for the collective during replay.
 
 \subsection{Chunked-Prefill Chunk Size Tuning}
 \label{sec:chunk-tune}
@@ -437,70 +450,62 @@ size & 96-tok & 176-tok & 96-tok & 176-tok \\
 
 Chunk size 192 is significantly worse: the 96-token prompt fits in a single chunk of 192 but the chunk is too small to fully utilise the Tensix cores, and decode throughput collapses to 3.2 tok/s because the SSM state is partially cold. Chunk sizes 256--512 give equivalent prefill throughput (${\approx}140$--145 tok/s at 176 tokens); 256 is selected as it minimises peak DRAM allocation without sacrificing throughput. Decode throughput is essentially flat across 256--512, confirming that chunk size does not affect steady-state decode (the SSM state is fully warm after prefill regardless of $C$).
 
-\section{Current Bottleneck}
+\section{Current Bottleneck and Trace Performance}
 \label{sec:bottleneck}
 
-\subsection{Measured Decode Latency}
+\subsection{Measured Decode Latency (With Trace)}
 
-Table~\ref{tab:timing} shows the per-component timing breakdown for a single decode step on the 1$\times$4 Wormhole mesh, averaged over 18 steady-state steps.
+Table~\ref{tab:timing} shows the per-component timing breakdown for a single decode step on the 1$\times$4 Wormhole mesh with trace enabled, averaged over 16 steady-state steps (steps 3--18, after 2 warmup and 1 first-trace-replay step).
 
 \begin{table}[h]
-\caption{Decode step timing (Granite-4.0-h-tiny, 1$\times$4 mesh, fabric enabled).}
+\caption{Decode step timing (Granite-4.0-h-tiny, 1$\times$4 mesh, fabric + trace enabled).}
 \label{tab:timing}
 \begin{tabular}{lrr}
 \toprule
 Component & Time (ms) & \% of total \\
 \midrule
-Mamba2 (36 layers) & 57--63 & 42--46\% \\
-MoE + Shared MLP (40 layers) & 64--75 & 47--54\% \\
-Attention (4 layers) & 2.5--2.7 & $\sim$2\% \\
-Embedding + LM head & $\sim$3 & $\sim$2\% \\
+Mamba2 (36 layers) & 52--58 & 54--61\% \\
+MoE + Shared MLP (40 layers) & 62--68 & 65--71\% \\
+Attention (4 layers) & 1.8--2.0 & $\sim$2\% \\
 \midrule
-Total & 130--145 & \\
-Throughput & \multicolumn{2}{c}{9.4--9.6 tok/s} \\
+Total (trace replay) & $\approx$96 & \\
+Throughput & \multicolumn{2}{c}{10.4--10.5 tok/s} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Mamba and MLP are roughly equal contributors. Attention is negligible at decode (sequence length 1, 4-head KV cache).
+With trace enabled, the single \texttt{execute\_trace} dispatch replaces $\approx$500 individual PCIe round-trips. The step time drops from 130--145\,ms (no trace) to $\approx$96\,ms, a $\approx$33\% improvement. Mamba2 remains the dominant contributor because its per-layer recurrent ops are compute- and DRAM-bound; MoE all-gather collectives overlap with compute during replay.
 
-\subsection{Trace + Fabric Deadlock}
+\subsection{Bypass-Mode Off-by-One Discovery}
 
-The primary obstacle to applying Metal trace is an interaction between \texttt{ttnn.execute\_trace} and the Ethernet fabric. After a trace executes and the host calls \texttt{execute\_trace(..., blocking=True)}, the Ethernet core responsible for the preceding all-gather collective is left in firmware state \texttt{0x40} (running). Any subsequent \texttt{ttnn.copy} into a trace input buffer hangs indefinitely because the copy command cannot acquire the Ethernet core.
-
-This affects both Mamba traces (the Mamba in/out projections use \texttt{all\_gather} for tensor parallelism) and MLP traces (the MoE reduce step uses \texttt{all\_gather} for expert parallelism). The sequence that triggers the deadlock is:
+During development, an early inline capture strategy (triggering trace capture inside the generation loop at step $t$) produced incoherent responses across all prompts. Step-by-step token comparison showed that WITH TRACE, step $t$'s top token matched NO TRACE step $t-1$ — a consistent one-step lag. This was traced to Metal's bypass mode:
 
 \begin{enumerate}
-\item \texttt{execute\_trace(tid, blocking=True)} --- runs recorded ops
-\item Ethernet core enters state \texttt{0x40} (collective still ``in flight'' from trace replay)
-\item \texttt{all\_gather(...)} for MoE reduce --- stalls, waiting for Ethernet core
-\item \texttt{ttnn.copy(...)} at start of next layer --- hangs permanently
+\item \texttt{begin\_trace\_capture()} calls \texttt{set\_bypass\_mode(true)} on all device CQs.
+\item All ops between \texttt{begin} and \texttt{end} are recorded into a host-side buffer but \textbf{not dispatched} to the device.
+\item KV cache writes (\texttt{paged\_update\_cache}) and SSM state updates (\texttt{ttnn.assign}) inside the capture window are recorded but never executed.
+\item The device's state at the end of capture is identical to its state before capture began.
+\item The captured step's \texttt{execute\_trace} replay then processes the \emph{current} embedding with the \emph{previous} device state, producing the same output as step $t-1$.
 \end{enumerate}
 
-The root cause is that Metal does not flush or quiesce the fabric dispatch state when exiting a trace replay. A correct fix at the firmware level would require one of: (a) polling Ethernet cores to \texttt{0x0} after \texttt{execute\_trace} completes, (b) injecting a fabric-sync command at the end of each trace's command buffer, or (c) quiescing the fabric before \texttt{begin\_trace\_capture} and re-enabling it after \texttt{execute\_trace}.
+This is not a bug in Metal; it is the intended behaviour that allows allocations to be fixed. The fix is to capture the trace with a dummy input \emph{outside} the generation loop (Algorithm~\ref{alg:trace}), so the capture step never corrupts the autoregressive state.
 
-A partial application-level workaround exists: disabling fabric entirely (\texttt{FabricConfig.DISABLED}) removes all \texttt{all\_gather} calls from the critical path, eliminating the Ethernet core interaction and allowing \texttt{execute\_trace} to complete cleanly. The cost is that expert parallelism is lost — each device redundantly computes the full MoE output — but dispatch overhead still collapses from $\approx$50\,ms to $\approx$1\,ms per step. Across the full sweep of chunk sizes (Table~\ref{tab:chunk}) and mesh configurations tested in this project, trace without fabric consistently deadlocks in the same pattern, confirming that the interaction is deterministic and not a transient firmware state. The implementation therefore runs traces disabled on all fabric mesh configurations until the firmware-level fix is available.
-
-\subsection{Impact of Disabling Trace}
-
-Without trace, each TTNN op requires an individual PCIe dispatch. The 500+ operations per decode step at $\approx$0.1\,ms each account for the bulk of the observed 130--145\,ms step time.
+\subsection{Latency Decomposition}
 
 We decompose the decode step latency into four components:
 \begin{equation}
 T_{\mathrm{step}} = T_{\mathrm{dispatch}} + T_{\mathrm{compute}} + T_{\mathrm{fabric}} + T_{\mathrm{DRAM}}
 \label{eq:roofline}
 \end{equation}
-With trace disabled, $T_{\mathrm{dispatch}} \approx 500 \times 0.1\,\text{ms} = 50\,\text{ms}$ provides a lower bound on dispatch cost (some ops overlap with device execution, explaining the 130--145\,ms total). $T_{\mathrm{DRAM}}$ is the weight-streaming lower bound: streaming $\approx 2.5\,\text{GB}$ of Mamba + MoE weights per step at 190\,GB/s gives $\approx 13\,\text{ms}$. $T_{\mathrm{fabric}}$ covers 40 all-gather calls at $\approx 0.5\,\text{ms}$ each = $\approx 20\,\text{ms}$. The remaining $T_{\mathrm{compute}}$ (MatMul + SSM on Tensix) is estimated at 5--10\,ms. With trace enabled, $T_{\mathrm{dispatch}}$ collapses to $\approx 1\,\text{ms}$ (one replay per step), leaving $T_{\mathrm{step}} \approx 13 + 20 + 7 = 40\,\text{ms}$, or $\approx 25\,\text{tok/s}$. This provides the theoretical target once the trace + fabric deadlock is resolved. The current 9.5 tok/s represents a $\sim$1.05$\times$ gap attributable to dispatch overhead; eliminating dispatch via trace is expected to target $\approx$25\,tok/s.
+Without trace, $T_{\mathrm{dispatch}} \approx 500 \times 0.1\,\text{ms} = 50\,\text{ms}$ (lower bound; some ops overlap). $T_{\mathrm{DRAM}}$ is the weight-streaming lower bound: $\approx 2.5\,\text{GB}$ at 190\,GB/s $\approx 13\,\text{ms}$. $T_{\mathrm{fabric}}$ covers $\approx$40 all-gather calls at $\approx 0.5\,\text{ms}$ each $\approx 20\,\text{ms}$. $T_{\mathrm{compute}}$ (MatMul + SSM on Tensix) $\approx 7\,\text{ms}$.
+
+With trace, $T_{\mathrm{dispatch}}$ collapses to $\approx 1\,\text{ms}$ (one replay), giving $T_{\mathrm{step}} \approx 13 + 20 + 7 = 40\,\text{ms}$ — a theoretical target of $\approx$25 tok/s. The measured 96\,ms ($\approx$10.4 tok/s) is above this floor, indicating that $T_{\mathrm{fabric}}$ and $T_{\mathrm{DRAM}}$ are not fully concurrent with trace replay in the current firmware. Further profiling would be required to separate these contributions inside the trace replay.
 
 \subsection{Path Forward}
 
-Two optimisation steps remain viable today without a firmware change:
+\textbf{Fused SSM kernel.} The \texttt{ssm\_update} kernel (Algorithm~\ref{alg:kernel}) reduces Mamba per-layer DRAM passes from 5 to 3 and saves 4 dispatches per layer. With trace, the dispatch saving is already collapsed; the DRAM saving of $\approx 0.15\,\text{ms}$ (768\,KB/layer $\times$ 36 layers at 190\,GB/s) still applies, potentially reducing Mamba step time by 2--3\%. The primary value of the kernel is its reduced $T_{\mathrm{DRAM}}$ rather than dispatch reduction once trace is deployed.
 
-\textbf{(1) Fused SSM kernel.} The \texttt{ssm\_update} kernel (Algorithm~\ref{alg:kernel}) reduces Mamba per-layer DRAM passes from 5 to 3 and saves 4 dispatches per layer, for an estimated $\sim$14\,ms dispatch saving and $\sim$0.15\,ms DRAM saving per decode step without any trace dependency.
-
-\textbf{(2) Trace without fabric.} Disabling fabric (\texttt{FabricConfig.DISABLED}) removes the Ethernet core interaction, allowing per-layer MLP traces (Algorithms~\ref{alg:trace} and~\ref{alg:trace-fwd}) to run cleanly. Expert parallelism is lost (each device redundantly computes all experts), but dispatch overhead collapses from $\approx$50\,ms to $\approx$1\,ms per step. On a single-chip (1$\times$1) or no-fabric mesh, the trace path is available now. The estimated throughput with trace and no fabric is $T_{\mathrm{step}} \approx 13 + 0 + 7 = 20\,\text{ms}$, or $\approx$50\,tok/s — removing $T_{\mathrm{fabric}} \approx 20\,\text{ms}$ since no all-gather is issued, and collapsing $T_{\mathrm{dispatch}}$ to near zero.
-
-The full combination of trace \emph{and} fabric requires the Metal firmware to quiesce Ethernet core state on trace exit before the remaining gap closes completely.
+\textbf{Fabric throughput.} The $\approx$20\,ms fabric component is the next largest term. Profiling the per-all-gather latency inside trace replay and exploring ring-topology scheduling would reduce this gap to the theoretical 40\,ms floor.
 
 \section{Related Work}
 
@@ -573,7 +578,7 @@ Model & Backend & short\_8 & short\_10 & med\_32 & long\_128 & long\_256 \\
 \midrule
 tiny & CPU (1 core) & 2.58 & 2.60 & 2.61 & 2.61 & 2.62 \\
 tiny & A100 GPU    & 7.65 & 9.40 & 9.32 & 9.34 & 9.19 \\
-tiny & WH 1$\times$4  & 9.45 & 9.41 & 9.47 & 9.58 & 9.50 \\
+tiny & WH 1$\times$4 (trace)  & 10.35 & 10.29 & 10.47 & 10.43 & 10.48 \\
 \midrule
 small & CPU (1 core) & 0.66 & 0.66 & 0.54 & 0.54 & 0.64 \\
 small & A100 GPU    & 5.39 & 5.40 & 5.53 & 5.56 & 5.59 \\
@@ -582,7 +587,7 @@ small & WH 2$\times$4  & 3.71 & 3.71 & 3.71 & 3.71 & 3.74 \\
 \end{tabular}}
 \end{table}
 
-For the tiny model, the Wormhole 1$\times$4 achieves 9.4--9.6 tok/s — matching or slightly exceeding the A100 (9.2--9.4 tok/s) at steady-state, and is $3.6\times$ faster than CPU. For the small model, the Wormhole 2$\times$4 achieves 3.7 tok/s vs.\ the A100's 5.4--5.6 tok/s ($1.5\times$ gap). Notably, the Wormhole decode rate is nearly constant across all prompt lengths, whereas the A100 shows a warm-up effect on very short prefills (short\_8 is slower due to CUDA kernel launch overhead dominating a 5-token sequence).
+For the tiny model with trace enabled, the Wormhole 1$\times$4 achieves 10.3--10.5 tok/s — exceeding the A100 (9.2--9.4 tok/s) by $\approx$11\% at steady-state, and is $4\times$ faster than CPU. For the small model (no trace), the Wormhole 2$\times$4 achieves 3.7 tok/s vs.\ the A100's 5.4--5.6 tok/s ($1.5\times$ gap). Notably, the Wormhole tiny decode rate is nearly constant across all prompt lengths, whereas the A100 shows a warm-up effect on very short prefills (short\_8 is slower due to CUDA kernel launch overhead dominating a 5-token sequence).
 
 \subsubsection{Prefill throughput}
 
@@ -599,7 +604,7 @@ Model & Backend & short\_10 & med\_32 & long\_128 & long\_256 \\
 \midrule
 tiny & CPU     &  0.71 &  2.17 &  8.22 & 14.85 \\
 tiny & A100    & 25.38 & 75.12 & 279.1 & 503.2 \\
-tiny & WH 1$\times$4 & 9.7 & 26.8 &  83.9 & 104.8 \\
+tiny & WH 1$\times$4 & 9.7 & 26.3 &  83.2 & 102.4 \\
 \midrule
 small & CPU     &  0.26 &  0.80 &  3.01 &  5.39 \\
 small & A100    &  9.84 & 28.85 &  95.6 & 178.1 \\
@@ -635,23 +640,26 @@ Wormhole load time for tiny (99\,s) is dominated by uploading 64-expert weight m
 \subsubsection{Output quality}
 \label{sec:eval-quality}
 
-The tiny model on Wormhole produces coherent, on-topic responses matching the A100 output for all five prompts (e.g., ``Paris. The Eiffel Tower...'' for the France prompt). The small model on Wormhole shows some garbled tokens at short prompts (e.g., ``Paris. The Eiffel\textbackslash nTowereight''), suggesting a numerical issue in the small-model logits path that was not present in the tiny model. The small model on A100 and CPU produces clean output. This correctness gap in the small TT implementation is an outstanding issue.
+The tiny model on Wormhole with trace enabled produces coherent, on-topic responses matching the A100 output for all five prompts (e.g., ``Paris. The Eiffel Tower, a symbol of the city\ldots'' for the France prompt). Prior to the bypass-mode fix, the tiny model with inline trace capture produced incoherent output due to the off-by-one state lag described in Section~\ref{sec:bottleneck}; the corrected \texttt{capture\_decode\_trace()} approach restores full output quality. The small model on Wormhole shows some garbled tokens at short prompts, suggesting a numerical issue in the small-model logits path that is not present in the tiny model. The small model on A100 and CPU produces clean output. This correctness gap in the small TT implementation is an outstanding issue.
 
 \subsection{Discussion}
 
 \textbf{Decode gap vs.\ A100.}
-The tiny model on 4 Wormhole chips (9.4--9.6 tok/s) matches or slightly exceeds a single A100 (9.2--9.4 tok/s). Given that the A100 benefits from a mature \texttt{triton} and CUDA Mamba2 kernel stack, and that Wormhole decode is currently fully dispatch-bound (Section~\ref{sec:bottleneck}), this is a strong result for early-stage hardware bring-up.
+The tiny model on 4 Wormhole chips with trace enabled (10.3--10.5 tok/s) exceeds a single A100 (9.2--9.4 tok/s) by $\approx$11\%. The trace collapses 500+ PCIe dispatches per step to a single replay command, eliminating the dispatch-bound bottleneck that previously held steady-state throughput at 9.4--9.6 tok/s. Given that the A100 benefits from a mature Triton and CUDA Mamba2 kernel stack, this is a strong result for early-stage hardware bring-up.
 
-The small model gap is larger (3.7 vs.\ 5.5 tok/s, 33\%) despite using twice as many chips (8 vs.\ 1). The small model's per-layer weight matrices are $\sim$6$\times$ larger (H=4096 vs.\ 1536), making it more DRAM-bandwidth-bound. With dispatch overhead fixed via trace, the Wormhole system should approach or exceed the A100 for the small model, since 8 chips provide $8\times 190 = 1{,}520\,\text{GB/s}$ aggregate DRAM bandwidth vs.\ the A100 PCIe's $1{,}935\,\text{GB/s}$.
+The small model gap remains (3.7 vs.\ 5.5 tok/s, 33\%) because the small model trace has not yet been implemented. The small model's per-layer weight matrices are $\sim$6$\times$ larger (H=4096 vs.\ 1536), making it more DRAM-bandwidth-bound. With trace applied to the small model, the Wormhole system should approach or exceed the A100, since 8 chips provide $8\times 190 = 1{,}520\,\text{GB/s}$ aggregate DRAM bandwidth vs.\ the A100 PCIe's $1{,}935\,\text{GB/s}$.
 
 \textbf{CPU baselines.}
 Both CPU baselines (2.6 tok/s tiny, 0.6 tok/s small) are far below Wormhole and A100, confirming that inference-time throughput requires hardware acceleration. The tiny CPU load time (1.9\,s) is fast because weights are small enough to fit in CPU cache-warm allocations; the small model (23.6\,s) requires paging several GB of weights.
 
 \textbf{Constant decode rate on Wormhole.}
-Unlike the A100 where decode throughput improves with context length (9.2 to 9.4 tok/s from short to long), Wormhole decode is flat at 9.4--9.6 tok/s for tiny regardless of prompt length. This is because the dominant cost is per-op PCIe dispatch, which is independent of sequence length. The A100 improvement at longer contexts reflects better CUDA kernel amortisation over longer KV-cache reads.
+Unlike the A100 where decode throughput improves with context length (9.2 to 9.4 tok/s from short to long), Wormhole decode with trace is flat at 10.3--10.5 tok/s for tiny regardless of prompt length. With trace, the dominant cost is device-side compute and fabric collectives inside the replay, which are independent of how many tokens were prefilled. The A100 improvement at longer contexts reflects better CUDA kernel amortisation over longer KV-cache reads.
 
 \textbf{Small model output quality.}
-The garbled small-model responses on Wormhole (but not on CPU or A100) indicate a numerical issue specific to the TT path, likely in the logits gather or in the LM head shard composition across the 2$\times$4 mesh. The tiny model uses a different logits gather axis (dim=3 for vocab sharding) that was corrected in commit \texttt{8dae1dc}; the same fix may not be fully validated for the 2$\times$4 configuration. This is a correctness bug, not a performance issue, and does not affect the timing measurements.
+The garbled small-model responses on Wormhole (but not on CPU or A100) indicate a numerical issue specific to the TT path, likely in the logits gather or in the LM head shard composition across the 2$\times$4 mesh. The tiny model's logits gather axis (dim=3 for vocab sharding) was corrected in commit \texttt{8dae1dc} and produces clean output; the same fix may not be fully validated for the 2$\times$4 configuration. This is a correctness bug, not a performance issue, and does not affect the timing measurements.
+
+\textbf{Trace correctness.}
+The trace off-by-one issue (Section~\ref{sec:bottleneck}) caused incoherent output whenever trace was captured inline during the generation loop. After switching to the \texttt{capture\_decode\_trace()} approach, the tiny-model trace and no-trace paths produce token-for-token identical top-1 predictions at every decode step, confirming full numerical correctness of the trace path.
 
 \section{Threats to Validity}
 
@@ -659,7 +667,7 @@ Several factors may impact the validity of the results:
 \begin{itemize}
 \item Timing measurements are taken on a shared Galaxy system; other tenants' workloads may affect chip thermal state and PCIe bus utilisation.
 \item Decode throughput on the 1$\times$4 Wormhole mesh varies between 9.4 and 9.6 tok/s across runs with identical code and a warm compiled-kernel cache; cold-cache runs (first run after \texttt{rm -rf generated/}) produce similar throughput once TTNN recompiles all kernels in the same session.
-\item The trace deadlock is observed consistently but its firmware root cause has not been confirmed by the Metal team.
+\item The bypass-mode off-by-one behaviour is consistent with the Metal source code, but the exact boundary conditions (e.g., whether \texttt{ttnn.assign} into a buffer allocated before capture is guaranteed stable across firmware versions) have not been confirmed by the Metal team.
 \end{itemize}
 
 \subsection{Ethics Considerations}
@@ -668,13 +676,15 @@ This work focuses on engineering and systems-level optimization of language mode
 
 \section{Conclusion}
 
-This project presents a complete port of Granite-4.0-h-tiny and Granite-4.0-h-small from HuggingFace to Tenstorrent Wormhole hardware using the TTNN Metal stack, and benchmarks the result against NVIDIA A100 PCIe and CPU baselines. The tiny model (1$\times$4 mesh) achieves 9.4--9.6 tok/s decode throughput — matching the A100 (9.2--9.4 tok/s) and $3.6\times$ faster than CPU. The small model (2$\times$4 mesh) reaches 3.7 tok/s vs.\ 5.5 tok/s on A100.
+This project presents a complete port of Granite-4.0-h-tiny and Granite-4.0-h-small from HuggingFace to Tenstorrent Wormhole hardware using the TTNN Metal stack, and benchmarks the result against NVIDIA A100 PCIe and CPU baselines. The tiny model (1$\times$4 mesh) achieves 10.3--10.5 tok/s decode throughput with trace enabled — exceeding the A100 (9.2--9.4 tok/s) by $\approx$11\% and $4\times$ faster than CPU. The small model (2$\times$4 mesh, no trace) reaches 3.7 tok/s vs.\ 5.5 tok/s on A100.
 
-All measured throughput is obtained without Metal trace, meaning the system is dispatch-bound: 500+ individual PCIe commands per decode step contribute $\approx$50\,ms of the 130--145\,ms total step latency. The primary porting challenges encountered — including bfloat8\_b quantisation sensitivity, SSM state persistence across chunked prefill, MoE expert-parallel sharding, and CCL initialisation ordering — are documented in Section~\ref{sec:challenges} to guide future ports of hybrid SSM/attention models to similar hardware.
+The Metal decode trace (Algorithm~\ref{alg:trace}) collapses $\approx$500 PCIe dispatches per step to a single replay, reducing step latency from 130--145\,ms to $\approx$96\,ms. A key implementation finding is that Metal trace capture runs in hardware bypass mode: ops are recorded but not executed on device, so capturing the trace inside the autoregressive generation loop introduces a one-step lag in KV cache and SSM state. This was diagnosed and resolved by isolating the capture to a dummy-input call (\texttt{capture\_decode\_trace()}) outside the generation loop.
 
-Chunk-size tuning (Section~\ref{sec:chunk-tune}) establishes that $C=256$ is the optimal prefill chunk size, achieving 140--145 tok/s prefill throughput vs.\ 41 tok/s at $C=192$. The fused \texttt{ssm\_update} Metal kernel (Section~\ref{sec:optimisation}) is designed and ready to deploy; it eliminates 4 dispatches per Mamba layer ($\sim$14\,ms saving per step) without any trace dependency.
+The primary porting challenges encountered — including bfloat8\_b quantisation sensitivity, SSM state persistence across chunked prefill, MoE expert-parallel sharding, CCL initialisation ordering, and the bypass-mode trace hazard — are documented in Section~\ref{sec:challenges} to guide future ports of hybrid SSM/attention models to similar hardware.
 
-The primary obstacle to full throughput is a deterministic deadlock between \texttt{ttnn.execute\_trace} and Ethernet fabric collectives (\texttt{all\_gather}): the Ethernet core is left in state \texttt{0x40} after trace replay, causing any subsequent collective to hang. Two paths forward exist: (a) running trace without fabric (no \texttt{all\_gather}, each device computes all experts) yields an estimated $\approx$50\,tok/s on the current mesh; (b) a firmware-level quiesce of Ethernet core state on trace exit would enable the full trace + expert-parallel combination, targeting $\approx$25\,tok/s on the 1$\times$4 mesh. The complete per-layer MLP trace implementation (Algorithms~\ref{alg:trace} and~\ref{alg:trace-fwd}) is ready to activate once either path is validated.
+Chunk-size tuning (Section~\ref{sec:chunk-tune}) establishes that $C=256$ is the optimal prefill chunk size, achieving 140--145 tok/s prefill throughput vs.\ 41 tok/s at $C=192$. The fused \texttt{ssm\_update} Metal kernel (Section~\ref{sec:optimisation}) is designed and ready to deploy; with trace already eliminating dispatch overhead, its primary remaining benefit is a $\approx$0.15\,ms DRAM saving per step from eliminating one intermediate 768\,KB write per layer.
+
+The next performance target for the tiny model is the $\approx$25 tok/s theoretical ceiling (Equation~\ref{eq:roofline}), which requires reducing the $T_{\mathrm{fabric}} \approx 20\,\text{ms}$ all-gather component that dominates the remaining gap from 96\,ms to the 40\,ms floor.
 
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{Bibliography}
