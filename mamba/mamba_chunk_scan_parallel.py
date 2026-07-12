@@ -43,6 +43,9 @@ class TensorParallelMamba:
 
         self.is_mesh = _is_mesh_device(device)
         self.num_devices = device.get_num_devices() if self.is_mesh else 1
+        self._mesh_rows = device.shape[0] if self.is_mesh and self.num_devices > 1 else 1
+
+        self._topology = ttnn.Topology.Linear
 
         self.config = Mamba2Config.from_hf_mamba(hf_mamba)
         self.device_mgr = TTNNDeviceManager(device, dtype)
@@ -106,8 +109,13 @@ class TensorParallelMamba:
         replicate_mapper = self.mesh_mapper
 
         if self.is_mesh and self.num_devices > 1 and self.tensor_parallel:
-            # Use actual mesh shape so row ≥ 1 also gets valid column-shards.
+            # Column-parallel: shard the output dim across mesh columns only.
+            # Rows receive replicated shards; a single all_gather(cluster_axis=1)
+            # over columns suffices. Using (1, num_cols) keeps rows out of the
+            # sharding logic regardless of mesh row count.
             mesh_shape = self.device.shape
+            # Use the actual device shape so TTNN maps devices correctly.
+            # dims=(None, -1): replicate across rows, shard last dim across cols.
             col_mapper = ttnn.ShardTensor2dMesh(
                 self.device, dims=(None, -1), mesh_shape=mesh_shape
             )
@@ -239,7 +247,23 @@ class TensorParallelMamba:
         )
 
     def _all_gather(self, x, dim, cluster_axis, memory_config):
-        return ttnn.all_gather(x, dim=dim, cluster_axis=cluster_axis, memory_config=memory_config)
+        if self.tt_ccl is not None:
+            return ttnn.experimental.all_gather_async(
+                x,
+                persistent_output_buffer=None,
+                dim=dim,
+                cluster_axis=cluster_axis,
+                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis),
+                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
+                num_links=self.tt_ccl.get_num_links(cluster_axis),
+                memory_config=memory_config,
+                topology=self._topology,
+                chunks_per_sync=10,
+                num_workers_per_link=2,
+                num_buffers_per_channel=2,
+            )
+        return ttnn.all_gather(x, dim=dim, cluster_axis=cluster_axis,
+                               memory_config=memory_config)
 
     def forward_prefill_chunk_scan(self, hidden_states, cache_params=None, real_seq_len=None):
         replicate_mapper = self.mesh_mapper

@@ -124,9 +124,9 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             use_tt_moe=True,
             mamba_chunk_size=256 if num_devices >= 4 else None,
             max_cache_length=512,
-            # tiny: bfloat8_b gives +5-7% throughput at fast load (small weights).
-            # small: bfloat16 avoids 375s CPU quantization of 2.9 GB expert weights.
-            moe_weight_dtype=ttnn.bfloat8_b if num_devices <= 4 else ttnn.bfloat16,
+            # bfloat8_b required for both models: small model MoE bfloat16 would
+            # consume ~9 GB/device, leaving no room for Mamba weights on 12 GB DRAM.
+            moe_weight_dtype=ttnn.bfloat8_b,
             moe_use_all_gather=use_all_gather,
         )
         load_s = time.time() - t_load0
@@ -255,10 +255,10 @@ def main():
     full_mesh = None
     if use_fabric:
         try:
-            ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+            ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_2D)
             full_mesh = ttnn.open_mesh_device(mesh_shape=GALAXY_SHAPE, trace_region_size=268435456)
             fabric_ok = True
-            print("[info] fabric enabled")
+            print("[info] fabric enabled (2D)")
         except Exception as e:
             print(f"[warn] fabric open failed ({type(e).__name__}), retrying without fabric")
             try:

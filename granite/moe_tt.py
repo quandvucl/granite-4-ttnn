@@ -1,9 +1,9 @@
 """
 TTNN MoE for GraniteMoeHybrid — expert-parallel sharding across mesh columns.
 
-Single-row mesh (tiny, 1×4): shard experts across cols; all_gather_async(axis=1)+sum.
-Multi-row mesh (small, 2×4): flat EP across 8 devices; local sum then CPU reduce.
-  Two-axis on-device reduce was tried but row-axis all_gather latency hurt prefill (-53%).
+1×4 (tiny): shard 9 experts/col, all_gather_async(axis=1, Linear)+sum.
+2×4 (small): flat EP across 8 devices (9 experts/device), ShardTensorToMesh(dim=1).
+  Full-mesh all-reduce: ttnn.all_gather(dim=1, no cluster_axis)+sum — trace-safe, no semaphores.
 Decode router runs fully on-device (topk+softmax+embedding, no PCIe round-trip).
 Prefill router runs on CPU (PCIe cost amortized over S tokens).
 Decode trace: all_gather_async with persistent_output_buffer=None; output allocated in
@@ -28,6 +28,8 @@ class GraniteTTMoE:
         self.is_mesh = _is_mesh_device(device)
         self.num_devices = device.get_num_devices() if self.is_mesh else 1
 
+        self._topology = ttnn.Topology.Linear
+
         self.num_experts = hf_moe.input_linear.num_experts
         self.hidden_size = hf_moe.input_size
         self.intermediate_size = hf_moe.hidden_size
@@ -43,16 +45,16 @@ class GraniteTTMoE:
 
         # EP sharding strategy:
         #
-        # Single-row (tiny, 1×4): shard across 4 cols; all_gather(axis=1) + sum on device.
+        # Single-row (tiny, 1×4): col-parallel EP.
+        #   Shard experts across 4 cols (9/device); all_gather_async(axis=1)+sum.
         #
-        # Multi-row (small, 2×4): flat EP across 8 devices (9 experts/device).
-        #   CPU reduce: download partial sums, sum on CPU, re-upload.
-        #   Two-axis on-device reduce tested but reverted: row-axis all_gather latency
-        #   dominates for long sequences, hurting prefill (-53%) despite decode gains (+14%).
+        # Multi-row (small, 2×4): flat EP across all 8 devices (9/device).
+        #   ShardTensorToMesh(dim=1) maps experts 0..8→dev0, 9..17→dev1, ...
+        #   Full-mesh all-reduce: ttnn.all_gather(dim=1, num_links=1) — no cluster_axis,
+        #   trace-safe, no CCL semaphores. Slower than async but correct in trace.
+        #   (Two-axis all_gather_async tried: cluster_axis=0 caused trace corruption.)
         self._use_col_parallel = (self._mesh_rows == 1) and self.num_devices > 1 and use_all_gather
-        # Multi-row decode: all_gather across rows (cluster_axis=0) for S=1 only.
-        # Prefill still uses CPU reduce (row all_gather latency dominates long sequences).
-        self._use_row_reduce = (self._mesh_rows > 1) and use_all_gather
+        self._use_row_reduce = False  # disabled; using flat ttnn.all_gather for multi-row
 
         if self._use_col_parallel:
             effective_cols = self._mesh_cols
@@ -68,8 +70,6 @@ class GraniteTTMoE:
             )
         else:
             # Multi-row: flat EP across all devices.
-            # Decode: on-device row all_gather + col all_gather (if use_row_reduce).
-            # Prefill: CPU reduce (PCIe cheaper than row all_gather for long S).
             effective_devices = self.num_devices
             while effective_devices > 1 and self.num_experts % effective_devices != 0:
                 effective_devices -= 1
@@ -114,23 +114,46 @@ class GraniteTTMoE:
         )
 
     def _load_weights(self):
+        import sys
         W_in_4d  = self.hf_moe.input_linear.weight.to(torch.bfloat16).transpose(1, 2).contiguous().unsqueeze(0)
         W_out_4d = self.hf_moe.output_linear.weight.to(torch.bfloat16).transpose(1, 2).contiguous().unsqueeze(0)
 
-        self.gate_up_proj = ttnn.from_torch(
+        # Upload as bfloat16 (fast DMA), then cast on-device to target dtype.
+        # Avoids ttnn's slow CPU-side tile-by-tile quantization for bfloat8_b
+        # (~375s for 72-expert small model). On-device typecast takes <1s.
+        print(f"  [moe_tt] uploading gate_up bf16 shape={list(W_in_4d.shape)} dtype={self.dtype}", flush=True)
+        gate_up_bf16 = ttnn.from_torch(
             W_in_4d,
-            device=self.device, dtype=self.dtype,
+            device=self.device, dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._ep_mapper,
         )
-        self.down_proj = ttnn.from_torch(
+        print(f"  [moe_tt] gate_up uploaded", flush=True)
+        if self.dtype != ttnn.bfloat16:
+            print(f"  [moe_tt] typecasting gate_up to {self.dtype}", flush=True)
+            self.gate_up_proj = ttnn.typecast(gate_up_bf16, self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            gate_up_bf16.deallocate(True)
+            print(f"  [moe_tt] gate_up typecast done", flush=True)
+        else:
+            self.gate_up_proj = gate_up_bf16
+
+        print(f"  [moe_tt] uploading down_proj bf16 shape={list(W_out_4d.shape)}", flush=True)
+        down_bf16 = ttnn.from_torch(
             W_out_4d,
-            device=self.device, dtype=self.dtype,
+            device=self.device, dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._ep_mapper,
         )
+        print(f"  [moe_tt] down_proj uploaded", flush=True)
+        if self.dtype != ttnn.bfloat16:
+            print(f"  [moe_tt] typecasting down_proj to {self.dtype}", flush=True)
+            self.down_proj = ttnn.typecast(down_bf16, self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            down_bf16.deallocate(True)
+            print(f"  [moe_tt] down_proj typecast done", flush=True)
+        else:
+            self.down_proj = down_bf16
 
     def compute_routing_cpu(self, hidden_states_tt):
         """
@@ -229,7 +252,7 @@ class GraniteTTMoE:
                 barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
                 num_links=self.tt_ccl.get_num_links(cluster_axis),
                 memory_config=memory_config,
-                topology=ttnn.Topology.Linear,
+                topology=self._topology,
                 chunks_per_sync=10,
                 num_workers_per_link=2,
                 num_buffers_per_channel=2,
@@ -255,10 +278,8 @@ class GraniteTTMoE:
         self._precomputed_routing = None  # consume it
         if routing_tt is None:
             if S == 1 and self._use_col_parallel:
-                # Decode with fabric: fully on-device routing avoids PCIe round-trip.
                 routing_tt = self.compute_routing_device(hidden_states_tt)
             else:
-                # Prefill or no-fabric: CPU routing (PCIe cost amortized, or fabric unavailable).
                 routing_tt = self.compute_routing_cpu(hidden_states_tt)
         # per device: routing_tt [1, E_local, S, 1]
 
@@ -295,36 +316,18 @@ class GraniteTTMoE:
         weighted_tt.deallocate(True)
 
         if self._use_col_parallel and self.effective_cols > 1:
+            # Single-row mesh (tiny): async col gather + sum.
             gathered_tt = self._all_gather(local_sum_tt, dim=1, cluster_axis=1, memory_config=MC)
             local_sum_tt.deallocate(True)
             result_tt = ttnn.sum(gathered_tt, dim=1, keepdim=True, memory_config=MC)
             gathered_tt.deallocate(True)
         elif not self._use_col_parallel and self.effective_cols > 1:
-            if self._use_row_reduce and S == 1:
-                row_gathered = self._all_gather(local_sum_tt, dim=1, cluster_axis=0, memory_config=MC)
-                local_sum_tt.deallocate(True)
-                col_sum_tt = ttnn.sum(row_gathered, dim=1, keepdim=True, memory_config=MC)
-                row_gathered.deallocate(True)
-                col_gathered = self._all_gather(col_sum_tt, dim=1, cluster_axis=1, memory_config=MC)
-                col_sum_tt.deallocate(True)
-                result_tt = ttnn.sum(col_gathered, dim=1, keepdim=True, memory_config=MC)
-                col_gathered.deallocate(True)
-            else:
-                # Multi-row mesh prefill or no-fabric: CPU reduce.
-                all_sums = ttnn.to_torch(
-                    local_sum_tt,
-                    mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0),
-                )
-                local_sum_tt.deallocate(True)
-                global_sum = all_sums.sum(dim=0, keepdim=True)
-                result_tt = ttnn.from_torch(
-                    global_sum,
-                    device=self.device,
-                    dtype=self.act_dtype,
-                    layout=ttnn.TILE_LAYOUT,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None,
-                )
+            # Multi-row mesh (small, 2×4): two-axis all_reduce, trace-safe.
+            # axis=1 reduces across 4 cols, axis=0 reduces across 2 rows.
+            after_cols = ttnn.all_reduce(local_sum_tt, cluster_axis=1, memory_config=MC)
+            local_sum_tt.deallocate(True)
+            result_tt = ttnn.all_reduce(after_cols, cluster_axis=0, memory_config=MC)
+            after_cols.deallocate(True)
         else:
             result_tt = local_sum_tt
 
