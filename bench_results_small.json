@@ -1,47 +1,47 @@
 {
   "model": "small",
-  "load_s": 121.78074336051941,
+  "load_s": 454.50581979751587,
   "num_devices": 8,
   "results": [
     {
       "prompt": "short_8",
       "tokens": 5,
-      "prefill_toks": 1.2526124064983952,
-      "decode_toks": 2.8456805137594015,
+      "prefill_toks": 1.3497451824604798,
+      "decode_toks": 2.982278981434277,
       "prompt_text": "The capital of France is",
       "response": " Paris."
     },
     {
       "prompt": "short_10",
       "tokens": 8,
-      "prefill_toks": 4.511376511430829,
-      "decode_toks": 4.740111010114147,
+      "prefill_toks": 4.8272500034167525,
+      "decode_toks": 4.9213976929774965,
       "prompt_text": "The largest planet in our solar system is",
-      "response": " Jupiter. It's so big that all the other planets could fit inside it!"
+      "response": " Jupiter, with a diameter of about 88.846 times that"
     },
     {
       "prompt": "medium_32",
       "tokens": 25,
-      "prefill_toks": 11.907648766969157,
-      "decode_toks": 4.739614805420204,
+      "prefill_toks": 12.67363648021636,
+      "decode_toks": 4.924400549933724,
       "prompt_text": "Artificial intelligence is transforming many industries. Machine learning models can now perform tasks that previously required human expertise, such as image recognition",
-      "response": " and natural language processing.\n\nHowever the rapid advancement of AI also raises important ethical questions about its impact on society"
+      "response": " and natural language processing.\n\nOne of the most exciting applications for AI in healthcare involves using deep neural networks to"
     },
     {
       "prompt": "long_128",
       "tokens": 96,
-      "prefill_toks": 45.302361082108625,
-      "decode_toks": 4.741953302680262,
+      "prefill_toks": 46.20481843652347,
+      "decode_toks": 4.972581788536582,
       "prompt_text": "Large language models have become increasingly capable over recent years. These models are trained on vast amounts of text data and can generate coherent, contextually appropriate responses across a wide range of topics. They are used in applications ranging from customer service chatbots to code generation tools, scientific research assistants, and creative writing aids. The architecture underlying most of these models is the transformer, which uses self-attention mechanisms to capture long-range dependencies in text. Recent hybrid architectures combine transformers with state-space models",
       "response": " or other components for improved efficiency.\n\nThe development process typically involves pre-training large neural networks using unsupervised"
     },
     {
       "prompt": "long_256",
       "tokens": 176,
-      "prefill_toks": 59.069268113129795,
-      "decode_toks": 4.726993326948751,
+      "prefill_toks": 60.39611575246803,
+      "decode_toks": 5.013689859049853,
       "prompt_text": "The field of natural language processing has undergone a remarkable transformation with the advent of large-scale pretrained language models. These systems, trained on hundreds of billions of tokens of text from the internet and other sources, have demonstrated surprising emergent capabilities including multi-step reasoning, in-context learning, and instruction following. The scaling laws governing these models suggest that performance on many tasks continues to improve predictably with increases in model size, dataset size, and compute budget. This has motivated the development of increasingly large models, from hundreds of millions to hundreds of billions of parameters. However, serving these models efficiently at inference time presents significant engineering challenges, particularly for applications requiring low latency responses. Speculative decoding, quantization, and hardware-specific optimizations are among the techniques used to address these challenges. Hybrid architectures that combine attention layers with state-space models like Mamba offer promising tradeoffs between computational efficiency and modeling capability",
-      "response": ".\n\nIn this talk I will discuss some recent advances along each dimension: (1) new hybrid generative"
+      "response": ".\n\nIn this talk I will give an overview about how we can use LLMs effectively while keeping them"
     }
   ]
 }

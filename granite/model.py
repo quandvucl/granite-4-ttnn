@@ -187,8 +187,11 @@ class TTGraniteMoeHybridForCausalLM:
             if verbose:
                 print(f"  Mesh device detected ({device.get_num_devices()} devices) - tensor parallelism enabled")
             self.tt_ccl = get_tt_ccl(device) if device.get_num_devices() > 1 else None
+            _ms = device.shape
+            self._is_multirow_mesh = _ms[0] > 1 and _ms[1] > 1
         else:
             self.tt_ccl = None
+            self._is_multirow_mesh = False
 
         # Initialize production-ready RMSNorm
         if verbose:
@@ -327,8 +330,6 @@ class TTGraniteMoeHybridForCausalLM:
         self._in_trace = False            # True only during begin/end_trace_capture and execute_trace
         if self.tt_ccl is not None: self.tt_ccl._in_trace = False
 
-        # Disable trace while validating on-device MoE reduce correctness.
-        self._disable_trace = True
 
 
         # Set sub-device stall group at init so all ops use the trace-compatible dispatch path.
@@ -443,8 +444,10 @@ class TTGraniteMoeHybridForCausalLM:
                     layer.simple_attention.update_decode_pos(start_pos)
 
         # ── Decode trace replay (fast path) ─────────────────────────
+        # Trace is broken on FABRIC_2D 2D mesh: all CCL ops route through composite_all_gather
+        # (all_broadcast + concat), and concat allocates dynamically — incompatible with trace.
         _trace_supported = (self.tt_ccl is not None and self.moe_use_all_gather
-                            and not getattr(self, '_disable_trace', False))
+                            and not self._is_multirow_mesh)
         _TRACE_DEBUG = getattr(self, '_trace_debug', False)
         if is_decode and not _state_only and _trace_supported and self._decode_trace_id is not None:
             new_input = ttnn.from_torch(
@@ -457,7 +460,15 @@ class TTGraniteMoeHybridForCausalLM:
             # Sync so copy_host_to_device_tensor (_cur_pos_tt) is flushed before replay.
             ttnn.synchronize_device(self.device)
             self._in_trace = True
-            if self.tt_ccl is not None: self.tt_ccl._in_trace = True
+            if self.tt_ccl is not None:
+                self.tt_ccl._in_trace = True
+                # Restore index-0 so replay uses the same handles baked in during capture.
+                if hasattr(self.tt_ccl, 'reset_semaphore_indices'):
+                    self.tt_ccl.reset_semaphore_indices()
+                else:
+                    self.tt_ccl.barrier_semaphore_idx = [0, 0, 0]
+                    self.tt_ccl.ag_semaphores_idx = [0, 0, 0]
+                    self.tt_ccl.rs_semaphores_idx = [0, 0, 0]
             ttnn.execute_trace(self.device, self._decode_trace_id, cq_id=0, blocking=False)
             ttnn.synchronize_device(self.device)
             self._in_trace = False
@@ -544,7 +555,7 @@ class TTGraniteMoeHybridForCausalLM:
         incremented. Call this once after warmup; forward() will auto-replay.
         """
         _trace_supported = (self.tt_ccl is not None and self.moe_use_all_gather
-                            and not getattr(self, '_disable_trace', False))
+                            and not self._is_multirow_mesh)
         if not _trace_supported:
             print(f"  [trace] SKIPPED: tt_ccl={self.tt_ccl is not None} moe_all_gather={self.moe_use_all_gather}", flush=True)
             return
@@ -628,7 +639,16 @@ class TTGraniteMoeHybridForCausalLM:
         ttnn.end_trace_capture(self.device, _trace_id, cq_id=0)
         self._decode_trace_id = _trace_id
         self._in_trace = False
-        if self.tt_ccl is not None: self.tt_ccl._in_trace = False
+        if self.tt_ccl is not None:
+            self.tt_ccl._in_trace = False
+            # Reset indices so replays always use the same index-0 semaphore handles
+            # that were baked in during capture.
+            if hasattr(self.tt_ccl, 'reset_semaphore_indices'):
+                self.tt_ccl.reset_semaphore_indices()
+            else:
+                self.tt_ccl.barrier_semaphore_idx = [0, 0, 0]
+                self.tt_ccl.ag_semaphores_idx = [0, 0, 0]
+                self.tt_ccl.rs_semaphores_idx = [0, 0, 0]
         print(f"  [trace] capture done, trace_id={_trace_id}", flush=True)
 
     def _extract_logits(self, logits_tt):
