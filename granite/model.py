@@ -444,8 +444,9 @@ class TTGraniteMoeHybridForCausalLM:
                     layer.simple_attention.update_decode_pos(start_pos)
 
         # ── Decode trace replay (fast path) ─────────────────────────
-        # Trace is broken on FABRIC_2D 2D mesh: all CCL ops route through composite_all_gather
-        # (all_broadcast + concat), and concat allocates dynamically — incompatible with trace.
+        # Trace requires single-row mesh: on FABRIC_2D, is_true_2d_mesh() checks mesh_shape[0]>1.
+        # Single-row (1xN): composite bypassed → all_gather_async is trace-safe.
+        # Multi-row (MxN, M>1): composite triggered → concat dynamic alloc → not trace-safe.
         _trace_supported = (self.tt_ccl is not None and self.moe_use_all_gather
                             and not self._is_multirow_mesh)
         _TRACE_DEBUG = getattr(self, '_trace_debug', False)
@@ -557,7 +558,8 @@ class TTGraniteMoeHybridForCausalLM:
         _trace_supported = (self.tt_ccl is not None and self.moe_use_all_gather
                             and not self._is_multirow_mesh)
         if not _trace_supported:
-            print(f"  [trace] SKIPPED: tt_ccl={self.tt_ccl is not None} moe_all_gather={self.moe_use_all_gather}", flush=True)
+            print(f"  [trace] SKIPPED: tt_ccl={self.tt_ccl is not None} "
+                  f"moe_all_gather={self.moe_use_all_gather} multirow={self._is_multirow_mesh}", flush=True)
             return
         if self._decode_trace_id is not None:
             print(f"  [trace] already captured, skipping", flush=True)

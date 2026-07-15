@@ -74,7 +74,7 @@ MESH_SHAPE_MAP = {
     4:  ttnn.MeshShape(1, 4),
     8:  ttnn.MeshShape(2, 4),
     16: ttnn.MeshShape(4, 4),
-    32: ttnn.MeshShape(4, 8),
+    32: ttnn.MeshShape(8, 4),
 }
 
 

@@ -4,10 +4,24 @@ TTNN MoE for GraniteMoeHybrid — expert-parallel sharding across mesh devices.
 1×4 tiny (single-row): ShardTensor2dMesh(dims=(None,1)), 9 experts/col.
   Reduce: all_gather_async(cluster_axis=1, Linear) + sum. Trace-safe.
 2×4 small (multi-row): ShardTensorToMesh(dim=1), 9 experts/device.
-  Reduce: all_gather_async(cluster_axis=1) + sum → all_gather_async(cluster_axis=0) + sum.
-  Both trace-safe on FABRIC_1D_RING (composite path only triggers on FABRIC_2D).
-Decode router: on-device (topk+softmax+embedding, no PCIe). Trace-safe.
-Prefill router: CPU (PCIe cost amortized over S tokens).
+  Reduce: ttnn.all_reduce(cluster_axis=1) + ttnn.all_reduce(cluster_axis=0).
+  Not trace-safe on FABRIC_2D 2D mesh (composite_all_gather → dynamic concat alloc).
+
+Decode router (S=1): on-device topk+softmax+embedding, no PCIe. Both tiny and small.
+
+  Tiny path: embed into full [E,E] eye (replicated) → [top_k, E] one-hots → sum →
+    [1,1,1,E] → linear with ShardTensor2dMesh(dims=(None,1)) proj [E,E_local].
+    ShardTensor2dMesh gives TTNN col-parallel context → correct independent output.
+
+  Small path: embed directly into sharded [E, E_local] eye per device.
+    ShardTensorToMesh(dim=1) on eye[E,E] → device d holds eye[:, d*E_local:(d+1)*E_local].
+    Embedding is a row-lookup (not a matmul) — no collective op triggered.
+    Each device independently extracts its own E_local routing weights.
+
+  linear(replicated, flat-sharded) is avoided for small: on a 2D mesh TTNN applies
+  TP all-reduce semantics to matmul, collapsing all-devices to device-0 result.
+
+Prefill router (S>1): CPU (PCIe cost amortized over S tokens).
 """
 
 import torch
@@ -102,21 +116,35 @@ class GraniteTTMoE:
         self._load_routing_matrices(replicate_mapper)
 
     def _load_routing_matrices(self, replicate_mapper):
-        E = self.num_experts
-        eye = torch.eye(E, dtype=torch.bfloat16)
-        # Replicated [E, E] identity in ROW_MAJOR for embedding lookup (all devices need all rows).
-        self._routing_eye_tt = ttnn.from_torch(
-            eye, device=self.device, dtype=ttnn.bfloat16,
-            layout=ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=replicate_mapper,
-        )
-        # Column-sharded [E, E_local] identity for routing projection: [1,E] @ [E,E_local] = [1,E_local].
-        # Using _ep_mapper ensures the col sharding matches the expert weight sharding.
-        self._routing_proj_tt = ttnn.from_torch(
-            eye, device=self.device, dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=self._ep_mapper,
-        )
+        E       = self.num_experts
+        E_local = self.experts_per_device
+        eye     = torch.eye(E, dtype=torch.bfloat16)
+
+        if self._is_multirow:
+            # Small (2×4 flat EP): embedding table is sharded per device.
+            # ShardTensorToMesh(dim=1) on eye[E,E] → device d gets eye[:, d*E_local:(d+1)*E_local]
+            # shape [E, E_local]. Embedding is a row-lookup with no collective — each device
+            # independently returns its local routing slice. No linear projection needed.
+            self._routing_eye_tt = ttnn.from_torch(
+                eye, device=self.device, dtype=ttnn.bfloat16,
+                layout=ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=self._ep_mapper,
+            )
+            self._routing_proj_tt = None  # not used for multirow
+        else:
+            # Tiny (1×4 col-parallel) and single-device: replicated full [E,E] eye.
+            self._routing_eye_tt = ttnn.from_torch(
+                eye, device=self.device, dtype=ttnn.bfloat16,
+                layout=ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=replicate_mapper,
+            )
+            # [E, E_local] projection for col-parallel: ShardTensor2dMesh gives TTNN
+            # the col-parallel context so linear(replicated, col-sharded) is correct.
+            self._routing_proj_tt = ttnn.from_torch(
+                eye, device=self.device, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=self._ep_mapper,
+            )
 
     def _load_weights(self):
         W_in_4d  = self.hf_moe.input_linear.weight.to(torch.bfloat16).transpose(1, 2).contiguous().unsqueeze(0)
@@ -189,11 +217,18 @@ class GraniteTTMoE:
     def compute_routing_device(self, hidden_states_tt):
         """
         Fully on-device routing for decode (S=1). Returns [1, E_local, 1, 1] per device.
-        Uses topk + softmax + embedding-scatter to avoid PCIe round-trip.
+        Uses topk + softmax + embedding to avoid PCIe round-trip.
+
+        Tiny (col-parallel): embedding table is replicated [E,E]; embed → [top_k,E] one-hots
+          → sum → [1,1,1,E] → linear with ShardTensor2dMesh proj → [1,1,1,E_local] per device.
+
+        Small (multirow, flat EP): embedding table is sharded [E,E_local] per device.
+          Embedding row-lookup returns [top_k, E_local] directly for each device — indices are
+          replicated (from replicated logits+topk), table differs per device, no collective.
+          Sum top_k rows → [1,1,1,E_local] per device. No linear projection.
         """
-        E       = self.num_experts
         E_local = self.experts_per_device
-        L1 = ttnn.L1_MEMORY_CONFIG
+        L1      = ttnn.L1_MEMORY_CONFIG
 
         logits_tt = ttnn.linear(
             hidden_states_tt, self.router_weight_tt,
@@ -212,6 +247,7 @@ class GraniteTTMoE:
         idxs_2d = ttnn.reshape(idxs_u32, [1, self.top_k])
         idxs_u32.deallocate(True)
 
+        # embed: [1, top_k] indices → [1, top_k, E_local] (multirow) or [1, top_k, E] (col-parallel)
         onehot_tt = ttnn.embedding(
             idxs_2d, self._routing_eye_tt,
             layout=ttnn.TILE_LAYOUT, memory_config=L1,
@@ -225,19 +261,28 @@ class GraniteTTMoE:
         onehot_tt.deallocate(True)
         weights_3d.deallocate(True)
 
-        scaled_4d = ttnn.reshape(scaled_tt, [1, 1, self.top_k, E])
-        scaled_tt.deallocate(True)
-        routing_4d = ttnn.sum(scaled_4d, dim=2, keepdim=True, memory_config=L1)
-        scaled_4d.deallocate(True)
+        if self._is_multirow:
+            # scaled_tt: [1, top_k, E_local] — sum over top_k dimension directly
+            routing_local = ttnn.sum(scaled_tt, dim=1, keepdim=False, memory_config=L1)
+            scaled_tt.deallocate(True)
+            routing_tt = ttnn.reshape(routing_local, [1, E_local, 1, 1])
+            routing_local.deallocate(True)
+        else:
+            # col-parallel: scaled_tt [1, top_k, E] → sum → [1,1,1,E] → linear proj → [1,1,1,E_local]
+            E = self.num_experts
+            scaled_4d = ttnn.reshape(scaled_tt, [1, 1, self.top_k, E])
+            scaled_tt.deallocate(True)
+            routing_4d = ttnn.sum(scaled_4d, dim=2, keepdim=True, memory_config=L1)
+            scaled_4d.deallocate(True)
 
-        routing_local = ttnn.linear(
-            routing_4d, self._routing_proj_tt,
-            dtype=ttnn.bfloat16, memory_config=L1,
-        )
-        routing_4d.deallocate(True)
+            routing_local = ttnn.linear(
+                routing_4d, self._routing_proj_tt,
+                dtype=ttnn.bfloat16, memory_config=L1,
+            )
+            routing_4d.deallocate(True)
+            routing_tt = ttnn.reshape(routing_local, [1, E_local, 1, 1])
+            routing_local.deallocate(True)
 
-        routing_tt = ttnn.reshape(routing_local, [1, E_local, 1, 1])
-        routing_local.deallocate(True)
         return routing_tt
 
     def _all_gather_col(self, x, dim, memory_config):
@@ -295,7 +340,7 @@ class GraniteTTMoE:
             routing_tt = getattr(self, '_precomputed_routing', None)
         self._precomputed_routing = None
         if routing_tt is None:
-            if S == 1 and self._use_col_parallel:
+            if S == 1 and (self._use_col_parallel or self._is_multirow):
                 routing_tt = self.compute_routing_device(hidden_states_tt)
             else:
                 routing_tt = self.compute_routing_cpu(hidden_states_tt)
@@ -339,10 +384,10 @@ class GraniteTTMoE:
             result_tt = ttnn.sum(gathered_tt, dim=1, keepdim=True, memory_config=MC)
             gathered_tt.deallocate(True)
         elif self._is_multirow and self.effective_devs > 1:
-            # Multi-row (small, 2×4): ttnn.all_reduce for each axis.
-            # all_gather_async goes through composite_all_gather on FABRIC_2D 2D mesh
-            # (broken: concat is not trace-safe). ttnn.all_reduce also uses composite
-            # internally but is correct in non-trace mode.
+            # Multi-row (small, 2×4 on FABRIC_2D): ttnn.all_reduce, non-trace only.
+            # all_gather_async → composite_all_gather (FABRIC_2D 2D mesh) → concat not trace-safe.
+            # ttnn.all_reduce also uses composite internally but is correct non-trace.
+            # Trace is disabled for multirow in model.py (_is_multirow_mesh check).
             after_cols = ttnn.all_reduce(local_sum_tt, cluster_axis=1, memory_config=MC)
             local_sum_tt.deallocate(True)
             result_tt = ttnn.all_reduce(after_cols, cluster_axis=0, memory_config=MC)
