@@ -33,13 +33,14 @@ class ReplicatedMLP:
         self.dtype = dtype
 
     def forward(self, x: "ttnn.Tensor", mode=None) -> "ttnn.Tensor":
-        gate = ttnn.linear(x, self.w1, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        up   = ttnn.linear(x, self.w3, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        gate = ttnn.silu(gate, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        mid  = ttnn.mul(gate, up, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        MC = ttnn.L1_MEMORY_CONFIG
+        gate = ttnn.linear(x, self.w1, dtype=self.dtype, memory_config=MC)
+        up   = ttnn.linear(x, self.w3, dtype=self.dtype, memory_config=MC)
+        gate = ttnn.silu(gate, memory_config=MC)
+        mid  = ttnn.mul(gate, up, memory_config=MC)
         gate.deallocate(True)
         up.deallocate(True)
-        out  = ttnn.linear(mid, self.w2, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        out  = ttnn.linear(mid, self.w2, dtype=self.dtype, memory_config=MC)
         mid.deallocate(True)
         return out
 
@@ -53,17 +54,18 @@ class ColumnParallelMLP:
     Rows receive replicated shards, so no row all_gather is needed.
     """
 
-    def __init__(self, w1, w2, w3, num_cols, dtype, tt_ccl=None):
+    def __init__(self, w1, w2, w3, num_cols, dtype, tt_ccl=None, cluster_axis=1):
         self.w1 = w1
         self.w3 = w3
         self.w2 = w2
         self.num_cols = num_cols
         self.dtype = dtype
         self.tt_ccl = tt_ccl
+        self._cluster_axis = cluster_axis
         self._topology = ttnn.Topology.Linear
 
     def forward(self, x, mode=None):
-        MC = ttnn.DRAM_MEMORY_CONFIG
+        MC = ttnn.L1_MEMORY_CONFIG
         gate = ttnn.linear(x, self.w1, dtype=self.dtype, memory_config=MC)
         up   = ttnn.linear(x, self.w3, dtype=self.dtype, memory_config=MC)
         gate = ttnn.silu(gate, memory_config=MC)
@@ -73,22 +75,23 @@ class ColumnParallelMLP:
         out = ttnn.linear(mid, self.w2, dtype=self.dtype, memory_config=MC)
         mid.deallocate(True)
         if self.num_cols > 1:
+            ax = self._cluster_axis
             if self.tt_ccl is not None:
                 gathered = ttnn.experimental.all_gather_async(
                     out,
                     persistent_output_buffer=None,
-                    dim=1, cluster_axis=1,
-                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(1),
-                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(1),
-                    num_links=self.tt_ccl.get_num_links(1),
+                    dim=1, cluster_axis=ax,
+                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(ax),
+                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(ax),
+                    num_links=self.tt_ccl.get_num_links(ax),
                     memory_config=MC,
                     topology=self._topology,
-                    chunks_per_sync=10,
-                    num_workers_per_link=2,
+                    chunks_per_sync=1,
+                    num_workers_per_link=1,
                     num_buffers_per_channel=2,
                 )
             else:
-                gathered = ttnn.all_gather(out, dim=1, cluster_axis=1, memory_config=MC)
+                gathered = ttnn.all_gather(out, dim=1, cluster_axis=ax, memory_config=MC)
             out.deallocate(True)
             out = ttnn.sum(gathered, dim=1, keepdim=True, memory_config=MC)
             gathered.deallocate(True)
@@ -231,10 +234,9 @@ class TTGraniteMoeHybridForCausalLM:
             up_weight = input_linear_t[:, actual_intermediate_size:].contiguous()
             down_weight = output_linear_weight_hf.T.contiguous()
 
-            # Enable column-parallel MLP for meshes with > 4 devices (small model, 2×4).
-            # Tiny model (1×4): replicated weights fit; TP disabled (all_gather latency
-            # exceeds savings at H=1536). Small model (2×4): TP required — full
-            # replication would OOM 12 GB per-chip DRAM.
+            # Enable column-parallel MLP for meshes with >= 4 devices.
+            # Small on 4 dev (H=4096, F=1536): 40×37.7 MB replicated = 1.5 GB — needs TP.
+            # Tiny (H=1536, F=768, 4 devices): TP also works (F/4=384, divisible).
             _num_dev = device.get_num_devices() if is_mesh else 1
             use_tensor_parallel = is_mesh and _num_dev > 4
             dtype = config.get_ttnn_dtype()
@@ -242,35 +244,41 @@ class TTGraniteMoeHybridForCausalLM:
             if use_tensor_parallel:
                 mesh_shape = device.shape
                 num_cols = mesh_shape[1]
-                # Shard F-dim across cols only; rows replicate.
-                # Use actual mesh shape — TTNN requires dims match the full mesh.
-                # dims=(None, 1): replicate across rows, shard dim 1 across cols.
+                num_rows = mesh_shape[0]
                 F = gate_weight.shape[1]
-                if F % num_cols == 0:
-                    col_mapper = ttnn.ShardTensor2dMesh(device, dims=(None, 1), mesh_shape=mesh_shape)
-                    row_mapper = ttnn.ShardTensor2dMesh(device, dims=(None, 0), mesh_shape=mesh_shape)
-
-                    def _upload_col(t):
+                # Only shard shared MLP across cols (N×M mesh, M>1).
+                # 8×1: num_cols=1 → replicated (no TP for shared MLP on row-only mesh).
+                # Replicated is faster: matmul at F=192/device underutilizes Tensix cores,
+                # and 40 all_gather calls/step exceed savings vs replicated at F=1536.
+                if num_cols == 1:
+                    use_tensor_parallel = False
+                else:
+                    num_tp, cluster_axis = num_cols, 1
+                    fwd_mapper = ttnn.ShardTensor2dMesh(device, dims=(None, 1), mesh_shape=mesh_shape)
+                    rev_mapper = ttnn.ShardTensor2dMesh(device, dims=(None, 0), mesh_shape=mesh_shape)
+                if use_tensor_parallel and F % num_tp == 0:
+                    def _upload_fwd(t):
                         return ttnn.from_torch(
                             t, device=device, dtype=dtype,
                             layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                            mesh_mapper=col_mapper,
+                            mesh_mapper=fwd_mapper,
                         )
 
-                    def _upload_row(t):
+                    def _upload_rev(t):
                         return ttnn.from_torch(
                             t, device=device, dtype=dtype,
                             layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                            mesh_mapper=row_mapper,
+                            mesh_mapper=rev_mapper,
                         )
 
                     layer_mlp = ColumnParallelMLP(
-                        w1=_upload_col(gate_weight),
-                        w2=_upload_row(down_weight),
-                        w3=_upload_col(up_weight),
-                        num_cols=num_cols,
+                        w1=_upload_fwd(gate_weight),
+                        w2=_upload_rev(down_weight),
+                        w3=_upload_fwd(up_weight),
+                        num_cols=num_tp,
                         dtype=dtype,
                         tt_ccl=self.tt_ccl,
+                        cluster_axis=cluster_axis,
                     )
                 else:
                     use_tensor_parallel = False  # fallthrough to replicated
@@ -444,9 +452,9 @@ class TTGraniteMoeHybridForCausalLM:
                     layer.simple_attention.update_decode_pos(start_pos)
 
         # ── Decode trace replay (fast path) ─────────────────────────
-        # Trace requires single-row mesh: on FABRIC_2D, is_true_2d_mesh() checks mesh_shape[0]>1.
-        # Single-row (1xN): composite bypassed → all_gather_async is trace-safe.
-        # Multi-row (MxN, M>1): composite triggered → concat dynamic alloc → not trace-safe.
+        # Trace requires mesh_shape[1]==1 or mesh_shape[0]==1 (not both >1).
+        # is_true_2d_mesh() = mesh[0]>1 && mesh[1]>1 → composite_all_gather (dynamic alloc).
+        # Tiny 1×4: mesh[0]=1 → safe. Small 8×1: mesh[1]=1 → safe. 2×4 would not be safe.
         _trace_supported = (self.tt_ccl is not None and self.moe_use_all_gather
                             and not self._is_multirow_mesh)
         _TRACE_DEBUG = getattr(self, '_trace_debug', False)
@@ -458,8 +466,6 @@ class TTGraniteMoeHybridForCausalLM:
             )
             ttnn.assign(new_input, self._decode_trace_input)
             new_input.deallocate(True)
-            # Sync so copy_host_to_device_tensor (_cur_pos_tt) is flushed before replay.
-            ttnn.synchronize_device(self.device)
             self._in_trace = True
             if self.tt_ccl is not None:
                 self.tt_ccl._in_trace = True

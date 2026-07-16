@@ -122,10 +122,8 @@ class TTGraniteDecoderLayer:
         else:
             self.simple_attention = None
             if hasattr(hf_layer, "mamba") and use_tt_mamba:
-                # Tiny (H=1536, 4 chips): replicated weights fit in DRAM; TP disabled —
-                # all_gather latency exceeds compute savings at this size.
-                # Small (H=4096, 8 chips): TP required — full replication would OOM
-                # the 12 GB per-chip DRAM (36 layers × 64 MB out_proj × 8 devices = 18 GB).
+                # Small on 4 dev (H=4096): replicated = 3.5 GB bf8 → OOM. TP required.
+                # Tiny (H=1536, 4 devices): TP also works; unified threshold with MLP.
                 _num_dev = device.get_num_devices() if self.is_mesh else 1
                 _mamba_tp = self.is_mesh and _num_dev > 4
                 self.mamba = TensorParallelMamba(

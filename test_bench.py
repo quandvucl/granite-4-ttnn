@@ -72,7 +72,7 @@ MESH_SHAPE_MAP = {
     1:  ttnn.MeshShape(1, 1),
     2:  ttnn.MeshShape(1, 2),
     4:  ttnn.MeshShape(1, 4),
-    8:  ttnn.MeshShape(2, 4),
+    8:  ttnn.MeshShape(8, 1),
     16: ttnn.MeshShape(4, 4),
     32: ttnn.MeshShape(8, 4),
 }
@@ -124,9 +124,10 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             use_tt_moe=True,
             mamba_chunk_size=256 if num_devices >= 4 else None,
             max_cache_length=512,
-            # bfloat8_b required for both models: small model MoE bfloat16 would
-            # consume ~9 GB/device, leaving no room for Mamba weights on 12 GB DRAM.
+            # bfloat8_b required for both: on 4 devices Mamba is replicated (no TP),
+            # each device holds full Mamba weights — bfloat16 OOMs 12 GB DRAM.
             moe_weight_dtype=ttnn.bfloat8_b,
+            mamba_weight_dtype=None,
             moe_use_all_gather=use_all_gather,
         )
         load_s = time.time() - t_load0

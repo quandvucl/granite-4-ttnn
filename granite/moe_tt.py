@@ -1,11 +1,11 @@
 """
 TTNN MoE for GraniteMoeHybrid — expert-parallel sharding across mesh devices.
 
-1×4 tiny (single-row): ShardTensor2dMesh(dims=(None,1)), 9 experts/col.
+1×4 tiny (4 devices): ShardTensor2dMesh(dims=(None,1)), 9 experts/device.
   Reduce: all_gather_async(cluster_axis=1, Linear) + sum. Trace-safe.
-2×4 small (multi-row): ShardTensorToMesh(dim=1), 9 experts/device.
-  Reduce: ttnn.all_reduce(cluster_axis=1) + ttnn.all_reduce(cluster_axis=0).
-  Not trace-safe on FABRIC_2D 2D mesh (composite_all_gather → dynamic concat alloc).
+8×1 small (8 devices): ShardTensorToMesh(dim=1), 9 experts/device.
+  Reduce: all_gather_async(cluster_axis=0, Linear) + sum. Trace-safe.
+  MeshShape(8,1): mesh_shape[1]=1 → is_true_2d_mesh()=false → composite_all_gather bypassed.
 
 Decode router (S=1): on-device topk+softmax+embedding, no PCIe. Both tiny and small.
 
@@ -56,16 +56,10 @@ class GraniteTTMoE:
             self._mesh_rows = 1
             self._mesh_cols = 1
 
-        # EP sharding strategy:
-        #
-        # Single-row (tiny, 1×4): col-parallel EP.
-        #   Shard experts across 4 cols (9/device); all_gather_async(axis=1)+sum.
-        #
-        # Multi-row (small, 2×4): flat EP across all 8 devices (9/device).
-        #   ShardTensorToMesh(dim=1) maps experts 0..8→dev0, 9..17→dev1, ...
-        #   Col reduce: all_gather_async(cluster_axis=1)+sum.
-        #   Row reduce: all_gather_async(cluster_axis=0)+sum.
-        #   Both trace-safe on FABRIC_1D_RING (composite bypassed, semaphores pre-allocated).
+        # EP sharding:
+        #   Tiny (1×4): ShardTensor2dMesh(dims=(None,1)), 9 experts/device, all_gather(axis=1).
+        #   Small (8×1): ShardTensorToMesh(dim=1), 9 experts/device, all_gather(axis=0).
+        #   Both trace-safe: single-axis mesh → is_true_2d_mesh()=false → no composite path.
         self._use_col_parallel = (self._mesh_rows == 1) and self.num_devices > 1 and use_all_gather
         self._is_multirow = (self._mesh_rows > 1) and self.num_devices > 1 and use_all_gather
 
@@ -286,7 +280,7 @@ class GraniteTTMoE:
         return routing_tt
 
     def _all_gather_col(self, x, dim, memory_config):
-        """All-gather along column axis (cluster_axis=1). Trace-safe on FABRIC_1D_RING."""
+        """All-gather along column axis (cluster_axis=1). Trace-safe on single-row mesh."""
         if self.tt_ccl is not None:
             return ttnn.experimental.all_gather_async(
                 x,
@@ -298,14 +292,14 @@ class GraniteTTMoE:
                 num_links=self.tt_ccl.get_num_links(1),
                 memory_config=memory_config,
                 topology=self._topology,
-                chunks_per_sync=10,
-                num_workers_per_link=2,
+                chunks_per_sync=1,
+                num_workers_per_link=1,
                 num_buffers_per_channel=2,
             )
         return ttnn.all_gather(x, dim=dim, cluster_axis=1, memory_config=memory_config)
 
     def _all_gather_row(self, x, dim, memory_config):
-        """All-gather along row axis (cluster_axis=0). Trace-safe on FABRIC_1D_RING."""
+        """All-gather along row axis (cluster_axis=0). Trace-safe on single-row mesh."""
         if self.tt_ccl is not None:
             return ttnn.experimental.all_gather_async(
                 x,
@@ -317,8 +311,8 @@ class GraniteTTMoE:
                 num_links=self.tt_ccl.get_num_links(0),
                 memory_config=memory_config,
                 topology=self._topology,
-                chunks_per_sync=10,
-                num_workers_per_link=2,
+                chunks_per_sync=1,
+                num_workers_per_link=1,
                 num_buffers_per_channel=2,
             )
         return ttnn.all_gather(x, dim=dim, cluster_axis=0, memory_config=memory_config)
@@ -384,14 +378,18 @@ class GraniteTTMoE:
             result_tt = ttnn.sum(gathered_tt, dim=1, keepdim=True, memory_config=MC)
             gathered_tt.deallocate(True)
         elif self._is_multirow and self.effective_devs > 1:
-            # Multi-row (small, 2×4 on FABRIC_2D): ttnn.all_reduce, non-trace only.
-            # all_gather_async → composite_all_gather (FABRIC_2D 2D mesh) → concat not trace-safe.
-            # ttnn.all_reduce also uses composite internally but is correct non-trace.
-            # Trace is disabled for multirow in model.py (_is_multirow_mesh check).
-            after_cols = ttnn.all_reduce(local_sum_tt, cluster_axis=1, memory_config=MC)
-            local_sum_tt.deallocate(True)
-            result_tt = ttnn.all_reduce(after_cols, cluster_axis=0, memory_config=MC)
-            after_cols.deallocate(True)
+            if self._mesh_cols == 1:
+                # 8×1 mesh: gather along rows, trace-safe (mesh_shape[1]=1 → not is_true_2d_mesh).
+                gathered_tt = self._all_gather_row(local_sum_tt, dim=1, memory_config=MC)
+                local_sum_tt.deallocate(True)
+                result_tt = ttnn.sum(gathered_tt, dim=1, keepdim=True, memory_config=MC)
+                gathered_tt.deallocate(True)
+            else:
+                # 2×4 mesh: all_reduce, non-trace (FABRIC_2D + is_true_2d_mesh).
+                after_cols = ttnn.all_reduce(local_sum_tt, cluster_axis=1, memory_config=MC)
+                local_sum_tt.deallocate(True)
+                result_tt = ttnn.all_reduce(after_cols, cluster_axis=0, memory_config=MC)
+                after_cols.deallocate(True)
         else:
             result_tt = local_sum_tt
 

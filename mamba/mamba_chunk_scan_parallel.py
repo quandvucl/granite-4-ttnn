@@ -109,27 +109,28 @@ class TensorParallelMamba:
         replicate_mapper = self.mesh_mapper
 
         if self.is_mesh and self.num_devices > 1 and self.tensor_parallel:
-            # Column-parallel: shard the output dim across mesh columns only.
-            # Rows receive replicated shards; a single all_gather(cluster_axis=1)
-            # over columns suffices. Using (1, num_cols) keeps rows out of the
-            # sharding logic regardless of mesh row count.
             mesh_shape = self.device.shape
-            # Use the actual device shape so TTNN maps devices correctly.
-            # dims=(None, -1): replicate across rows, shard last dim across cols.
-            col_mapper = ttnn.ShardTensor2dMesh(
-                self.device, dims=(None, -1), mesh_shape=mesh_shape
-            )
+            num_cols = mesh_shape[1]
+            # 8×1 mesh: shard last dim across rows (cluster_axis=0).
+            # N×M mesh (M>1): shard last dim across cols (cluster_axis=1).
+            if num_cols == 1:
+                tp_mapper = ttnn.ShardTensor2dMesh(self.device, dims=(-1, None), mesh_shape=mesh_shape)
+                self._tp_cluster_axis = 0
+            else:
+                tp_mapper = ttnn.ShardTensor2dMesh(self.device, dims=(None, -1), mesh_shape=mesh_shape)
+                self._tp_cluster_axis = 1
             in_t  = self.hf_mamba.in_proj.weight.T.contiguous().unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
             out_t = self.hf_mamba.out_proj.weight.T.contiguous().unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
             self.in_proj_weight_tt = ttnn.from_torch(
                 in_t, dtype=self.weight_dtype, layout=ttnn.TILE_LAYOUT,
-                device=self.device, mesh_mapper=col_mapper,
+                device=self.device, mesh_mapper=tp_mapper,
             )
             self.out_proj_weight_tt = ttnn.from_torch(
                 out_t, dtype=self.weight_dtype, layout=ttnn.TILE_LAYOUT,
-                device=self.device, mesh_mapper=col_mapper,
+                device=self.device, mesh_mapper=tp_mapper,
             )
         else:
+            self._tp_cluster_axis = 1
             self.in_proj_weight_tt = to_tt_tensor(
                 self.hf_mamba.in_proj.weight.T.contiguous(),
                 self.device, self.weight_dtype, layout=ttnn.TILE_LAYOUT,
@@ -258,8 +259,8 @@ class TensorParallelMamba:
                 num_links=self.tt_ccl.get_num_links(cluster_axis),
                 memory_config=memory_config,
                 topology=self._topology,
-                chunks_per_sync=10,
-                num_workers_per_link=2,
+                chunks_per_sync=1,
+                num_workers_per_link=1,
                 num_buffers_per_channel=2,
             )
         return ttnn.all_gather(x, dim=dim, cluster_axis=cluster_axis,
@@ -288,7 +289,7 @@ class TensorParallelMamba:
         if _owns_hidden_tt:
             hidden_tt.deallocate(True)
         if self._use_col_parallel:
-            projected_tt = self._all_gather(projected_tt, dim=3, cluster_axis=1,
+            projected_tt = self._all_gather(projected_tt, dim=3, cluster_axis=self._tp_cluster_axis,
                                             memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
         padded_s = projected_tt.shape[2]
@@ -385,7 +386,7 @@ class TensorParallelMamba:
         output_tt = ttnn.matmul(gated_tt, self.out_proj_weight_tt)
         gated_tt.deallocate(True)
         if self._use_col_parallel:
-            output_tt = self._all_gather(output_tt, dim=3, cluster_axis=1,
+            output_tt = self._all_gather(output_tt, dim=3, cluster_axis=self._tp_cluster_axis,
                                          memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
         output_tt = ttnn.reshape(output_tt, [1, 1, seq_len, self.hidden_size])
@@ -690,7 +691,7 @@ class TensorParallelMamba:
             dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         if self._use_col_parallel:
-            projected_tt = self._all_gather(projected_tt, dim=3, cluster_axis=1,
+            projected_tt = self._all_gather(projected_tt, dim=3, cluster_axis=self._tp_cluster_axis,
                                             memory_config=ttnn.DRAM_MEMORY_CONFIG)
         gate_tt = projected_tt[:, :, :, :inter]
         xBC_tt  = projected_tt[:, :, :, inter:inter + conv_dim]
@@ -766,6 +767,6 @@ class TensorParallelMamba:
         )
         scan_tt.deallocate(True)
         if self._use_col_parallel:
-            output_tt = self._all_gather(output_tt, dim=3, cluster_axis=1,
+            output_tt = self._all_gather(output_tt, dim=3, cluster_axis=self._tp_cluster_axis,
                                          memory_config=ttnn.DRAM_MEMORY_CONFIG)
         return output_tt
