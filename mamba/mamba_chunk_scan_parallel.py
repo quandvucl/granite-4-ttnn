@@ -489,10 +489,13 @@ class TensorParallelMamba:
 
         states_tt = ttnn.reshape(states_tt, [B_sz, C_n, H, Dh, N])
 
+        # Reshape self._ssm_state_tt to [B,1,H,Dh,N] for concat. We do NOT call
+        # deallocate on the reshape view — we deallocate the reshaped handle only after
+        # concat, keeping self._ssm_state_tt's underlying buffer intact.
         prev_tt = ttnn.reshape(self._ssm_state_tt, [B_sz, 1, H, Dh, N])
         states_tt = ttnn.concat([prev_tt, states_tt], dim=1,
                                 memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        prev_tt.deallocate(True)
+        # Do NOT deallocate prev_tt here — it shares self._ssm_state_tt's buffer.
 
         A_cumsum_last_tt = A_cumsum_tt[:, :, :, cs-1]
         A_cumsum_padded_tt = ttnn.concat([self._seg_zero_col_tt, A_cumsum_last_tt], dim=2,
@@ -513,15 +516,17 @@ class TensorParallelMamba:
         dc_tt.deallocate(True); st_tt.deallocate(True)
 
         new_states_tt = ttnn.reshape(new_states_tt, [B_sz, H, C_n + 1, Dh, N])
-        states_tt    = new_states_tt[:, :, :C_n, :, :]
-        ssm_state_tt = new_states_tt[:, :, C_n:, :, :]
+        # permute materializes a new owning tensor for states_tt (no longer a view of new_states_tt).
+        states_tt = ttnn.permute(new_states_tt[:, :, :C_n, :, :], [0, 2, 1, 3, 4])
+        # clone materializes a new owning tensor for ssm_copy (no longer a view of new_states_tt).
+        ssm_copy = ttnn.clone(
+            ttnn.reshape(new_states_tt[:, :, C_n:, :, :], [B_sz, H, Dh, N]),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         new_states_tt.deallocate(True)
-        ssm_state_tt = ttnn.reshape(ssm_state_tt, [B_sz, H, Dh, N])
-
-        self._ssm_state_tt.deallocate(True)
-        self._ssm_state_tt = ssm_state_tt
-
-        states_tt = ttnn.permute(states_tt, [0, 2, 1, 3, 4])
+        # Write new SSM state into the fixed-address buffer so trace replays use the right address.
+        ttnn.assign(ssm_copy, self._ssm_state_tt)
+        ssm_copy.deallocate(True)
 
         state_decay_tt = ttnn.exp(A_cumsum_tt)
         A_cumsum_tt.deallocate(True)

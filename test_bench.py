@@ -135,6 +135,39 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
 
         results = []
 
+        def pick_next(logits_raw, seen_ids):
+            if isinstance(logits_raw, ttnn.Tensor):
+                last = logits_raw[0, 0, -1, :]
+                if last.dtype == ttnn.bfloat8_b:
+                    last = ttnn.typecast(last, ttnn.bfloat16)
+                scores = to_torch_tensor(last).float().reshape(1, -1)
+            else:
+                scores = logits_raw[0, -1, :].float().unsqueeze(0)
+            vocab_size = scores.shape[1]
+            valid = [tid for tid in seen_ids if tid < vocab_size]
+            if valid:
+                seen = torch.tensor([valid], dtype=torch.long)
+                rep_processor = RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY)
+                scores = rep_processor(seen, scores)
+            return scores[0].argmax().item()
+
+        # ── Warmup + trace capture (once, before benchmarking) ──────────────
+        print("  Warming up and capturing decode trace...", flush=True)
+        warmup_ids = tokenizer("Once upon a time in a land far away", return_tensors="pt")["input_ids"]
+        tt_model.reset_cache()
+        logits = tt_model.forward(warmup_ids)
+        ttnn.synchronize_device(device)
+        warmup_next = pick_next(logits, warmup_ids[0].tolist())
+        warmup_tensor = torch.zeros((1, 1), dtype=warmup_ids.dtype)
+        for step in range(3):
+            warmup_tensor[0, 0] = warmup_next
+            logits = tt_model.forward(warmup_tensor)
+            ttnn.synchronize_device(device)
+            warmup_next = pick_next(logits, warmup_ids[0].tolist())
+            if step == 1:
+                tt_model.capture_decode_trace()
+        print("  Trace captured.", flush=True)
+
         for prompt_label, prompt_text in PROMPTS.items():
             input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"]
             actual_len = input_ids.shape[1]
@@ -149,28 +182,10 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             ttnn.synchronize_device(device)
             prefill_ms = (time.time() - t0) * 1000
 
-            rep_processor = RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY)
-
-            def pick_next(logits_raw, seen_ids):
-                if isinstance(logits_raw, ttnn.Tensor):
-                    last = logits_raw[0, 0, -1, :]
-                    if last.dtype == ttnn.bfloat8_b:
-                        last = ttnn.typecast(last, ttnn.bfloat16)
-                    scores = to_torch_tensor(last).float().reshape(1, -1)
-                else:
-                    scores = logits_raw[0, -1, :].float().unsqueeze(0)
-                vocab_size = scores.shape[1]
-                valid = [tid for tid in seen_ids if tid < vocab_size]
-                if valid:
-                    seen = torch.tensor([valid], dtype=torch.long)
-                    scores = rep_processor(seen, scores)
-                return scores[0].argmax().item()
-
             context_ids = input_ids[0].tolist()
             next_id = pick_next(logits, context_ids)
 
-            # Decode loop — steps 1-2 are warmup (compile + kernel upload),
-            # then capture trace; steps 3+ replay trace at full speed.
+            # All decode steps use trace (captured once during warmup above).
             decode_times = []
             generated_ids = [next_id]
             next_tensor = torch.zeros((1, 1), dtype=input_ids.dtype)
@@ -185,10 +200,6 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
                 next_id = pick_next(logits, context_ids + generated_ids)
                 generated_ids.append(next_id)
 
-                # After 2 warmup steps, capture trace for subsequent steps
-                if step == 1:
-                    tt_model.capture_decode_trace()
-
                 if next_id == tokenizer.eos_token_id:
                     break
 
@@ -196,8 +207,8 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             print(f"  Prompt   : {prompt_text}")
             print(f"  Response : {response}")
 
-            # Stats — skip steps 1-2 (warmup) and step 3 (first trace replay, slower due to alloc)
-            steady = decode_times[3:] if len(decode_times) > 3 else decode_times
+            # Skip first step (first trace replay after reset_cache, slightly slower)
+            steady = decode_times[1:] if len(decode_times) > 1 else decode_times
             avg_ms = sum(steady) / len(steady)
             tok_s  = 1000.0 / avg_ms
 

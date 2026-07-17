@@ -713,28 +713,15 @@ class TTGraniteMoeHybridForCausalLM:
         return last_logits
 
     def reset_cache(self):
-        """Reset all caches for new generation/benchmark."""
-        # Reset Mamba cache
+        """Reset KV and Mamba caches for a new sequence. Does NOT release the decode trace."""
         self.cache_manager.reset()
 
-        # Reset hybrid cache if it exists
         if hasattr(self.cache_manager, "hybrid_cache"):
             delattr(self.cache_manager, "hybrid_cache")
 
-        # Reset Attention1D cache in all attention layers
         for layer in self.layers:
             if hasattr(layer, 'reset_cache'):
                 layer.reset_cache()
-
-        # Release decode trace — caller must call capture_decode_trace() again after warmup.
-        if self._decode_trace_id is not None:
-            ttnn.release_trace(self.device, self._decode_trace_id)
-            self._decode_trace_id = None
-            self._decode_trace_input = None
-            self._decode_trace_output = None
-            self._trace_zeros = None
-        self._in_trace = False
-        if self.tt_ccl is not None: self.tt_ccl._in_trace = False
 
     def reset_reduction_stats(self):
         """Reset MLP reduction counters across all layers."""
