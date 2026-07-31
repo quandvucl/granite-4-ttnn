@@ -1,0 +1,9 @@
+\begin{abstract}
+Running large language models efficiently today almost always means using NVIDIA GPUs. This project asks whether a fundamentally different type of AI accelerator — Tenstorrent Wormhole — can match or exceed GPU performance for real production models, and documents the engineering work required to find out.
+
+We port IBM's Granite-4.0-h (tiny and small variants) from the standard HuggingFace/PyTorch stack to Tenstorrent's Wormhole hardware, specifically a Galaxy 32 multi-chip system. The model combines recurrent and attention layers with sparse expert routing, making it a demanding and representative inference target.
+
+The porting work surfaces challenges in four areas: numerical precision (bfloat16 accumulation errors, weight quantisation sensitivity), architectural adaptation (state persistence, expert sharding), runtime behaviour (component initialisation ordering, memory aliasing), and toolchain gaps (missing fused kernels, a correctness hazard in hardware trace capture). We describe three optimisations that address the dominant bottleneck — per-operation communication overhead between the host CPU and the device — by reducing the number of operations the host must issue per decode step. The most impactful is a whole-model hardware trace that replays the entire forward pass with a single command.
+
+With trace enabled, the tiny model (4 Wormhole chips) achieves 10.5--10.6 tok/s decode throughput — exceeding an NVIDIA A100 PCIe (9.2--9.4 tok/s) by $\approx$13\%. The small model (8 chips, no trace) achieves 5.66--5.72 tok/s, exceeding the A100 (5.4--5.6 tok/s) by $\approx$4\%. These results show that non-GPU hardware can exceed A100 inference throughput for this class of model; the challenges and solutions are described in detail for future practitioners.
+\end{abstract}

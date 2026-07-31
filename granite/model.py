@@ -136,16 +136,6 @@ class TTGraniteMoeHybridForCausalLM:
         self.use_tt_moe = use_tt_moe
         self.moe_weight_dtype = moe_weight_dtype if moe_weight_dtype is not None else ttnn.bfloat8_b
         self.mamba_weight_dtype = mamba_weight_dtype  # None means use activation dtype (bfloat16)
-        self.last_layer_family_timing = {
-            "attention_total": 0.0,
-            "mamba_total": 0.0,
-            "mamba_prefill_total": 0.0,
-            "mamba_decode_total": 0.0,
-            "mlp_total": 0.0,
-            "layer_total": 0.0,
-            "layer_count": 0,
-            "seq_len": 0,
-        }
 
         # Extract HF components
         self.embed_tokens = hf_model.model.embed_tokens
@@ -353,25 +343,13 @@ class TTGraniteMoeHybridForCausalLM:
         if verbose:
             print(f"\n✓ Model initialized with {len(self.layers)} layers")
             print(f"  - {len(config.attention_layer_indices)} attention layers")
-            print(
-                f"  - {config.num_hidden_layers - len(config.attention_layer_indices)} mamba layers (matmuls on TT, SSM core on CPU)"
-            )
+            print(f"  - {config.num_hidden_layers - len(config.attention_layer_indices)} mamba layers")
             if is_mesh and device.get_num_devices() > 1:
                 print(f"  - Mesh device: {device.get_num_devices()} devices")
                 if use_tensor_parallel:
                     print(f"  - Tensor parallelism: ENABLED")
-                    print(
-                        f"    • MLP and Mamba weights sharded across devices (column/row parallel)"
-                    )
-                    print(f"    • Reduction: native all-reduce (fallback to host gather-sum-broadcast)")
-                    print(f"    • Expected speedup: significant for matmul-heavy operations")
                 else:
-                    print(
-                        f"  - Tensor parallelism: DISABLED (using replicated weights)"
-                    )
-                    print(
-                        f"  - All devices compute same result (redundant but correct)"
-                    )
+                    print(f"  - Tensor parallelism: DISABLED (replicated weights)")
 
     def forward(
         self,
@@ -457,7 +435,6 @@ class TTGraniteMoeHybridForCausalLM:
         # Tiny 1×4: mesh[0]=1 → safe. Small 8×1: mesh[1]=1 → safe. 2×4 would not be safe.
         _trace_supported = (self.tt_ccl is not None and self.moe_use_all_gather
                             and not self._is_multirow_mesh)
-        _TRACE_DEBUG = getattr(self, '_trace_debug', False)
         if is_decode and not _state_only and _trace_supported and self._decode_trace_id is not None:
             new_input = ttnn.from_torch(
                 hs4d, device=self.device, dtype=self.config.get_ttnn_dtype(),
@@ -481,17 +458,11 @@ class TTGraniteMoeHybridForCausalLM:
             self._in_trace = False
             if self.tt_ccl is not None: self.tt_ccl._in_trace = False
             trace_logits = self._extract_logits(self._decode_trace_output)
-            if _TRACE_DEBUG:
-                import sys
-                print(f"[TRACE] top5: {trace_logits[0, -1].float().topk(5).indices.tolist()}", file=sys.stderr, flush=True)
             if use_cache:
                 self.cache_manager.increment_position(seq_len)
             return trace_logits
 
         # ── 40-layer loop — hidden_tt stays on device ────────────────
-        attention_total = mamba_total = mamba_prefill_total = mamba_decode_total = 0.0
-        mlp_total = layer_total = 0.0
-
         hidden_tt = ttnn.from_torch(
             hs4d, device=self.device, dtype=self.config.get_ttnn_dtype(),
             layout=ttnn.TILE_LAYOUT,
@@ -510,21 +481,7 @@ class TTGraniteMoeHybridForCausalLM:
                 cache_position=cache_position,
                 has_previous_state=has_previous_state,
             )
-            t = getattr(layer, "last_timing", None)
-            if t:
-                attention_total += float(t.get("attention", 0.0))
-                mamba_total += float(t.get("mamba", 0.0))
-                mamba_prefill_total += float(t.get("mamba_prefill", 0.0))
-                mamba_decode_total += float(t.get("mamba_decode", 0.0))
-                mlp_total += float(t.get("mlp", 0.0))
-                layer_total += float(t.get("total", 0.0))
 
-        self.last_layer_family_timing = {
-            "attention_total": attention_total, "mamba_total": mamba_total,
-            "mamba_prefill_total": mamba_prefill_total, "mamba_decode_total": mamba_decode_total,
-            "mlp_total": mlp_total, "layer_total": layer_total,
-            "layer_count": len(self.layers), "seq_len": seq_len,
-        }
 
         if use_cache:
             self.cache_manager.increment_position(seq_len)
@@ -544,11 +501,7 @@ class TTGraniteMoeHybridForCausalLM:
             logits_tt = ttnn.multiply(logits_tt, 1.0 / self.logits_scaling)
 
         # ── TTNN → CPU (once) ────────────────────────────────────────
-        result = self._extract_logits(logits_tt)
-        if _TRACE_DEBUG and is_decode:
-            import sys
-            print(f"[NOTRACE] top5: {result[0, -1].float().topk(5).indices.tolist()}", file=sys.stderr, flush=True)
-        return result
+        return self._extract_logits(logits_tt)
 
     def capture_decode_trace(self):
         """Capture the decode trace using a dummy token at the current position.
@@ -722,56 +675,6 @@ class TTGraniteMoeHybridForCausalLM:
         for layer in self.layers:
             if hasattr(layer, 'reset_cache'):
                 layer.reset_cache()
-
-    def reset_reduction_stats(self):
-        """Reset MLP reduction counters across all layers."""
-        for layer in self.layers:
-            if hasattr(layer, "shared_mlp") and hasattr(
-                layer.shared_mlp, "reset_reduction_stats"
-            ):
-                layer.shared_mlp.reset_reduction_stats()
-
-    def get_reduction_stats(self):
-        """Aggregate MLP reduction counters across all layers."""
-        native_count = 0
-        fallback_count = 0
-        native_available_true = 0
-        native_available_false = 0
-        native_available_unknown = 0
-
-        for layer in self.layers:
-            if not hasattr(layer, "shared_mlp") or not hasattr(
-                layer.shared_mlp, "get_reduction_stats"
-            ):
-                continue
-
-            layer_stats = layer.shared_mlp.get_reduction_stats()
-            native_count += int(layer_stats.get("native_all_reduce_count", 0))
-            fallback_count += int(layer_stats.get("host_fallback_reduce_count", 0))
-
-            native_available = layer_stats.get("native_all_reduce_available")
-            if native_available is True:
-                native_available_true += 1
-            elif native_available is False:
-                native_available_false += 1
-            else:
-                native_available_unknown += 1
-
-        return {
-            "native_all_reduce_count": native_count,
-            "host_fallback_reduce_count": fallback_count,
-            "native_available_layers_true": native_available_true,
-            "native_available_layers_false": native_available_false,
-            "native_available_layers_unknown": native_available_unknown,
-        }
-
-    def print_cache_stats(self):
-        """Print cache statistics."""
-        self.cache_manager.print_summary()
-
-    def get_last_layer_family_timing(self):
-        """Get timing totals for attention, mamba, and MLP from the last forward pass."""
-        return dict(self.last_layer_family_timing)
 
     @classmethod
     def from_pretrained(

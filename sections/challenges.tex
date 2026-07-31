@@ -1,0 +1,60 @@
+\section{Porting Challenges}
+\label{sec:challenges}
+
+Porting from the HuggingFace reference implementation to on-device TTNN execution required resolving challenges in four categories.
+
+\subsection{Numerical Precision}
+
+\subsubsection{Tile-layout quantisation}
+
+TTNN operates on 32-element tiles and requires all tensors in bfloat16 (or lower) tile layout. HuggingFace uses float32 accumulation in several places (notably the SSM state update and the RMSNorm denominator). Converting these to bfloat16 on-tile without additional accumulation guards caused noticeable output degradation in the Mamba2 layers. The fix was to enable \texttt{fp32\_dest\_acc\_en=True} on all RMSNorm and matrix-multiply ops, and to keep the SSM state tensor in bfloat16 while using bfloat16 accumulators.
+
+\subsubsection{MoE weight quantisation}
+
+MoE expert weights are stored in \texttt{bfloat8\_b} (8-bit block float) to reduce per-device DRAM from $\sim$36\,MB/layer to $\sim$18\,MB/layer, a necessary compression given the 12\,GB DRAM per chip. Activations remain in bfloat16. The HuggingFace checkpoint stores all weights in float32 or bfloat16; quantisation to \texttt{bfloat8\_b} is performed at load time via \texttt{ttnn.from\_torch(..., dtype=ttnn.bfloat8\_b)}. For the tiny model this is lossless to two decimal places in decode output, but the small model shows residual logit errors (Section~\ref{sec:eval-quality}).
+
+\subsubsection{Logits gather axis on multi-chip mesh}
+
+The LM head output is sharded across the vocab dimension on a 1$\times$4 mesh. The HuggingFace path gathers along the last (vocab) dimension; TTNN's \texttt{ConcatMeshToTensor} composer requires explicitly specifying the correct concatenation axis. Using the wrong axis (dim=0 instead of dim=3 in TTNN's 4D tile layout) produced scrambled logits that generated coherent-looking but semantically wrong tokens. This was diagnosed by comparing token-id sequences between the TT and HuggingFace paths and corrected in the tiny model. The same fix has not been fully validated for the 8$\times$1 small-model configuration, which remains an open correctness issue.
+
+\subsection{Architectural Adaptation}
+
+\subsubsection{Hybrid layer dispatch ordering}
+
+The HuggingFace model alternates between Mamba2 and attention layers within the same \texttt{nn.Module} forward pass. On TTNN, each layer dispatch has a fixed ~0.1\,ms overhead; interleaving fallback (CPU-executed) layers with on-device layers would require round-tripping tensors over PCIe for every layer transition. The implementation therefore classifies all 40 layers upfront into \texttt{is\_attention\_layer} and Mamba layers, and executes each on-device end-to-end. The hidden state tensor stays on DRAM throughout all 40 layers without returning to host.
+
+\subsubsection{Mamba2 state persistence}
+
+HuggingFace's \texttt{MambaCache} stores the SSM state as a Python dict keyed by layer index, updated by value assignment. TTNN requires a persistent fixed-address DRAM tensor because trace replay records specific buffer addresses. The port replaced the dict-based cache with a flat \texttt{ttnn.Tensor} per layer, and the state update uses a pointer swap (\texttt{deallocate(old); self.\_ssm\_state\_tt = new\_state}) rather than in-place write, preserving address stability for future trace use.
+
+\subsubsection{MoE expert sharding mismatch}
+
+Granite-4.0-h uses 64 experts (tiny) and 72 experts (small). On a 1$\times$4 mesh, 64 divides evenly into 16 per device. On an 8$\times$1 mesh, 72 divides into 9 per device. TTNN's expert-parallel batched matmul requires the expert-count dimension to be a multiple of the tile size (32); 9 experts per device requires zero-padding to 16 before matmul and then masking the padded expert outputs in the routing weight multiply. This padding/masking logic has no equivalent in the HuggingFace implementation and was implemented from scratch.
+
+\subsubsection{Mesh topology selection: 8$\times$1 instead of 2$\times$4}
+
+The small model requires 8 chips. Two natural topologies are 2$\times$4 (two rows of four) and 8$\times$1 (a single row of eight). The 8$\times$1 topology was chosen because of a constraint in TTNN's collective communication implementation: when both mesh dimensions are greater than one (\texttt{is\_true\_2d\_mesh()} is true), \texttt{all\_gather\_async} internally uses a composite path that dynamically allocates its output buffer at runtime. Dynamic allocation inside a trace region is illegal — the Metal trace mechanism requires all buffer addresses to be fixed at capture time and stable on every replay. On an 8$\times$1 mesh, one dimension is 1, so \texttt{is\_true\_2d\_mesh()} is false and the simpler single-axis \texttt{all\_gather\_async} path is used, which allocates its output at capture time and replays correctly. A 2$\times$4 mesh would prevent trace replay from being used for the small model entirely.
+
+\subsection{Runtime and Compilation}
+
+\subsubsection{CCL initialisation order}
+
+TTNN's collective communication library (CCL) must be initialised \emph{after} all weight tensors are uploaded to device. Initialising CCL before any weight upload causes the fabric Ethernet cores to enter a routing mode that interferes with the PCIe DMA path, causing hangs on large tensor copies ($>$500\,MB). The HuggingFace reference has no such ordering constraint. The fix was to defer \texttt{ttnn.initialize\_fabric} and \texttt{ccl} construction to after all 40 layers' weights are resident on DRAM.
+
+\subsubsection{Tensor deallocate safety}
+
+TTNN tensors are reference-counted; calling \texttt{deallocate(True)} on a tensor while it is still aliased (e.g.\ by a circular buffer or trace output) causes a use-after-free that silently produces zeros. In the SSM state swap, the original code called \texttt{deallocate(True)} on the old state before constructing the replacement, which left a brief window where the CB read pointer pointed to freed memory. The fix was to allocate the new state (\texttt{ttnn.zeros\_like}) before freeing the old one.
+
+\subsection{Toolchain Limitations}
+
+\subsubsection{No native Mamba2 chunk-scan kernel}
+
+The HuggingFace Mamba2 implementation calls \texttt{mamba\_ssm.ops.triton.selective\_state\_update} for decode, a Triton kernel that fuses the full recurrent step. No equivalent exists in the TTNN Metal kernel library at the time of writing. The decode path was implemented using five sequential TTNN ops (addcmul, mul, sum, add), and the fused \texttt{ssm\_update} Metal kernel described in Section~\ref{sec:optimisation} was written to close this gap.
+
+\subsubsection{Metal trace bypass-mode correctness hazard}
+
+TTNN's \texttt{begin\_trace\_capture}/\texttt{end\_trace\_capture} calls \texttt{set\_bypass\_mode(true)} on all device command queues for the duration of the capture. In bypass mode, operations are \emph{recorded} into a host-side buffer but are \textbf{not dispatched to the device}. This is intentional---the device must see fixed-address allocations, not actual execution---but it has a critical implication for autoregressive decode: if trace capture is triggered \emph{inside} the generation loop at step $t$, the capture step executes in bypass mode and produces stale logits from step $t-1$ (device KV cache and SSM state are not advanced). Every subsequent token is then shifted by one position, producing incoherent output.
+
+This was diagnosed by observing that WITH TRACE, step-$t$ output matched NO TRACE step $t-1$ output across all prompts. The root cause was confirmed by reading \texttt{tt\_metal/distributed/fd\_mesh\_command\_queue.cpp}: \texttt{record\_begin} calls \texttt{set\_bypass\_mode(true, clear=true)}, and \texttt{system\_memory\_manager.cpp::issue\_queue\_reserve} routes to a \texttt{bypass\_buffer} vector in host RAM rather than the device CQ.
+
+The fix is to separate trace capture from the autoregressive loop entirely. The \texttt{capture\_decode\_trace()} method records the full 40-layer decode forward using a dummy (zeros) embedding input; this is called once after two real warmup steps, after which all subsequent \texttt{forward()} calls replay the trace. Because capture uses a dummy input and runs outside the generation loop, the bypass mode does not corrupt device state.

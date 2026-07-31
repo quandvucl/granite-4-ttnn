@@ -1,7 +1,6 @@
 """Hybrid Granite decoder layer — hidden_states stays on TTNN throughout all 40 layers."""
 
 import sys
-import time
 from pathlib import Path
 
 import torch
@@ -138,12 +137,6 @@ class TTGraniteDecoderLayer:
             else:
                 self.mamba = None
 
-        self.last_timing = {
-            "attention": 0.0, "mamba": 0.0,
-            "mamba_prefill": 0.0, "mamba_decode": 0.0,
-            "mlp": 0.0, "total": 0.0,
-        }
-
     def forward(
         self,
         hidden_states: ttnn.Tensor,
@@ -154,9 +147,6 @@ class TTGraniteDecoderLayer:
         cache_position=None,
         has_previous_state=None,
     ) -> ttnn.Tensor:
-        t0 = time.time()
-        attn_t = mamba_t = mamba_pre_t = mamba_dec_t = mlp_t = 0.0
-
         seq_len = len(cache_position) if cache_position is not None else hidden_states.shape[2]
         mode = Mode.DECODE if seq_len == 1 else Mode.PREFILL
         if not hasattr(cache_manager, "hybrid_cache"):
@@ -165,22 +155,15 @@ class TTGraniteDecoderLayer:
         residual = hidden_states
         normed = self.input_layernorm.forward(hidden_states, mode=mode)
 
-        t1 = time.time()
         if self.is_attention_layer:
             mixer_out = self._attention_forward(
                 normed, cache_manager, position_ids,
                 attention_mask, position_embeddings, cache_position, seq_len,
             )
-            attn_t = time.time() - t1
         else:
             mixer_out = self._mamba_forward(
                 normed, cache_manager, position_ids, cache_position, seq_len,
             )
-            mamba_t = time.time() - t1
-            if seq_len == 1:
-                mamba_dec_t = mamba_t
-            else:
-                mamba_pre_t = mamba_t
 
         normed.deallocate(True)
 
@@ -192,21 +175,14 @@ class TTGraniteDecoderLayer:
         residual = hidden_states
         normed2 = self.post_attention_layernorm.forward(hidden_states, mode=mode)
 
-        t2 = time.time()
         mlp_out = self._mlp_forward(normed2, seq_len, mode)
         normed2.deallocate(True)
-        mlp_t = time.time() - t2
 
         hidden_states = ttnn.mac(mlp_out, self.residual_multiplier_tt, residual,
                                  memory_config=ttnn.DRAM_MEMORY_CONFIG)
         mlp_out.deallocate(True)
         residual.deallocate(True)
 
-        self.last_timing = {
-            "attention": attn_t, "mamba": mamba_t,
-            "mamba_prefill": mamba_pre_t, "mamba_decode": mamba_dec_t,
-            "mlp": mlp_t, "total": time.time() - t0,
-        }
         return hidden_states
 
     def _attention_forward(self, normed, cache_manager, position_ids,

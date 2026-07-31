@@ -1,0 +1,124 @@
+\section{Optimisation Targets}
+\label{sec:optimisation}
+
+\subsection{Fused Residual Add (\texttt{mac})}
+\label{sec:mac}
+
+Each of the 40 decoder layers applies two residual additions of the form $h \leftarrow \alpha \cdot m + r$. The naive implementation issues two ops: \texttt{ttnn.mul}($m$, $\alpha$) followed by \texttt{ttnn.add}(scaled, $r$), requiring two separate PCIe dispatches and two DRAM passes. TTNN provides \texttt{ttnn.mac}($m$, $\alpha$, $r$) which fuses these into a single op, one dispatch, and one DRAM pass. Replacing both residual adds per layer saves 80 dispatches per decode step ($\approx$8\,ms). This optimisation is implemented in the current codebase.
+
+\subsection{Fused SSM State-Update Kernel}
+
+The standard TTNN decode path for the SSM step (Equations~\ref{eq:state}--\ref{eq:output}) issues five separate operations:
+
+\begin{algorithmic}[1]
+\State $\mathbf{h} \leftarrow \mathtt{addcmul}(\overline{B}\mathbf{x},\; \overline{A},\; \mathbf{h})$ \Comment{$H\!\times\!D\!\times\!N$ write}
+\State $\mathbf{yc} \leftarrow \mathbf{h} \odot C.\mathrm{unsqueeze}(-2)$ \Comment{broadcast $N$-dim}
+\State $\mathbf{y} \leftarrow \mathtt{sum}(\mathbf{yc},\; \mathrm{dim}{=}{-1})$ \Comment{reduce over $N$}
+\State $\mathbf{y} \leftarrow \mathbf{y} + D \odot x$ \Comment{skip connection}
+\end{algorithmic}
+
+Each step dispatches a separate PCIe command and performs a separate DRAM pass over the $H \times D \times N = 393{,}216$-element state tensor. We implement a fused Metal kernel \texttt{ssm\_update} that performs all three DRAM-intensive operations (steps 1--3) in a single pass:
+
+\begin{algorithm}
+\caption{Fused SSM Update Kernel (per Tensix core group)}
+\label{alg:kernel}
+\begin{algorithmic}[1]
+\Require $\overline{B}\mathbf{x}, \overline{A}, \mathbf{h}_{\mathrm{in}}, C$ all in DRAM; output $\mathbf{h}_{\mathrm{out}}, y$ pre-allocated
+\Require Each core is assigned $w$ \emph{groups} of tiles, where one group = one $(d, h)$ row of $N$ tiles
+\For{each assigned tile group $(d, h)$}
+  \State \textbf{Phase 1 (read + fuse state update):}
+  \For{$n \leftarrow 0$ to $N_t - 1$} \Comment{$N_t$ tiles in $N$-dim}
+    \State Read tile $\overline{B}\mathbf{x}[h,d,n]$, $\overline{A}[h,d,n]$, $\mathbf{h}[h,d,n]$ into SRAM
+    \State $\mathbf{h}_{\mathrm{out}}[h,d,n] \leftarrow \overline{B}\mathbf{x}[h,d,n] + \overline{A}[h,d,n] \odot \mathbf{h}[h,d,n]$
+    \State Buffer $\mathbf{h}_{\mathrm{out}}[h,d,n]$ in CB5 (SRAM); write to DRAM output
+  \EndFor
+  \State \textbf{Phase 2 (read $C$, compute $\mathbf{yc}$):}
+  \State Read $C[h, :]$ ($N_t$ tiles) into SRAM  \Comment{shared across $D$ in group}
+  \For{$n \leftarrow 0$ to $N_t - 1$}
+    \State $\mathbf{yc}[h,d,n] \leftarrow \mathbf{h}_{\mathrm{out}}[h,d,n] \odot C[h,n]$ \Comment{element-wise}
+    \State Buffer in CB6
+  \EndFor
+  \State \textbf{Phase 3 (reduce $y$):}
+  \State $y[h,d] \leftarrow \sum_{n=0}^{N_t-1} \mathbf{yc}[h,d,n]$ \Comment{hardware reduce-row}
+  \State Write $y[h,d]$ to DRAM output
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+The kernel uses three circular buffers (SRAM): CB5 holds the buffered $\mathbf{h}_{\mathrm{out}}$ tiles, CB6 holds the $\mathbf{yc}$ tiles, and CB16/CB17 are the output channels. The tile-level reduce uses the Tensix hardware \texttt{reduce\_tile} instruction (\texttt{PoolType::SUM}, \texttt{REDUCE\_ROW}).
+
+The benefit of fusion is twofold. First, $\mathbf{h}_{\mathrm{out}}$ is read back from L1 CB5 in Phase~2 rather than DRAM, eliminating one 768\,KB DRAM read per layer. Second, the 5-op TTNN path is replaced by a single \texttt{ttnn.generic\_op} call per layer, reducing PCIe dispatch overhead per decode step.
+
+\subsection{Whole-Model Decode Trace}
+\label{sec:trace-impl}
+
+The larger source of overhead is the total dispatch count. A single decode step across 40 layers issues approximately 500+ TTNN operations. At $\sim$0.1\,ms per dispatch, this accounts for the majority of the measured step latency without trace.
+
+The Metal trace mechanism allows the host to record a sequence of device commands once and replay them with a single dispatch thereafter. The implementation traces the \emph{entire} 40-layer decode forward pass, including all \texttt{all\_gather\_async} collective calls for expert-parallel MoE. The collective calls use \texttt{all\_gather\_async} (asynchronous with \texttt{persistent\_output\_buffer=None}), which allocates its output inside the trace region at capture time and replays correctly because the same physical addresses are reused on every replay.
+
+A key design constraint arises from Metal's bypass mode (Section~\ref{sec:challenges}): the capture must be \emph{isolated from the autoregressive loop}. The trace is captured once using a dummy (zeros) embedding input, called after two real warmup steps complete. Subsequent decode forwards replay the trace.
+
+\begin{algorithm}
+\caption{Whole-Model Decode Trace Capture (called once after warmup)}
+\label{alg:trace}
+\begin{algorithmic}[1]
+\Require Model at position $p$ after prefill + 2 warmup decode steps
+\State \textit{// Allocate persistent buffers outside trace region}
+\State $\mathbf{in} \leftarrow \mathtt{zeros}([1,1,1,H])$ \Comment{fixed-address DRAM input}
+\State $\mathbf{z} \leftarrow \mathtt{zeros}([1,1,1,H])$ \Comment{addend for copy-via-add inside trace}
+\State Update attention position buffers to position $p$
+\State $\mathtt{synchronize}()$
+\State \textit{// Record trace using dummy input --- bypass mode, no device state change}
+\State $\mathrm{tid} \leftarrow \mathtt{begin\_trace\_capture}()$
+\State $\mathbf{h} \leftarrow \mathbf{in} + \mathbf{z}$ \Comment{exposes $\mathbf{in}$ as a writable entry point}
+\For{each decoder layer $\ell = 0 \ldots 39$}
+  \State $\mathbf{h} \leftarrow \mathrm{Layer}_\ell.\mathrm{forward}(\mathbf{h})$ \Comment{Mamba/Attn + MoE, incl.\ \texttt{all\_gather\_async}}
+\EndFor
+\State $\mathbf{logits}_{\mathrm{trace}} \leftarrow \mathrm{LMHead}(\mathrm{Norm}(\mathbf{h}))$
+\State $\mathtt{end\_trace\_capture}(\mathrm{tid})$
+\State \textbf{return} $\mathrm{tid}$, $\mathbf{in}$, $\mathbf{logits}_{\mathrm{trace}}$ \Comment{$\mathbf{logits}_{\mathrm{trace}}$ lives in trace region}
+\end{algorithmic}
+\end{algorithm}
+
+During each decode step after capture, the traced forward executes as:
+
+\begin{algorithm}
+\caption{Whole-Model Traced Forward (per decode step)}
+\label{alg:trace-fwd}
+\begin{algorithmic}[1]
+\State $\mathbf{e} \leftarrow \mathrm{embed}(\mathrm{token})$ \Comment{CPU embedding lookup}
+\State $\mathtt{assign}(\mathbf{e},\; \mathbf{in})$ \Comment{write real embedding into fixed input buffer}
+\State $\mathtt{synchronize}()$ \Comment{flush async PCIe write before replay}
+\State $\mathtt{execute\_trace}(\mathrm{tid},\; \mathtt{blocking=False})$ \Comment{\textbf{1 dispatch} for all 500+ ops}
+\State $\mathtt{synchronize}()$
+\State \textbf{return} $\mathbf{logits}_{\mathrm{trace}}$ \Comment{read from trace-region output buffer}
+\end{algorithmic}
+\end{algorithm}
+
+The \texttt{assign} at line 2 overwrites the fixed-address input buffer so that the trace replay processes the real token embedding rather than the dummy zeros used during capture. The \texttt{synchronize} at line 3 ensures the PCIe write completes before the trace firmware begins reading from that address. The \texttt{all\_gather\_async} calls inside the trace use \texttt{persistent\_output\_buffer=None}, which causes the output buffer to be allocated once inside the trace region at capture time and reused on every replay --- no host involvement is required for the collective during replay.
+
+\subsection{Chunked-Prefill Chunk Size Tuning}
+\label{sec:chunk-tune}
+
+Prefill for long sequences is processed in chunks of $C$ tokens, each passed through all 40 layers before the next chunk begins. The chunk size $C$ controls the trade-off between L1 reuse (larger $C$ amortises per-chunk setup cost) and peak DRAM pressure (smaller $C$ reduces the working-set size). We swept $C \in \{192, 256, 320, 384, 512\}$ on the tiny model (1$\times$4 mesh) using two representative prompts (96 and 176 tokens), measuring both prefill and decode throughput. Results are shown in Table~\ref{tab:chunk}.
+
+\begin{table}[h]
+\caption{Chunk size sweep (Granite-4.0-h-tiny, 1$\times$4 mesh). Prefill and decode throughput in tok/s.}
+\label{tab:chunk}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{rrrrrr}
+\toprule
+Chunk & \multicolumn{2}{c}{Prefill (tok/s)} & \multicolumn{2}{c}{Decode (tok/s)} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+size & 96-tok & 176-tok & 96-tok & 176-tok \\
+\midrule
+192 &  41.4 &  96.2 & 3.2 & 7.4 \\
+256 & 140.6 & 143.5 & 7.5 & 7.2 \\
+320 & 139.3 & 144.6 & 7.2 & 7.2 \\
+384 & 128.3 & 145.3 & 7.2 & 7.1 \\
+512 & 135.5 & 145.3 & 7.0 & 7.1 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Chunk size 192 is significantly worse: the 96-token prompt fits in a single chunk of 192 but the chunk is too small to fully utilise the Tensix cores, and decode throughput collapses to 3.2 tok/s because the SSM state is partially cold. Chunk sizes 256--512 give equivalent prefill throughput (${\approx}140$--145 tok/s at 176 tokens); 256 is selected as it minimises peak DRAM allocation without sacrificing throughput. Decode throughput is essentially flat across 256--512, confirming that chunk size does not affect steady-state decode (the SSM state is fully warm after prefill regardless of $C$).

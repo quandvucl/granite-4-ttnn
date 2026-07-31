@@ -1,14 +1,13 @@
-"""Configuration classes for Mamba2 layers."""
+"""Configuration for Mamba2 layers."""
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Tuple
 
 
 @dataclass
 class Mamba2Config:
-    """Configuration for Mamba2 layer parameters."""
+    """Mamba2 layer parameters extracted from a HuggingFace Granite layer."""
 
-    # Model dimensions
     hidden_size: int
     intermediate_size: int
     num_heads: int
@@ -17,26 +16,18 @@ class Mamba2Config:
     conv_dim: int
     conv_kernel: int
     chunk_size: int
-
-    # Layer identification
     layer_idx: int
-
-    # SSM parameters (time_step limits)
     time_step_min: float
     time_step_max: float
-
-    # Additional parameters
     use_conv_bias: bool = True
     n_groups: int = 1
 
     @property
     def time_step_limit(self) -> Tuple[float, float]:
-        """Time step limits for clamping."""
         return (self.time_step_min, self.time_step_max)
 
     @classmethod
     def from_hf_mamba(cls, hf_mamba) -> "Mamba2Config":
-        """Create config from HuggingFace Granite Mamba layer."""
         return cls(
             hidden_size=hf_mamba.hidden_size,
             intermediate_size=hf_mamba.intermediate_size,
@@ -52,18 +43,3 @@ class Mamba2Config:
             use_conv_bias=hf_mamba.use_conv_bias,
             n_groups=hf_mamba.n_groups,
         )
-
-
-@dataclass
-class MemoryConfig:
-    """Memory configuration for TTNN operations."""
-
-    # Default memory configs for different operation types
-    default_layout: str = "TILE"
-    matmul_memory_config: Optional[str] = None
-    scan_memory_config: Optional[str] = None
-
-    def get_config(self, shape: Tuple[int, ...], op_type: str):
-        """Get memory config for specific operation."""
-        # Placeholder - will be filled with actual logic
-        return None

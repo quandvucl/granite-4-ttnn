@@ -1,0 +1,11 @@
+\section{Conclusion}
+
+This project presents a complete port of Granite-4.0-h-tiny and Granite-4.0-h-small from HuggingFace to Tenstorrent Wormhole hardware using the TTNN Metal stack, and benchmarks the result against NVIDIA A100 PCIe and CPU baselines. The tiny model (1$\times$4 mesh) achieves 10.5--10.6 tok/s decode throughput with trace enabled — exceeding the A100 (9.2--9.4 tok/s) by $\approx$13\% and $4\times$ faster than CPU. The small model (no trace, 8$\times$1 mesh) reaches 5.66--5.72 tok/s, exceeding the A100 (5.4--5.6 tok/s) by $\approx$4\%.
+
+The Metal decode trace (Algorithm~\ref{alg:trace}) collapses $\approx$500 PCIe dispatches per step to a single replay, reducing step latency from 130--145\,ms to $\approx$95\,ms. A key implementation finding is that Metal trace capture runs in hardware bypass mode: ops are recorded but not executed on device, so capturing the trace inside the autoregressive generation loop introduces a one-step lag in KV cache and SSM state. This was diagnosed and resolved by isolating the capture to a dummy-input call (\texttt{capture\_decode\_trace()}) outside the generation loop.
+
+The primary porting challenges encountered — including bfloat8\_b quantisation sensitivity, SSM state persistence across chunked prefill, MoE expert-parallel sharding, CCL initialisation ordering, and the bypass-mode trace hazard — are documented in Section~\ref{sec:challenges} to guide future ports of hybrid SSM/attention models to similar hardware.
+
+Chunk-size tuning (Section~\ref{sec:chunk-tune}) establishes that $C=256$ is the optimal prefill chunk size, achieving 140--145 tok/s prefill throughput vs.\ 41 tok/s at $C=192$. The fused \texttt{ssm\_update} Metal kernel (Section~\ref{sec:optimisation}) is designed and ready to deploy; with trace already eliminating dispatch overhead, its primary remaining benefit is a $\approx$0.15\,ms DRAM saving per step from eliminating one intermediate 768\,KB write per layer.
+
+The next performance target for the tiny model is reducing the all-gather collective cost ($T_{\mathrm{fabric}}$) that contributes to the remaining 95\,ms step time, as identified by the latency decomposition in Section~\ref{sec:bottleneck}.

@@ -1,0 +1,17 @@
+\section{Implementation}
+
+\subsection{On-Device Execution Strategy}
+
+All 40 decoder layers execute on-device end-to-end: the hidden state tensor $h \in \mathbb{R}^{1 \times 1 \times S \times H}$ is uploaded once at the start of prefill and remains on DRAM across all layers and all decode steps. PCIe transfers occur only for (a) token embedding lookup (host-side), (b) LM head logits read-back (one tensor per step), and (c) routing logits during prefill (amortised over $S$ tokens; for decode the router runs on-device).
+
+Mamba2 decode runs the recurrent step (Equations~\ref{eq:state}--\ref{eq:output}) entirely on device. The SSM state $\mathbf{h}$ is maintained as a persistent DRAM tensor across decode steps, updated in-place via a pointer swap after each step.
+
+\subsection{Mesh Sharding and Fabric}
+
+On a 1$\times$4 mesh with fabric enabled, tensor parallelism applies to:
+\begin{itemize}
+\item \textbf{MoE experts}: sharded across 4 devices via \texttt{ShardTensor2dMesh(dims=(None,1))}; reduced via \texttt{all\_gather(cluster\_axis=1)}.
+\item \textbf{Mamba in-projection}: column-parallel across devices (shards the combined gate+xBC+dt output), reduced via \texttt{all\_gather(dim=3, cluster\_axis=1)} after projection.
+\item \textbf{Mamba out-projection}: each chip computes its share of the output; contributions are collected and summed across devices via \texttt{all\_gather(dim=3, cluster\_axis=1)}.
+\item \textbf{Attention, shared MLP, norms}: weights replicated on all devices; independent compute, no reduce.
+\end{itemize}

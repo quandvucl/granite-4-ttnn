@@ -17,9 +17,9 @@ from utils.device import (
     softplus_and_clamp_torch_via_tt,
 )
 from mamba.config import Mamba2Config
-from mamba.device_manager import TTNNDeviceManager
 from mamba.ssm_utils import extract_ssm_parameters
 from kernel.ssm_update.op import ssm_update as _ssm_update_kernel
+from kernel.conv1d_decode.op import conv1d_decode as _conv1d_decode_kernel
 
 class TensorParallelMamba:
 
@@ -48,7 +48,6 @@ class TensorParallelMamba:
         self._topology = ttnn.Topology.Linear
 
         self.config = Mamba2Config.from_hf_mamba(hf_mamba)
-        self.device_mgr = TTNNDeviceManager(device, dtype)
 
         self.num_heads = self.config.num_heads
         self.head_dim = self.config.head_dim
@@ -93,16 +92,15 @@ class TensorParallelMamba:
         )
         kernel_size = self.hf_mamba.conv1d.weight.shape[2]
         conv_dim = self.hf_mamba.conv_dim
-        # K separate [1,1,C,1] column tensors; _conv_pos is the next write slot.
-        self._conv_cache_cols = [
-            ttnn.from_torch(
-                torch.zeros(1, 1, conv_dim, 1, dtype=torch.bfloat16),
-                device=self.device, dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=self.mesh_mapper,
-            )
-            for _ in range(kernel_size)
-        ]
+        # Single contiguous [1, K, C, 1] cache buffer — fixed address for trace safety.
+        self._conv_cache_tt = ttnn.from_torch(
+            torch.zeros(1, kernel_size, conv_dim, 1, dtype=torch.bfloat16),
+            device=self.device, dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self.mesh_mapper,
+        )
+        # Keep _conv_cache_cols for prefill _seed_state compatibility (read-only after init)
+        self._conv_cache_cols = None  # no longer used in decode path
         self._conv_pos = 0
 
     def _load_weights(self):
@@ -185,8 +183,14 @@ class TensorParallelMamba:
         K = self.hf_mamba.conv1d.weight.shape[2]
         C = self.hf_mamba.conv_dim
         conv_w = self.hf_mamba.conv1d.weight.squeeze(1).to(torch.bfloat16)  # [C, K]
-        # K separate [1,1,C,1] weight column tensors — newest weight first (index 0).
-        # conv1d weight col [:, k] corresponds to lag k (0=newest, K-1=oldest).
+        # Single [1, K, C, 1] weight tensor — k=0 oldest lag, k=K-1 newest lag.
+        # conv_w[:, k] is lag-k weight; we arrange dim-1 as k=0..K-1 (oldest→newest).
+        conv_w_4d = conv_w.T.reshape(1, K, C, 1)  # [1, K, C, 1]
+        self._conv_w_tt = to_tt_tensor(
+            conv_w_4d, self.device, ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
+        )
+        # Keep _conv_w_cols for prefill path (still uses K-loop)
         self._conv_w_cols = [
             to_tt_tensor(
                 conv_w[:, k].reshape(1, 1, C, 1),
@@ -203,6 +207,16 @@ class TensorParallelMamba:
             )
         else:
             self._conv_bias_decode_tt = None
+
+        # Pre-allocated output buffers for the fused conv1d kernel (trace-safe fixed addresses).
+        self._conv_new_cache_tt = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, K, C, 1]), ttnn.bfloat16, ttnn.TILE_LAYOUT,
+            self.device, ttnn.DRAM_MEMORY_CONFIG,
+        )
+        self._conv_out_tt = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, 1, C, 1]), ttnn.bfloat16, ttnn.TILE_LAYOUT,
+            self.device, ttnn.DRAM_MEMORY_CONFIG,
+        )
 
         self._prefill_A_tt = to_tt_tensor(
             self._prefill_A.to(torch.bfloat16).reshape(1, 1, H),
@@ -605,16 +619,16 @@ class TensorParallelMamba:
             K = conv_state.shape[-1]
             C = self.hf_mamba.conv_dim
             # conv_state is [1, C, K] — k=0 oldest, k=K-1 newest.
-            # Shift-register convention: _conv_cache_cols[0]=oldest, [K-1]=newest.
-            for k in range(K):
-                new_col = ttnn.from_torch(
-                    conv_state[0, :, k].reshape(1, 1, C, 1).to(torch.bfloat16),
-                    device=self.device, dtype=ttnn.bfloat16,
-                    layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    mesh_mapper=self.mesh_mapper,
-                )
-                ttnn.assign(new_col, self._conv_cache_cols[k])
-                new_col.deallocate(True)
+            # _conv_cache_tt is [1, K, C, 1] with k=0 oldest, k=K-1 newest.
+            cache_4d = conv_state[0].T.reshape(1, K, C, 1).to(torch.bfloat16)
+            new_cache_tt = ttnn.from_torch(
+                cache_4d,
+                device=self.device, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=self.mesh_mapper,
+            )
+            ttnn.assign(new_cache_tt, self._conv_cache_tt)
+            new_cache_tt.deallocate(True)
             self._conv_pos = 0
             pad = conv_state[:, :, :K - 1].to(torch.bfloat16).reshape(1, 1, C, K - 1)
             new_pad_tt = ttnn.from_torch(
@@ -631,10 +645,9 @@ class TensorParallelMamba:
         zero_state = ttnn.zeros_like(self._ssm_state_tt)
         ttnn.assign(zero_state, self._ssm_state_tt)
         zero_state.deallocate(True)
-        for col in self._conv_cache_cols:
-            z = ttnn.zeros_like(col)
-            ttnn.assign(z, col)
-            z.deallocate(True)
+        zero_cache = ttnn.zeros_like(self._conv_cache_tt)
+        ttnn.assign(zero_cache, self._conv_cache_tt)
+        zero_cache.deallocate(True)
         self._conv_pos = 0
         zero_pad = ttnn.zeros_like(self._prefill_conv_pad_tt)
         ttnn.assign(zero_pad, self._prefill_conv_pad_tt)
@@ -704,12 +717,18 @@ class TensorParallelMamba:
         projected_tt.deallocate(True)
 
         xBC_tt = ttnn.reshape(xBC_tt, [1, 1, conv_dim, 1])
-        conv_out_tt = self._conv1d_decode_tt(xBC_tt)
+        # Fused conv1d: shift cache, dot product, bias, silu — single kernel dispatch.
+        new_cache_tt, conv_out_tt = _conv1d_decode_kernel(
+            xBC_tt, self._conv_cache_tt, self._conv_w_tt, self._conv_bias_decode_tt,
+            self.device, self._conv_new_cache_tt, self._conv_out_tt,
+        )
+        xBC_tt.deallocate(True)
+        # Update cache in-place (fixed address preserved for trace replay).
+        ttnn.assign(new_cache_tt, self._conv_cache_tt)
 
         x_tt     = conv_out_tt[:, :, :inter, :]
         B_raw_tt = conv_out_tt[:, :, inter:inter + n_g * N, :]
         C_raw_tt = conv_out_tt[:, :, inter + n_g * N:, :]
-        conv_out_tt.deallocate(True)
 
         x_tt = ttnn.reshape(x_tt, [batch_size, H, D])
 

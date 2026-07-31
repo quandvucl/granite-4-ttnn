@@ -1,0 +1,12 @@
+\section{Threats to Validity}
+
+Several factors may impact the validity of the results:
+\begin{itemize}
+\item Timing measurements are taken on a shared Galaxy system; other tenants' workloads may affect chip thermal state and PCIe bus utilisation.
+\item Decode throughput on the 1$\times$4 Wormhole mesh varies between 10.5 and 10.6 tok/s across runs with identical code and a warm compiled-kernel cache; cold-cache runs (first run after \texttt{rm -rf generated/}) produce similar throughput once TTNN recompiles all kernels in the same session.
+\item The bypass-mode off-by-one behaviour is consistent with the Metal source code, but the exact boundary conditions (e.g., whether \texttt{ttnn.assign} into a buffer allocated before capture is guaranteed stable across firmware versions) have not been confirmed by the Metal team.
+\end{itemize}
+
+\subsection{Ethics Considerations}
+
+This work focuses on engineering and systems-level optimization of language models. No personal or sensitive data is used in this study. Energy efficiency is a motivating concern for alternative accelerator deployments, though this project does not measure power directly.
