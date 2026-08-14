@@ -1,47 +1,50 @@
 {
-  "model": "tiny",
-  "load_s": 27.40689444541931,
-  "num_devices": 4,
+  "model": "small",
+  "load_s": 443.51026344299316,
+  "num_devices": 8,
+  "chunk_size": 384,
+  "use_conv1d_kernel": true,
+  "use_ssm_kernel": true,
   "results": [
     {
       "prompt": "short_8",
       "tokens": 5,
-      "prefill_toks": 6.774088100046384,
-      "decode_toks": 10.56831242571911,
+      "ttft_ms": 1411.3917350769043,
+      "decode_toks": 5.877907033777999,
       "prompt_text": "The capital of France is",
-      "response": " Paris. The Eiffel Tower, a symbol of the city and one of its most recognizable landmarks.\n\n"
+      "response": " Paris."
     },
     {
       "prompt": "short_10",
       "tokens": 8,
-      "prefill_toks": 11.03612826793167,
-      "decode_toks": 10.598925846944228,
+      "ttft_ms": 1485.2890968322754,
+      "decode_toks": 5.864789622563681,
       "prompt_text": "The largest planet in our solar system is",
-      "response": " Jupiter. It has a diameter of about 88,846 miles (142,984 kilometers), which makes"
+      "response": " Jupiter, with a diameter of about 88,846 miles (142,984 kilometers). It's so"
     },
     {
       "prompt": "medium_32",
       "tokens": 25,
-      "prefill_toks": 26.68720384695457,
-      "decode_toks": 10.611862436894848,
+      "ttft_ms": 1844.1193103790283,
+      "decode_toks": 5.787944015436303,
       "prompt_text": "Artificial intelligence is transforming many industries. Machine learning models can now perform tasks that previously required human expertise, such as image recognition",
-      "response": " and language translation.\n\nHowever, these AI systems are often considered \"black boxes\" because their decision-making processes"
+      "response": " and natural language processing.\n\n**Example:**  \n- **Image Recognition**: AI algorithms analyze images to identify objects"
     },
     {
       "prompt": "long_128",
       "tokens": 96,
-      "prefill_toks": 80.21858649852075,
-      "decode_toks": 10.594329574284682,
+      "ttft_ms": 1901.5660285949707,
+      "decode_toks": 5.810293373540532,
       "prompt_text": "Large language models have become increasingly capable over recent years. These models are trained on vast amounts of text data and can generate coherent, contextually appropriate responses across a wide range of topics. They are used in applications ranging from customer service chatbots to code generation tools, scientific research assistants, and creative writing aids. The architecture underlying most of these models is the transformer, which uses self-attention mechanisms to capture long-range dependencies in text. Recent hybrid architectures combine transformers with state-space models",
-      "response": " like LSTMs or RNNs for improved performance.\n\nHowever, despite their impressive capabilities, large language"
+      "response": " or recurrent layers for improved efficiency.\n\nThe rapid progress has raised important questions about safety: how do we ensure"
     },
     {
       "prompt": "long_256",
       "tokens": 176,
-      "prefill_toks": 101.05980414154936,
-      "decode_toks": 10.634430741026756,
+      "ttft_ms": 2836.757183074951,
+      "decode_toks": 5.845126022406673,
       "prompt_text": "The field of natural language processing has undergone a remarkable transformation with the advent of large-scale pretrained language models. These systems, trained on hundreds of billions of tokens of text from the internet and other sources, have demonstrated surprising emergent capabilities including multi-step reasoning, in-context learning, and instruction following. The scaling laws governing these models suggest that performance on many tasks continues to improve predictably with increases in model size, dataset size, and compute budget. This has motivated the development of increasingly large models, from hundreds of millions to hundreds of billions of parameters. However, serving these models efficiently at inference time presents significant engineering challenges, particularly for applications requiring low latency responses. Speculative decoding, quantization, and hardware-specific optimizations are among the techniques used to address these challenges. Hybrid architectures that combine attention layers with state-space models like Mamba offer promising tradeoffs between computational efficiency and modeling capability",
-      "response": ".\n\nHowever, despite their impressive abilities across diverse benchmarks, there remain notable limitations: most notably an inability to"
+      "response": ".\n\nIn this talk I will give an overview about how we can serve LLMs more efficient by using"
     }
   ]
 }

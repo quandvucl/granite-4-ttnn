@@ -4,32 +4,7 @@
 
 \subsubsection{Hardware}
 
-Table~\ref{tab:hw} summarises the hardware used for each backend.
-
-\begin{table}[h]
-\caption{Hardware specifications for each evaluation backend.}
-\label{tab:hw}
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{llll}
-\toprule
-Backend & Device & Memory & Peak BF16 \\
-\midrule
-CPU & AMD EPYC 9354P & 566\,GB DDR5 & n/a \\
-    & 32 cores, 3.8\,GHz & 256\,MB L3 & \\
-\midrule
-GPU (A100) & NVIDIA A100 PCIe 80\,GB~\citep{nvidia2020a100} & 80\,GB HBM2e & 312\,TFLOPS \\
-           & SM 8.0, 6912 CUDA cores & 1{,}935\,GB/s BW & BF16 \\
-\midrule
-TT-tiny & Wormhole Galaxy, 1$\times$4 submesh & 4$\times$12\,GB DRAM & — \\
-        & 4 chips, FABRIC\_1D & & \\
-\midrule
-TT-small & Wormhole Galaxy, 8$\times$1 submesh & 8$\times$12\,GB DRAM & — \\
-         & 8 chips, FABRIC\_1D & & \\
-\bottomrule
-\end{tabular}}
-\end{table}
-
-The CPU and Wormhole devices share the same host machine (AMD EPYC 9354P, 32 cores, 566\,GB system RAM). The A100 is located in a separate server (Intel Xeon Icelake, 14 cores, 117\,GB RAM) connected over the same network; HuggingFace inference runs locally on that node. CPU throughput is measured on a single physical core of the EPYC host to isolate serial inference performance from parallelism.
+The CPU and Wormhole devices share the same host machine (AMD EPYC 9354P, 32 cores at 3.8\,GHz with 2-way hyperthreading, 566\,GB DDR5 RAM). The A100 is located in a separate server (NVIDIA A100 PCIe 80\,GB~\citep{nvidia2020a100}, 1{,}935\,GB/s HBM2e bandwidth, 312\,TFLOPS BF16; host: Intel Xeon Icelake, 14 cores, 117\,GB RAM) on the same network.
 
 \subsubsection{Software}
 
@@ -37,113 +12,189 @@ All Python code runs under Python 3.10.12. The Wormhole backend uses TTNN~0.67.0
 
 \subsubsection{Configurations}
 
-Four configurations are evaluated and compared:
+Four primary configurations are used as baselines:
 
 \begin{itemize}
-\item \textbf{TT-tiny}: Granite-4.0-h-tiny on 1$\times$4 Wormhole submesh (4 chips, fabric enabled). MoE weights in \texttt{bfloat8\_b}; all others \texttt{bfloat16}.
-\item \textbf{TT-small}: Granite-4.0-h-small on 8$\times$1 Wormhole submesh (8 chips, fabric enabled). All weights \texttt{bfloat16}.
-\item \textbf{CUDA-tiny / CUDA-small}: HuggingFace reference implementation on the NVIDIA A100 80\,GB GPU, \texttt{bfloat16}, via \texttt{transformers.AutoModelForCausalLM} with \texttt{device\_map="cuda"}.
-\item \textbf{CPU-tiny / CPU-small}: Same HuggingFace reference, single CPU core on the host machine, \texttt{bfloat16}.
+\item \textbf{TT-tiny}: Granite-4.0-h-tiny on 1$\times$4 Wormhole submesh (4 chips, fabric enabled). All weights \texttt{bfloat16}. Decode trace enabled.
+\item \textbf{TT-small}: Granite-4.0-h-small on 8$\times$1 Wormhole submesh (8 chips, fabric enabled). MoE weights in \texttt{bfloat8\_b}, all others \texttt{bfloat16}. Decode trace enabled.
+\item \textbf{CUDA-tiny / CUDA-small}: HuggingFace reference on the NVIDIA A100 80\,GB GPU, \texttt{bfloat16}, without \texttt{torch.compile}. A compiled variant (\texttt{torch.compile} with the \texttt{inductor} backend) was also run for comparison (see Section~\ref{sec:discussion-compile}).
+\item \textbf{CPU-tiny / CPU-small}: Same HuggingFace reference on the host machine CPU, \texttt{float32}, without \texttt{torch.compile}. A compiled variant was also run for comparison.
 \end{itemize}
 
-Decode throughput is measured over 18 steady-state steps (skipping step 1 as warmup) with a repetition-penalty sampler ($p=1.3$) to avoid degenerate token loops. All backends generate the same 20 tokens per prompt.
+In total, 24 benchmark runs were performed: 10 on Tenstorrent with both kernels enabled (2 models $\times$ 5 chunk sizes: 192, 256, 320, 384, 512), 6 kernel ablation runs (2 models $\times$ 3 kernel configurations: no kernels, conv1d only, SSM only), 4 on CUDA (2 models $\times$ with/without \texttt{torch.compile}), and 4 on CPU (same). The default chunk size of 256 and the uncompiled CUDA and CPU paths are used as the primary baselines throughout the paper.
+
+Five prompts of increasing length are used: 5, 8, 25, 96, and 176 tokens. Each backend generates 20 tokens per prompt. Let $t_i$ be the time (in seconds) from submitting the $i$-th input token to receiving the corresponding logits (i.e., the time to produce one output token). Decode throughput is
+\begin{equation}
+  \text{tok/s} = \frac{1}{\frac{1}{19}\sum_{i=2}^{20} t_i},
+  \label{eq:throughput}
+\end{equation}
+where step 1 is excluded because it is slightly slower after a cache reset. At each step, a repetition penalty $p{=}1.3$ is applied to the logit $z_j$ of every token $j$ that has already appeared in the output:
+\begin{equation}
+  z_j \leftarrow \begin{cases} z_j / p & \text{if } z_j > 0 \\ z_j \times p & \text{if } z_j \leq 0. \end{cases}
+  \label{eq:rep-penalty}
+\end{equation}
+Dividing a positive logit by $p{>}1$ lowers it, and multiplying a negative logit by $p$ makes it more negative. Both operations reduce the probability of repeating already-seen tokens.
 
 \subsection{Results}
 
-\subsubsection{Decode throughput}
-
-Table~\ref{tab:decode} reports decode throughput in tokens per second for all backends and prompt lengths.
+\subsubsection{Kernel ablation}
+\label{sec:eval-kernel-ablation}
 
 \begin{table}[h]
-\caption{Decode throughput (tok/s) across backends, models, and prompt lengths. Higher is better. A100 = NVIDIA A100 80\,GB; WH = Wormhole Galaxy submesh.}
-\label{tab:decode}
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{llrrrrr}
+\caption{Decode throughput (tok/s) by fused kernel configuration, averaged across all five prompts (C=256). Both kernels active is the default used in all subsequent tables.}
+\label{tab:kernel-ablation}
+\begin{tabular}{lrr}
 \toprule
-Model & Backend & short\_8 & short\_10 & med\_32 & long\_128 & long\_256 \\
-       &          & (5 tok) & (8 tok) & (25 tok) & (96 tok) & (176 tok) \\
+Fused kernel configuration & tiny (tok/s) & small (tok/s) \\
 \midrule
-tiny & CPU (1 core) & 2.54 & 2.55 & 2.55 & 2.55 & 2.57 \\
-tiny & A100 GPU    & 7.65 & 9.40 & 9.32 & 9.34 & 9.19 \\
-tiny & WH 1$\times$4 (trace)  & 10.48 & 10.58 & 10.56 & 10.56 & 10.56 \\
+No fused kernels              & 10.52 & 5.75 \\
+\texttt{conv1d\_decode} only  & 10.60 & 5.82 \\
+\texttt{ssm\_update} only     & 10.56 & 5.75 \\
+Both kernels (default)        & \textbf{10.67} & \textbf{5.86} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both fused kernels contribute independently to decode throughput. For the tiny model, \texttt{conv1d\_decode} adds ${\approx}0.08$ tok/s and \texttt{ssm\_update} adds ${\approx}0.04$ tok/s over the no-kernel baseline; combined they add ${\approx}0.15$ tok/s (${\approx}1.4\%$). For the small model, \texttt{conv1d\_decode} adds ${\approx}0.07$ tok/s. \texttt{ssm\_update} alone provides no measurable gain but contributes an additional ${\approx}0.04$ tok/s when combined with \texttt{conv1d\_decode}. The absolute gains are modest because generating one token at a time means most of the time is spent reading model weights from memory, not doing computation — so reducing the number of operations per Mamba2 step only saves a small fraction of the total step time.
+
+\subsubsection{Granite-4.0-h-tiny}
+
+\begin{table}[h]
+\caption{Decode throughput (tok/s), tiny model. Higher is better. $^*$Token counts for TT/CPU tokenizer; A100 tokenizer produces 98 and 181 tokens for the same prompts.}
+\label{tab:tiny-decode}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrrr}
+\toprule
+Backend & short\_8 & short\_10 & med\_32 & long\_128 & long\_256 \\
+        & (5 tok) & (8 tok) & (25 tok) & (96 tok$^*$) & (176 tok$^*$) \\
 \midrule
-small & CPU (1 core) & 0.65 & 0.65 & 0.54 & 0.54 & 0.64 \\
-small & A100 GPU    & 5.39 & 5.40 & 5.53 & 5.55 & 5.59 \\
-small & WH 8$\times$1 (8 chips) & 5.72 & 5.71 & 5.72 & 5.70 & 5.66 \\
+CPU                           & 2.54 & 2.56 & 2.55 & 2.55 & 2.52 \\
+CPU + \texttt{torch.compile}  & 2.45 & 2.45 & 2.45 & 2.46 & 2.45 \\
+A100                          & 8.99 & 9.04 & 8.49 & 8.58 & 8.94 \\
+A100 + \texttt{torch.compile} & 6.15 & 5.96 & 5.60 & 5.27 & 5.75 \\
+WH 1$\times$4 (trace, C=256)  & \textbf{10.68} & \textbf{10.69} & \textbf{10.65} & \textbf{10.67} & \textbf{10.66} \\
 \bottomrule
 \end{tabular}}
 \end{table}
 
-For the tiny model with trace enabled, the Wormhole 1$\times$4 achieves 10.5--10.6 tok/s — exceeding the A100 (9.2--9.4 tok/s) by $\approx$13\% at steady-state, and is $4\times$ faster than CPU. For the small model (no trace), the Wormhole 8$\times$1 achieves 5.66--5.72 tok/s, exceeding the A100 (5.39--5.59 tok/s) by $\approx$4\% at most prompt lengths. Notably, the Wormhole tiny decode rate is nearly constant across all prompt lengths, whereas the A100 shows lower throughput at very short prefills (short\_8).
-
-\subsubsection{Prefill throughput}
-
-Table~\ref{tab:prefill} shows prefill throughput. Wormhole prefill is bottlenecked by the chunk-scan Mamba2 kernel; chunk size 256 was selected via the sweep in Table~\ref{tab:chunk} (Section~\ref{sec:chunk-tune}). The A100 benefits from PyTorch's highly-tuned batched scan implementation.
-
 \begin{table}[h]
-\caption{Prefill throughput (tok/s). Higher is better.}
-\label{tab:prefill}
+\caption{Prefill TTFT (ms), tiny model. Lower is better. $^*$See Table~\ref{tab:tiny-decode} footnote.}
+\label{tab:tiny-prefill}
 \resizebox{\columnwidth}{!}{%
-\begin{tabular}{llrrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-Model & Backend & short\_10 & med\_32 & long\_128 & long\_256 \\
-       &          & (8 tok) & (25 tok) & (96 tok) & (176 tok) \\
+Backend & short\_8 & short\_10 & med\_32 & long\_128 & long\_256 \\
+        & (5 tok) & (8 tok) & (25 tok) & (96 tok$^*$) & (176 tok$^*$) \\
 \midrule
-tiny & CPU     &  0.71 &  2.19 &  8.25 & 14.99 \\
-tiny & A100    & 25.38 & 75.12 & 279.1 & 503.2 \\
-tiny & WH 1$\times$4 & 10.95 & 27.86 &  85.11 & 104.43 \\
-\midrule
-small & CPU     &  0.26 &  0.80 &  2.40 &  5.06 \\
-small & A100    &  9.84 & 28.85 &  95.59 & 178.05 \\
-small & WH 8$\times$1 &  5.40 & 13.67 &  49.97 &  63.58 \\
+CPU                           & 11232 & 11330 & 11479 & 12065 & 12770 \\
+CPU + \texttt{torch.compile}  & 11942 & 12095 & 12148 & 12175 & 12334 \\
+A100                          & \textbf{321} & \textbf{322} & \textbf{370} & \textbf{364} & \textbf{397} \\
+A100 + \texttt{torch.compile} & 391 & 331 & 389 & 444 & 450 \\
+WH 1$\times$4 (trace, C=256)  & 730 & 735 & 889 & 1105 & 1664 \\
 \bottomrule
 \end{tabular}}
 \end{table}
 
-Wormhole prefill throughput is slower than A100 at long sequences (tiny: 104 vs.\ 503 tok/s at 176 tokens; small: 64 vs.\ 178 tok/s). Both benefit from longer sequences due to the chunked-scan structure amortising setup cost.
+The Wormhole tiny model (10.65--10.69 tok/s) exceeds the A100 (8.5--9.0 tok/s) by ${\approx}18\%$ and CPU (2.52--2.56 tok/s) by ${\approx}4\times$ across all prompt lengths. Decode throughput is constant across prompt lengths because trace replay cost is independent of prefill context length. The A100 without compile shows a dip at medium prompt lengths (med\_32, long\_128). \texttt{torch.compile} on the A100 degrades decode to 5.27--6.15 tok/s (see Section~\ref{sec:discussion-compile}). Wormhole prefill TTFT (730--1664\,ms) is 2--4$\times$ slower than the A100 (321--397\,ms).
+
+\subsubsection{Granite-4.0-h-small}
+
+\begin{table}[h]
+\caption{Decode throughput (tok/s), small model. Higher is better. $^*$See Table~\ref{tab:tiny-decode} footnote.}
+\label{tab:small-decode}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrrr}
+\toprule
+Backend & short\_8 & short\_10 & med\_32 & long\_128 & long\_256 \\
+        & (5 tok) & (8 tok) & (25 tok) & (96 tok$^*$) & (176 tok$^*$) \\
+\midrule
+CPU                           & 0.66 & 0.65 & 0.65 & 0.65 & 0.65 \\
+CPU + \texttt{torch.compile}  & 0.64 & 0.65 & 0.65 & 0.65 & 0.64 \\
+A100                          & \textbf{7.12} & \textbf{8.15} & \textbf{8.13} & \textbf{8.12} & \textbf{8.06} \\
+A100 + \texttt{torch.compile} & 4.83 & 6.69 & 6.83 & 6.81 & 6.77 \\
+WH 8$\times$1 (trace, C=256)  & 5.89 & 5.84 & 5.85 & 5.85 & 5.86 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table}[h]
+\caption{Prefill TTFT (ms), small model. Lower is better. $^*$See Table~\ref{tab:tiny-decode} footnote.}
+\label{tab:small-prefill}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrrr}
+\toprule
+Backend & short\_8 & short\_10 & med\_32 & long\_128 & long\_256 \\
+        & (5 tok) & (8 tok) & (25 tok) & (96 tok$^*$) & (176 tok$^*$) \\
+\midrule
+CPU                           & 30119 & 30500 & 31049 & 32033 & 32969 \\
+CPU + \texttt{torch.compile}  & 30486 & 30860 & 31687 & 32270 & 33600 \\
+A100                          & \textbf{790} & \textbf{737} & \textbf{758} & \textbf{778} & \textbf{789} \\
+A100 + \texttt{torch.compile} & 839 & 752 & 771 & 791 & 802 \\
+WH 8$\times$1 (trace, C=256)  & 1408 & 1491 & 1838 & 1918 & 2790 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+The small model on 8 chips achieves 5.84--5.89 tok/s, below the A100 (7.12--8.15 tok/s) by ${\approx}20\%$ but ${\approx}9\times$ faster than CPU (0.65--0.66 tok/s). As with tiny, Wormhole decode throughput is constant across all prompt lengths. \texttt{torch.compile} on the A100 substantially degrades decode (4.83--6.83 tok/s vs.\ 7.1--8.2 tok/s uncompiled). See Section~\ref{sec:discussion-compile}. Wormhole prefill TTFT (1408--2790\,ms) is 2--4$\times$ slower than A100 (737--790\,ms).
 
 \subsubsection{Model load time}
 
 \begin{table}[h]
-\caption{Model load time (seconds). Lower is better.}
+\caption{Model load time (seconds). Lower is better. Compile variants (\texttt{torch.compile}) are not shown separately: \texttt{torch.compile} wraps the model after loading and its JIT compilation is deferred to the first forward pass, so load time is unchanged.}
 \label{tab:load}
 \begin{tabular}{llr}
 \toprule
 Model & Backend & Load time (s) \\
 \midrule
-tiny & CPU     & 1.9 \\
-tiny & A100    & 4.1 \\
-tiny & WH 1$\times$4 & 23.4 \\
+tiny & CPU                & \textbf{1.9} \\
+tiny & A100               & 37.7 \\
+tiny & WH 1$\times$4      & 23.0 \\
 \midrule
-small & CPU     & 23.2 \\
-small & A100    & 175.5 \\
-small & WH 8$\times$1 & 452 \\
+small & CPU               & \textbf{6.5} \\
+small & A100              & 14.7 \\
+small & WH 8$\times$1     & 464 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Wormhole load time for tiny (23\,s) is dominated by uploading 64-expert weight matrices to 4 devices over PCIe. For small (452\,s), uploading 72-expert matrices to 8 devices over PCIe is the bottleneck; the much larger per-device weight footprint (13\,GB) makes this substantially slower than both the A100 (175\,s) and the tiny model.
+Both backends load weights from the local HuggingFace cache. Wormhole tiny (23\,s) loads faster than the A100 (38\,s). Wormhole small (464\,s) is substantially slower than the A100 (15\,s), reflecting the cost of distributing weights across 8 devices over PCIe.
 
 \subsubsection{Output quality}
 \label{sec:eval-quality}
 
-The tiny model on Wormhole with trace enabled produces coherent, on-topic responses matching the A100 output for all five prompts (e.g., ``Paris. The Eiffel Tower, a symbol of the city\ldots'' for the France prompt). Prior to the bypass-mode fix, the tiny model with inline trace capture produced incoherent output due to the off-by-one state lag described in Section~\ref{sec:bottleneck}; the corrected \texttt{capture\_decode\_trace()} approach restores full output quality. The small model on Wormhole shows some garbled tokens at short prompts, suggesting a numerical issue in the small-model logits path that is not present in the tiny model. The small model on A100 and CPU produces clean output. This correctness gap in the small TT implementation is an outstanding issue.
+Both models on Wormhole with trace enabled produce coherent, on-topic responses across all five prompts. All five TTNN chunk-size variants produce token-for-token identical outputs, confirming that chunk size does not affect generation quality. Six distinct agreement patterns are observed:
+
+\begin{itemize}
+  \item \textbf{WH, CPU, CPU+compile, A100, A100+compile all identical.} Example — tiny, \textit{``The largest planet in our solar system is''}: all backends: \textit{``Jupiter. It has a diameter of about 88,846 miles (142,984 kilometers), which makes\ldots''}
+
+  \item \textbf{WH close to CPU and A100 but differs at the tail.} Agreement through most tokens, divergence on the last few words. Example — tiny, \textit{``The capital of France is''}: WH: \textit{``\ldots skyline and one that many people\ldots''}; CPU / A100: \textit{``\ldots skyline and one among many tourist\ldots''}
+
+  \item \textbf{CPU and CPU+compile always identical.} \texttt{torch.compile} does not change output on CPU. Example — tiny, long\_128: CPU and CPU+compile both: \textit{``\ldots or other techniques for improved efficiency. However, despite their impressive capabilities, LLMs still face\ldots''}
+
+  \item \textbf{A100 and A100+compile can differ.} Triton autotuning changes floating-point operation order. Example — tiny, long\_128: A100: \textit{``\ldots like LSTMs or GATs for improved performance. The training process involves\ldots''}; A100+compile: \textit{``\ldots like LSTMs or GATs (Graph Attention Networks) for improved performance. However, despite\ldots''}
+
+  \item \textbf{CPU and A100 differ on longer prompts.} float32 (CPU) vs.\ bfloat16 (A100) accumulation diverges over many tokens. Example — tiny, long\_128: CPU: \textit{``\ldots or other techniques for improved efficiency\ldots''}; A100: \textit{``\ldots like LSTMs or GATs for improved performance\ldots''}
+
+  \item \textbf{WH differs from both CPU and A100 on longer prompts.} WH uses bfloat16 on different hardware with a different tokenizer. Example — tiny, long\_128: WH: \textit{``\ldots like LSTMs or RNNs for improved performance\ldots''}; CPU: \textit{``\ldots or other techniques for improved efficiency\ldots''}; A100: \textit{``\ldots like LSTMs or GATs for improved performance\ldots''}
+\end{itemize}
 
 \subsection{Discussion}
 
-\textbf{Decode gap vs.\ A100.}
-The tiny model on 4 Wormhole chips with trace enabled (10.5--10.6 tok/s) exceeds a single A100 (9.2--9.4 tok/s) by $\approx$13\%. The trace collapses 500+ PCIe dispatches per step to a single replay command, eliminating the dispatch-bound bottleneck that previously held steady-state throughput at 9.4--9.6 tok/s. Given that the A100 benefits from a mature Triton and CUDA Mamba2 kernel stack, this is a strong result for early-stage hardware bring-up.
+\textbf{Tiny model: Wormhole exceeds A100.}
+The tiny model on 4 Wormhole chips (10.65--10.69 tok/s) is ${\approx}18\%$ faster than the A100 (8.5--9.0 tok/s). Decode trace recording (Section~\ref{sec:challenges}) replaces the per-token command overhead with a single replay call, which is the key reason Wormhole wins at this scale. The A100 has years of software optimisation behind it, so outperforming it on a relatively new and less mature hardware platform is a strong result.
 
-The small model on 8 chips achieves 5.66--5.72 tok/s, exceeding the A100 (5.39--5.59 tok/s) by $\approx$4\% at most prompt lengths. Unlike the tiny model, the small model runs without trace; the dominant cost is DRAM bandwidth across 8 devices streaming $\sim$6.5\,GB of weights per step.
+\textbf{Small model: Wormhole below A100.}
+The small model on 8 chips (5.84--5.89 tok/s) is ${\approx}20\%$ slower than the A100 (7.1--8.2 tok/s). The bottleneck is reading weights from memory: at this model size, each token generation must load a large amount of data across 8 chips, and the 8$\times$1 mesh has less total memory bandwidth than the A100's HBM2e. Trace is enabled but the memory cost outweighs the command overhead savings.
 
 \textbf{CPU baselines.}
-Both CPU baselines (2.6 tok/s tiny, 0.6 tok/s small) are far below Wormhole and A100, confirming that inference-time throughput requires hardware acceleration. The tiny CPU load time (1.9\,s) is fast because weights are small enough to fit in CPU cache-warm allocations; the small model (23.6\,s) requires paging several GB of weights.
+Both CPU results (2.5--2.6 tok/s tiny, 0.65--0.66 tok/s small) are far below Wormhole and A100. Wormhole is ${\approx}4\times$ faster than CPU for tiny and ${\approx}9\times$ for small. \texttt{torch.compile} gives no meaningful improvement on CPU for this model family (Section~\ref{sec:discussion-compile}).
 
 \textbf{Constant decode rate on Wormhole.}
-Unlike the A100 where decode throughput improves with context length (9.2 to 9.4 tok/s from short to long), Wormhole decode with trace is flat at 10.5--10.6 tok/s for tiny regardless of prompt length. With trace, the dominant cost is device-side compute and fabric collectives inside the replay, which are independent of how many tokens were prefilled. The A100 improvement at longer contexts likely reflects better amortisation of per-step fixed costs over longer sequences.
+Wormhole throughput does not change across prompt lengths (10.65--10.69 tok/s for tiny, 5.84--5.89 tok/s for small) because the trace replays the same fixed sequence of operations regardless of how long the input was. The A100 without \texttt{torch.compile} dips slightly at medium prompt lengths (med\_32, long\_128), likely because its GPU kernels are less efficient at those particular input sizes.
 
-\textbf{Small model output quality.}
-The garbled small-model responses on Wormhole (but not on CPU or A100) indicate a numerical issue specific to the TT path, likely in the logits gather or in the LM head shard composition across the 8$\times$1 mesh. The tiny model's logits gather axis (dim=3 for vocab sharding) was corrected in commit \texttt{8dae1dc} and produces clean output; the same fix may not be fully validated for the 8$\times$1 configuration. This is a correctness bug, not a performance issue, and does not affect the timing measurements.
+\textbf{Fused kernel gains at larger batch sizes.}
+All benchmarks in this paper use batch size 1, where each token generation step reads the full model weights from memory but does very little arithmetic. When only one token is generated at a time, the time saved by fusing operations is small compared to the total weight-reading cost, which is why the kernel gains are only ${\approx}1$--2\%. At larger batch sizes, the same weights are shared across multiple requests in a single step, so reading weights becomes less of a bottleneck and the arithmetic savings from fused kernels matter more. The current implementation does not support batched decode, but extending the fused kernels to batch size $>1$ is a natural next step and would likely yield more significant gains.
 
-\textbf{Trace correctness.}
-The trace off-by-one issue (Section~\ref{sec:bottleneck}) caused incoherent output whenever trace was captured inline during the generation loop. After switching to the \texttt{capture\_decode\_trace()} approach, the tiny-model trace and no-trace paths produce token-for-token identical top-1 predictions at every decode step, confirming full numerical correctness of the trace path.
+\textbf{\texttt{torch.compile} on CPU and CUDA.}
+\label{sec:discussion-compile}
+\texttt{torch.compile} does not improve throughput for either backend. On CPU, compiled decode (2.45--2.46 tok/s tiny, 0.64--0.65 tok/s small) is marginally slower than uncompiled, with similar prefill time after warmup. On CUDA, compiled decode (5.27--6.15 tok/s tiny, 4.83--6.83 tok/s small) is substantially slower than uncompiled (8.5--9.0 tok/s tiny, 7.1--8.2 tok/s small). The main reason is that the Mamba2 recurrent state prevents CUDA graph capture, which is the primary mechanism by which \texttt{torch.compile} speeds up GPU inference; without it, the compilation overhead outweighs any gains. The notably lower result for small at short\_8 (4.83 tok/s) is because \texttt{torch.compile} runs additional setup work the first time it sees a new input size, which slows down that prompt's benchmark. The A100 rows in Tables~\ref{tab:tiny-decode} and~\ref{tab:small-decode} therefore use the uncompiled path.

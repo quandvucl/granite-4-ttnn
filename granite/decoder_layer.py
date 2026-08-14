@@ -54,6 +54,8 @@ class TTGraniteDecoderLayer:
         moe_weight_dtype=ttnn.bfloat8_b,
         mamba_weight_dtype=None,
         moe_use_all_gather=True,
+        use_conv1d_kernel=True,
+        use_ssm_kernel=True,
     ):
         self.device = device
         self.layer_idx = layer_idx
@@ -133,6 +135,8 @@ class TTGraniteDecoderLayer:
                     chunk_size_override=mamba_chunk_size,
                     weight_dtype=mamba_weight_dtype,
                     tt_ccl=tt_ccl,
+                    use_conv1d_kernel=use_conv1d_kernel,
+                    use_ssm_kernel=use_ssm_kernel,
                 )
             else:
                 self.mamba = None

@@ -3,10 +3,10 @@
 
 \subsection{Measured Decode Latency (With Trace)}
 
-Table~\ref{tab:timing} shows the per-component timing breakdown for a single decode step on the 1$\times$4 Wormhole mesh with trace enabled, averaged over 16 steady-state steps (steps 3--18, after 2 warmup and 1 first-trace-replay step).
+Table~\ref{tab:timing} shows the per-component timing for a single generation step on the 1$\times$4 Wormhole mesh with trace enabled, averaged over 16 steady-state steps (steps 3--18, after 2 warmup and 1 first-trace-replay step).
 
 \begin{table}[h]
-\caption{Decode step timing (Granite-4.0-h-tiny, 1$\times$4 mesh, fabric + trace enabled).}
+\caption{Generation step timing (Granite-4.0-h-tiny, 1$\times$4 mesh, fabric + trace enabled).}
 \label{tab:timing}
 \begin{tabular}{lrr}
 \toprule
@@ -22,11 +22,11 @@ Throughput & \multicolumn{2}{c}{10.5--10.6 tok/s} \\
 \end{tabular}
 \end{table}
 
-With trace enabled, the single \texttt{execute\_trace} dispatch replaces $\approx$500 individual PCIe round-trips. The step time drops from 130--145\,ms (no trace) to $\approx$95\,ms, a $\approx$33\% improvement. Mamba2 remains the dominant contributor because its per-layer recurrent ops are compute- and DRAM-bound; MoE all-gather collectives overlap with compute during replay.
+With trace enabled, the single \texttt{execute\_trace} command replaces $\approx$500 individual host-to-device round-trips. The step time drops from 130--145\,ms (no trace) to $\approx$95\,ms, a $\approx$33\% improvement. Mamba2 remains the largest contributor because its per-layer recurrent operations are compute- and memory-bound; MoE all-gather operations overlap with compute during replay.
 
 \subsection{Bypass-Mode Off-by-One Discovery}
 
-During development, an early inline capture strategy (triggering trace capture inside the generation loop at step $t$) produced incoherent responses across all prompts. Step-by-step token comparison showed that WITH TRACE, step $t$'s top token matched NO TRACE step $t-1$ — a consistent one-step lag. This was traced to Metal's bypass mode:
+During development, an early inline capture strategy (triggering trace capture inside the generation loop at step $t$) produced incoherent responses across all prompts. Step-by-step token comparison showed that WITH TRACE, step $t$'s top token matched NO TRACE step $t-1$ -- a consistent one-step lag. This was due to how the Metal framework handles trace recording:
 
 \begin{enumerate}
 \item \texttt{begin\_trace\_capture()} calls \texttt{set\_bypass\_mode(true)} on all device CQs.
@@ -36,7 +36,7 @@ During development, an early inline capture strategy (triggering trace capture i
 \item The captured step's \texttt{execute\_trace} replay then processes the \emph{current} embedding with the \emph{previous} device state, producing the same output as step $t-1$.
 \end{enumerate}
 
-This is not a bug in Metal; it is the intended behaviour that allows allocations to be fixed. The fix is to capture the trace with a dummy input \emph{outside} the generation loop (Algorithm~\ref{alg:trace}), so the capture step never corrupts the autoregressive state.
+This is not a bug in Metal; it is how the framework enables fixed memory addresses. The solution is to capture the trace with a dummy input \emph{outside} the generation loop (Algorithm~\ref{alg:trace}), so the recording step never corrupts the autoregressive state.
 
 \subsection{Latency Decomposition}
 
@@ -45,9 +45,9 @@ We decompose the decode step latency into four components:
 T_{\mathrm{step}} = T_{\mathrm{dispatch}} + T_{\mathrm{compute}} + T_{\mathrm{fabric}} + T_{\mathrm{DRAM}}
 \label{eq:roofline}
 \end{equation}
-Without trace, $T_{\mathrm{dispatch}}$ from $\approx$500 PCIe round-trips dominates, accounting for the majority of the 130--145\,ms step time.
+Without trace, $T_{\mathrm{dispatch}}$ from $\approx$500 host-to-device round-trips dominates, accounting for most of the 130--145\,ms step time.
 
-With trace, $T_{\mathrm{dispatch}}$ collapses to $\approx$1\,ms (one replay), reducing step time to $\approx$95\,ms. The remaining time is split across $T_{\mathrm{compute}}$, $T_{\mathrm{fabric}}$ (all-gather collectives), and $T_{\mathrm{DRAM}}$ (weight streaming); further profiling inside the trace replay would be required to separate these contributions.
+With trace, $T_{\mathrm{dispatch}}$ drops to $\approx$1\,ms (one replay command), reducing step time to $\approx$95\,ms. The remaining time is split across $T_{\mathrm{compute}}$ (arithmetic), $T_{\mathrm{fabric}}$ (collective operations), and $T_{\mathrm{DRAM}}$ (weight reads); measuring inside the trace would be needed to separate these components.
 
 \subsection{Path Forward}
 

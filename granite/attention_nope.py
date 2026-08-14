@@ -6,10 +6,6 @@ import ttnn
 
 class AttentionNoPE:
     """TTNN attention without position embeddings (Granite uses NoPE).
-
-    Works on both single devices and mesh devices.  On a mesh all weights and
-    the KV cache are replicated — attention has no all-reduce because each
-    device computes the identical result independently.
     """
 
     def __init__(

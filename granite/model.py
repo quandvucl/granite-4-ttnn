@@ -123,6 +123,9 @@ class TTGraniteMoeHybridForCausalLM:
         moe_weight_dtype=None,
         mamba_weight_dtype=None,
         moe_use_all_gather=True,
+        fabric_1d: bool = False,
+        use_conv1d_kernel: bool = True,
+        use_ssm_kernel: bool = True,
     ):
         self.device = device
         self.mamba_chunk_size = mamba_chunk_size
@@ -136,6 +139,8 @@ class TTGraniteMoeHybridForCausalLM:
         self.use_tt_moe = use_tt_moe
         self.moe_weight_dtype = moe_weight_dtype if moe_weight_dtype is not None else ttnn.bfloat8_b
         self.mamba_weight_dtype = mamba_weight_dtype  # None means use activation dtype (bfloat16)
+        self.use_conv1d_kernel = use_conv1d_kernel
+        self.use_ssm_kernel = use_ssm_kernel
 
         # Extract HF components
         self.embed_tokens = hf_model.model.embed_tokens
@@ -181,7 +186,9 @@ class TTGraniteMoeHybridForCausalLM:
                 print(f"  Mesh device detected ({device.get_num_devices()} devices) - tensor parallelism enabled")
             self.tt_ccl = get_tt_ccl(device) if device.get_num_devices() > 1 else None
             _ms = device.shape
-            self._is_multirow_mesh = _ms[0] > 1 and _ms[1] > 1
+            # FABRIC_1D never triggers composite all-gather (no dynamic alloc), so
+            # multirow meshes are trace-safe when fabric_1d=True.
+            self._is_multirow_mesh = _ms[0] > 1 and _ms[1] > 1 and not fabric_1d
         else:
             self.tt_ccl = None
             self._is_multirow_mesh = False
@@ -224,39 +231,41 @@ class TTGraniteMoeHybridForCausalLM:
             up_weight = input_linear_t[:, actual_intermediate_size:].contiguous()
             down_weight = output_linear_weight_hf.T.contiguous()
 
-            # Enable column-parallel MLP for meshes with >= 4 devices.
-            # Small on 4 dev (H=4096, F=1536): 40×37.7 MB replicated = 1.5 GB — needs TP.
-            # Tiny (H=1536, F=768, 4 devices): TP also works (F/4=384, divisible).
+            # Shard shared MLP across all available devices using whichever mesh axis has >1 devices.
+            # 1×N mesh (tiny): shard across cols (cluster_axis=1).
+            # N×1 mesh (small 8×1): shard across rows (cluster_axis=0) — same axis Mamba uses,
+            #   trace-safe, no composite all-gather. F/8=192 per device; bandwidth-bound at
+            #   batch=1 so underutilization of Tensix compute doesn't matter.
             _num_dev = device.get_num_devices() if is_mesh else 1
-            use_tensor_parallel = is_mesh and _num_dev > 4
-            dtype = config.get_ttnn_dtype()
+            act_dtype = config.get_ttnn_dtype()   # bf16 — matmul output dtype
+            # bf8 weights only pay off on large matrices (small model, H=4096).
+            # Tiny (H=1536): matmuls are compute-fast in bf16; bf8 unpacking overhead exceeds BW saving.
+            wt_dtype  = self.moe_weight_dtype if config.hidden_size > 2048 else act_dtype
+
+            # SharedMLP TP: col-parallel on meshes with >4 devices and num_cols > 1.
+            # Tiny (4 devices, 1×4): disabled — 40 all-gathers × ~12µs = 0.5ms overhead > savings.
+            # Small (8 devices, 8×4): num_cols=4 > 1 and _num_dev > 4 → enabled.
+            # Row-parallel all-gather always loses at batch=1 (latency >> BW saving).
+            mesh_shape = device.shape if is_mesh else ttnn.MeshShape(1, 1)
+            num_cols = mesh_shape[1] if is_mesh else 1
+            use_tensor_parallel = is_mesh and num_cols > 1 and _num_dev > 4
 
             if use_tensor_parallel:
-                mesh_shape = device.shape
-                num_cols = mesh_shape[1]
-                num_rows = mesh_shape[0]
+                num_tp, cluster_axis = num_cols, 1
+                fwd_mapper = ttnn.ShardTensor2dMesh(device, dims=(None, 1), mesh_shape=mesh_shape)
+                rev_mapper = ttnn.ShardTensor2dMesh(device, dims=(None, 0), mesh_shape=mesh_shape)
                 F = gate_weight.shape[1]
-                # Only shard shared MLP across cols (N×M mesh, M>1).
-                # 8×1: num_cols=1 → replicated (no TP for shared MLP on row-only mesh).
-                # Replicated is faster: matmul at F=192/device underutilizes Tensix cores,
-                # and 40 all_gather calls/step exceed savings vs replicated at F=1536.
-                if num_cols == 1:
-                    use_tensor_parallel = False
-                else:
-                    num_tp, cluster_axis = num_cols, 1
-                    fwd_mapper = ttnn.ShardTensor2dMesh(device, dims=(None, 1), mesh_shape=mesh_shape)
-                    rev_mapper = ttnn.ShardTensor2dMesh(device, dims=(None, 0), mesh_shape=mesh_shape)
-                if use_tensor_parallel and F % num_tp == 0:
+                if F % num_tp == 0:
                     def _upload_fwd(t):
                         return ttnn.from_torch(
-                            t, device=device, dtype=dtype,
+                            t, device=device, dtype=wt_dtype,
                             layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                             mesh_mapper=fwd_mapper,
                         )
 
                     def _upload_rev(t):
                         return ttnn.from_torch(
-                            t, device=device, dtype=dtype,
+                            t, device=device, dtype=wt_dtype,
                             layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                             mesh_mapper=rev_mapper,
                         )
@@ -266,7 +275,7 @@ class TTGraniteMoeHybridForCausalLM:
                         w2=_upload_rev(down_weight),
                         w3=_upload_fwd(up_weight),
                         num_cols=num_tp,
-                        dtype=dtype,
+                        dtype=act_dtype,
                         tt_ccl=self.tt_ccl,
                         cluster_axis=cluster_axis,
                     )
@@ -276,7 +285,7 @@ class TTGraniteMoeHybridForCausalLM:
             if not use_tensor_parallel:
                 def _upload_replicated(t):
                     return ttnn.from_torch(
-                        t, device=device, dtype=dtype,
+                        t, device=device, dtype=wt_dtype,
                         layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                         mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh else None,
                     )
@@ -285,7 +294,7 @@ class TTGraniteMoeHybridForCausalLM:
                     w1=_upload_replicated(gate_weight),
                     w2=_upload_replicated(down_weight),
                     w3=_upload_replicated(up_weight),
-                    dtype=dtype,
+                    dtype=act_dtype,
                 )
 
             layer = TTGraniteDecoderLayer(
@@ -306,6 +315,8 @@ class TTGraniteMoeHybridForCausalLM:
                 moe_weight_dtype=self.moe_weight_dtype,
                 mamba_weight_dtype=self.mamba_weight_dtype,
                 moe_use_all_gather=self.moe_use_all_gather,
+                use_conv1d_kernel=self.use_conv1d_kernel,
+                use_ssm_kernel=self.use_ssm_kernel,
             )
 
             self.layers.append(layer)
@@ -693,6 +704,9 @@ class TTGraniteMoeHybridForCausalLM:
         moe_weight_dtype=None,
         mamba_weight_dtype=None,
         moe_use_all_gather=True,
+        fabric_1d: bool = False,
+        use_conv1d_kernel: bool = True,
+        use_ssm_kernel: bool = True,
     ):
         if verbose:
             print(f"\n=== Loading {model_name} ===")
@@ -728,6 +742,56 @@ class TTGraniteMoeHybridForCausalLM:
             moe_weight_dtype=moe_weight_dtype,
             mamba_weight_dtype=mamba_weight_dtype,
             moe_use_all_gather=moe_use_all_gather,
+            fabric_1d=fabric_1d,
+            use_conv1d_kernel=use_conv1d_kernel,
+            use_ssm_kernel=use_ssm_kernel,
         )
 
         return tt_model
+
+    @classmethod
+    def from_hf_model(
+        cls,
+        hf_model,
+        device,
+        dtype: str = "bfloat16",
+        verbose: bool = True,
+        use_tt_attention: bool = False,
+        use_tt_mamba: bool = False,
+        use_tt_moe: bool = True,
+        mamba_chunk_size: int = None,
+        max_cache_length: int = None,
+        moe_weight_dtype=None,
+        mamba_weight_dtype=None,
+        moe_use_all_gather=True,
+        fabric_1d: bool = False,
+        use_conv1d_kernel: bool = True,
+        use_ssm_kernel: bool = True,
+    ):
+        """Construct TT model from an already-loaded HF model — skips HF download/load.
+
+        Use this when iterating on TT config (TP, dtype, mesh shape) to avoid
+        re-paying the HF model load cost each time.
+        """
+        config_kwargs = {"dtype": dtype}
+        if max_cache_length is not None:
+            config_kwargs["max_cache_length"] = max_cache_length
+        tt_config = TTGraniteConfig.from_hf_config(hf_model.config, **config_kwargs)
+        if verbose:
+            tt_config.print_summary()
+        return cls(
+            device,
+            hf_model,
+            tt_config,
+            verbose=verbose,
+            use_tt_attention=use_tt_attention,
+            use_tt_mamba=use_tt_mamba,
+            use_tt_moe=use_tt_moe,
+            mamba_chunk_size=mamba_chunk_size,
+            moe_weight_dtype=moe_weight_dtype,
+            mamba_weight_dtype=mamba_weight_dtype,
+            moe_use_all_gather=moe_use_all_gather,
+            fabric_1d=fabric_1d,
+            use_conv1d_kernel=use_conv1d_kernel,
+            use_ssm_kernel=use_ssm_kernel,
+        )

@@ -32,6 +32,8 @@ class TensorParallelMamba:
         chunk_size_override=None,
         weight_dtype=None,
         tt_ccl=None,
+        use_conv1d_kernel=True,
+        use_ssm_kernel=True,
     ):
         self.hf_mamba = hf_mamba
         self.device = device
@@ -40,6 +42,8 @@ class TensorParallelMamba:
         self.tensor_parallel = tensor_parallel
         self.layer_idx = hf_mamba.layer_idx
         self.tt_ccl = tt_ccl
+        self.use_conv1d_kernel = use_conv1d_kernel
+        self.use_ssm_kernel = use_ssm_kernel
 
         self.is_mesh = _is_mesh_device(device)
         self.num_devices = device.get_num_devices() if self.is_mesh else 1
@@ -99,8 +103,16 @@ class TensorParallelMamba:
             layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self.mesh_mapper,
         )
-        # Keep _conv_cache_cols for prefill _seed_state compatibility (read-only after init)
-        self._conv_cache_cols = None  # no longer used in decode path
+        # Per-column cache tensors — used by _conv1d_decode_tt fallback (no-kernel path).
+        self._conv_cache_cols = [
+            ttnn.from_torch(
+                torch.zeros(1, 1, conv_dim, 1, dtype=torch.bfloat16),
+                device=self.device, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=self.mesh_mapper,
+            )
+            for _ in range(kernel_size)
+        ]
         self._conv_pos = 0
 
     def _load_weights(self):
@@ -108,10 +120,12 @@ class TensorParallelMamba:
 
         if self.is_mesh and self.num_devices > 1 and self.tensor_parallel:
             mesh_shape = self.device.shape
+            num_rows = mesh_shape[0]
             num_cols = mesh_shape[1]
-            # 8×1 mesh: shard last dim across rows (cluster_axis=0).
-            # N×M mesh (M>1): shard last dim across cols (cluster_axis=1).
-            if num_cols == 1:
+            # Always shard Mamba across the axis with more devices (rows on Galaxy).
+            # This gives 8-way TP on both 8×1 and 8×4 meshes.
+            # For 8×4: cols replicate the same row-sharded computation — trace-safe.
+            if num_rows >= num_cols:
                 tp_mapper = ttnn.ShardTensor2dMesh(self.device, dims=(-1, None), mesh_shape=mesh_shape)
                 self._tp_cluster_axis = 0
             else:
@@ -215,6 +229,19 @@ class TensorParallelMamba:
         )
         self._conv_out_tt = ttnn.allocate_tensor_on_device(
             ttnn.Shape([1, 1, C, 1]), ttnn.bfloat16, ttnn.TILE_LAYOUT,
+            self.device, ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+        # Pre-allocated output buffers for the fused ssm_update kernel (trace-safe fixed addresses).
+        H = self.num_heads
+        D = self.head_dim
+        N = self.ssm_state_size
+        self._ssm_hout_tt = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, H, D, N]), ttnn.bfloat16, ttnn.TILE_LAYOUT,
+            self.device, ttnn.DRAM_MEMORY_CONFIG,
+        )
+        self._ssm_y_tt = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, H, D, 1]), ttnn.bfloat16, ttnn.TILE_LAYOUT,
             self.device, ttnn.DRAM_MEMORY_CONFIG,
         )
 
@@ -648,6 +675,10 @@ class TensorParallelMamba:
         zero_cache = ttnn.zeros_like(self._conv_cache_tt)
         ttnn.assign(zero_cache, self._conv_cache_tt)
         zero_cache.deallocate(True)
+        for col in self._conv_cache_cols:
+            z = ttnn.zeros_like(col)
+            ttnn.assign(z, col)
+            z.deallocate(True)
         self._conv_pos = 0
         zero_pad = ttnn.zeros_like(self._prefill_conv_pad_tt)
         ttnn.assign(zero_pad, self._prefill_conv_pad_tt)
@@ -717,14 +748,17 @@ class TensorParallelMamba:
         projected_tt.deallocate(True)
 
         xBC_tt = ttnn.reshape(xBC_tt, [1, 1, conv_dim, 1])
-        # Fused conv1d: shift cache, dot product, bias, silu — single kernel dispatch.
-        new_cache_tt, conv_out_tt = _conv1d_decode_kernel(
-            xBC_tt, self._conv_cache_tt, self._conv_w_tt, self._conv_bias_decode_tt,
-            self.device, self._conv_new_cache_tt, self._conv_out_tt,
-        )
-        xBC_tt.deallocate(True)
-        # Update cache in-place (fixed address preserved for trace replay).
-        ttnn.assign(new_cache_tt, self._conv_cache_tt)
+        if self.use_conv1d_kernel:
+            # Fused conv1d: shift cache, dot product, bias, silu — single kernel dispatch.
+            new_cache_tt, conv_out_tt = _conv1d_decode_kernel(
+                xBC_tt, self._conv_cache_tt, self._conv_w_tt, self._conv_bias_decode_tt,
+                self.device, self._conv_new_cache_tt, self._conv_out_tt,
+            )
+            xBC_tt.deallocate(True)
+            # Update cache in-place (fixed address preserved for trace replay).
+            ttnn.assign(new_cache_tt, self._conv_cache_tt)
+        else:
+            conv_out_tt = self._conv1d_decode_tt(xBC_tt)  # xBC_tt deallocated inside
 
         x_tt     = conv_out_tt[:, :, :inter, :]
         B_raw_tt = conv_out_tt[:, :, inter:inter + n_g * N, :]
@@ -758,20 +792,35 @@ class TensorParallelMamba:
         dtx_tt.deallocate(True); B_tt.deallocate(True)
 
         # SSM state update: h = dA*state + dBx,  y = sum_n(h * C)
-        # Trace-safe: assign new state into the fixed-address buffer (no dealloc+reallocate).
-        C_tt = ttnn.unsqueeze(C_tt, -2)   # [B, H, N] -> [B, H, 1, N]
-        new_state = ttnn.addcmul(dBx_tt, dA_tt, self._ssm_state_tt,
-                                 memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        dA_tt.deallocate(True); dBx_tt.deallocate(True)
-        ttnn.assign(new_state, self._ssm_state_tt)
-        new_state.deallocate(True)
+        if self.use_ssm_kernel:
+            # Fused Metal kernel: single DRAM pass over dBx, dA, state, C.
+            # C_tt stays [1, H, N] — kernel handles the D-broadcast internally.
+            hout_tt, y_raw_tt = _ssm_update_kernel(
+                dBx_tt, dA_tt, self._ssm_state_tt, C_tt, self.device,
+                hout_tt=self._ssm_hout_tt, y_tt=self._ssm_y_tt,
+                cache_bust_id=self.layer_idx,
+            )
+            dA_tt.deallocate(True); dBx_tt.deallocate(True); C_tt.deallocate(True)
+            # Update state in-place (fixed address preserved for trace replay).
+            ttnn.assign(hout_tt, self._ssm_state_tt)
+            # y_raw_tt is [1, H, D, 1] (reduce_w layout); squeeze last dim.
+            y_tt = y_raw_tt[:, :, :, 0]
+            y_tt = ttnn.reshape(y_tt, [batch_size, H, D])
+        else:
+            # Trace-safe: assign new state into the fixed-address buffer (no dealloc+reallocate).
+            C_tt = ttnn.unsqueeze(C_tt, -2)   # [B, H, N] -> [B, H, 1, N]
+            new_state = ttnn.addcmul(dBx_tt, dA_tt, self._ssm_state_tt,
+                                     memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            dA_tt.deallocate(True); dBx_tt.deallocate(True)
+            ttnn.assign(new_state, self._ssm_state_tt)
+            new_state.deallocate(True)
 
-        y_unred = ttnn.mul(self._ssm_state_tt, C_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        C_tt.deallocate(True)
-        y_tt = ttnn.sum(y_unred, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        y_unred.deallocate(True)
+            y_unred = ttnn.mul(self._ssm_state_tt, C_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            C_tt.deallocate(True)
+            y_tt = ttnn.sum(y_unred, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            y_unred.deallocate(True)
+            y_tt = ttnn.reshape(y_tt, [batch_size, H, D])
 
-        y_tt = ttnn.reshape(y_tt, [batch_size, H, D])
         y_tt = ttnn.addcmul(y_tt, self._ssm_D_tt, x_tt,
                             memory_config=ttnn.DRAM_MEMORY_CONFIG)
         x_tt.deallocate(True)

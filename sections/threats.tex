@@ -1,12 +1,10 @@
 \section{Threats to Validity}
 
-Several factors may impact the validity of the results:
+Several factors may affect how the results should be interpreted:
+
 \begin{itemize}
-\item Timing measurements are taken on a shared Galaxy system; other tenants' workloads may affect chip thermal state and PCIe bus utilisation.
-\item Decode throughput on the 1$\times$4 Wormhole mesh varies between 10.5 and 10.6 tok/s across runs with identical code and a warm compiled-kernel cache; cold-cache runs (first run after \texttt{rm -rf generated/}) produce similar throughput once TTNN recompiles all kernels in the same session.
-\item The bypass-mode off-by-one behaviour is consistent with the Metal source code, but the exact boundary conditions (e.g., whether \texttt{ttnn.assign} into a buffer allocated before capture is guaranteed stable across firmware versions) have not been confirmed by the Metal team.
+\item All benchmarks use batch size 1 and a fixed sequence of five prompts. Results may not generalise to higher batch sizes, longer sequences, or different prompt distributions.
+\item The A100 and Wormhole benchmarks were run on separate machines at different times, so differences in background system activity between the two machines may slightly affect the measured numbers.
 \end{itemize}
 
-\subsection{Ethics Considerations}
-
-This work focuses on engineering and systems-level optimization of language models. No personal or sensitive data is used in this study. Energy efficiency is a motivating concern for alternative accelerator deployments, though this project does not measure power directly.
+This work focuses on engineering and performance measurement. No personal or sensitive data is used. Power consumption is not measured in this project.

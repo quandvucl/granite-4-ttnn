@@ -25,7 +25,6 @@
 \input{sections/implementation}
 \input{sections/challenges}
 \input{sections/optimisation}
-\input{sections/bottleneck}
 \input{sections/related_work}
 \input{sections/evaluation}
 \input{sections/threats}

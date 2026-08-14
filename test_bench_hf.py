@@ -3,15 +3,17 @@
 Benchmark Granite models on CPU/HuggingFace: model load time + prefill + decode.
 
 Usage:
-  python test_bench_hf.py                        # tiny + small, all prompts
-  python test_bench_hf.py --model tiny           # tiny only
-  python test_bench_hf.py --model small          # small only
-  python test_bench_hf.py --decode-tokens 30     # more decode steps
+  python generate_with_warmup.py                        # tiny + small, all prompts
+  python generate_with_warmup.py --model tiny           # tiny only
+  python generate_with_warmup.py --model small          # small only
+  python generate_with_warmup.py --decode-tokens 30     # more decode steps
 """
 
 import argparse
 import json
 import time
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -62,7 +64,16 @@ DECODE_TOKENS = 20
 REPETITION_PENALTY = 1.3
 
 
-def load_model(model_id, device, compile=True):
+@dataclass
+class BenchRunner:
+    model: Any
+    tokenizer: Any
+    device: str
+    cache_class: Any  # HybridMambaAttentionDynamicCache
+    rep_processor: RepetitionPenaltyLogitsProcessor
+
+
+def load_model(model_id: str, device: str, compile: bool = True):
     if device == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -71,7 +82,6 @@ def load_model(model_id, device, compile=True):
     load_kwargs = dict(torch_dtype=torch_dtype, trust_remote_code=True)
     if device == "cuda":
         load_kwargs["device_map"] = "cuda"
-        load_kwargs["attn_implementation"] = "sdpa"
 
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
@@ -79,128 +89,140 @@ def load_model(model_id, device, compile=True):
         model.to(device)
     model.eval()
 
-    if device == "cuda" and compile:
-        model = torch.compile(model, dynamic=True, backend="inductor", options={
-            "max_autotune": True,
-            "triton.cudagraphs": False,
-            "max_autotune_gemm": True,
-            "coordinate_descent_tuning": True,
-            "shape_padding": True,
-        })
-        torch.cuda.empty_cache()
+    if compile:
+        if device == "cuda":
+            model = torch.compile(model, dynamic=True, backend="inductor", options={
+                "max_autotune": True,
+                "triton.cudagraphs": False,
+                "max_autotune_gemm": True,
+                "coordinate_descent_tuning": True,
+                "shape_padding": True,
+            })
+            torch.cuda.empty_cache()
+        else:
+            model = torch.compile(model, dynamic=True, backend="inductor", options={
+                "cpp_wrapper": True,
+            })
 
-    load_s = time.time() - t0
-    return model, load_s
+    return model, time.time() - t0
 
 
-def _warmup_one(model, ids, decode_steps, device, HybridMambaAttentionDynamicCache):
-    cache = HybridMambaAttentionDynamicCache(
-        model.config, batch_size=1, dtype=model.dtype, device=device
+def _warmup_one(runner: BenchRunner, ids: torch.Tensor, decode_steps: int):
+    cache = runner.cache_class(
+        runner.model.config, batch_size=1, dtype=runner.model.dtype, device=runner.device
     )
-    pos = torch.arange(ids.shape[1], device=device)
+    pos = torch.arange(ids.shape[1], device=runner.device)
     with torch.no_grad():
-        out = model(ids, past_key_values=cache, use_cache=True,
-                    cache_position=pos, position_ids=pos.unsqueeze(0))
+        out = runner.model(ids, past_key_values=cache, use_cache=True,
+                           cache_position=pos, position_ids=pos.unsqueeze(0))
         next_id = out.logits[0, -1, :].argmax().item()
         for step in range(decode_steps):
-            t = torch.tensor([[next_id]], device=device)
-            cp = torch.tensor([ids.shape[1] + step], device=device)
-            out = model(t, past_key_values=cache, use_cache=True,
-                        cache_position=cp, position_ids=cp.unsqueeze(0))
+            t = torch.tensor([[next_id]], device=runner.device)
+            cp = torch.tensor([ids.shape[1] + step], device=runner.device)
+            out = runner.model(t, past_key_values=cache, use_cache=True,
+                               cache_position=cp, position_ids=cp.unsqueeze(0))
             next_id = out.logits[0, -1, :].argmax().item()
     del cache, out
 
 
-def warmup_cuda(model, tokenizer, device, HybridMambaAttentionDynamicCache, decode_steps=20):
+def warmup_cuda(runner: BenchRunner, decode_steps: int = 20):
     """Compile prefill + decode paths across short and longer prompt shapes."""
     for prompt in ["Hi", "Once upon a time in a land far away"]:
-        ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
-        _warmup_one(model, ids, decode_steps, device, HybridMambaAttentionDynamicCache)
+        ids = runner.tokenizer(prompt, return_tensors="pt")["input_ids"].to(runner.device)
+        _warmup_one(runner, ids, decode_steps)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
 
-def pick_next(logits_raw, seen_ids, rep_processor, device):
-    scores = logits_raw[0, -1, :].float().unsqueeze(0)
-    vocab_size = scores.shape[1]
-    valid = [tid for tid in seen_ids if tid < vocab_size]
-    if valid:
-        seen = torch.tensor([valid], dtype=torch.long, device=device)
-        scores = rep_processor(seen, scores)
-    return scores[0].argmax().item()
+def warmup_cpu(runner: BenchRunner, decode_steps: int = 20):
+    """Trigger torch.compile JIT before benchmarking so prompt TTFTs are not inflated."""
+    for prompt in ["Hi", "Once upon a time in a land far away"]:
+        ids = runner.tokenizer(prompt, return_tensors="pt")["input_ids"]
+        _warmup_one(runner, ids, decode_steps)
 
 
-def sync(device):
+def sync(device: str):
     if device == "cuda":
         torch.cuda.synchronize()
 
 
-def bench_prompt(model, input_ids, decode_tokens, rep_processor, tokenizer, device, HybridMambaAttentionDynamicCache):
+def bench_prompt(runner: BenchRunner, input_ids: torch.Tensor, decode_tokens: int):
     actual_len = input_ids.shape[1]
-    cache = HybridMambaAttentionDynamicCache(
-        model.config, batch_size=1, dtype=model.dtype, device=device
+    cache = runner.cache_class(
+        runner.model.config, batch_size=1, dtype=runner.model.dtype, device=runner.device
     )
-    cache_position = torch.arange(actual_len, device=device)
+    cache_position = torch.arange(actual_len, device=runner.device)
 
+    # Prefill
+    sync(runner.device)
+    t0 = time.time()
     with torch.no_grad():
-        sync(device)
-        t0 = time.time()
-        out = model(input_ids, past_key_values=cache, use_cache=True,
-                    cache_position=cache_position, position_ids=cache_position.unsqueeze(0))
-        sync(device)
-        prefill_ms = (time.time() - t0) * 1000
+        out = runner.model(input_ids, past_key_values=cache, use_cache=True,
+                           cache_position=cache_position,
+                           position_ids=cache_position.unsqueeze(0))
+    sync(runner.device)
+    prefill_ms = (time.time() - t0) * 1000
 
-    all_ids = input_ids[0].tolist()
-    next_id = pick_next(out.logits, all_ids, rep_processor, device)
-    all_ids.append(next_id)
+    # Pre-allocate seen_ids buffer — avoids list→tensor each step
+    seen_buf = torch.empty(1, actual_len + decode_tokens + 1, dtype=torch.long, device=runner.device)
+    seen_buf[0, :actual_len] = input_ids[0]
+    seen_len = actual_len
 
+    scores = runner.rep_processor(seen_buf[:, :seen_len],
+                                  out.logits[0, -1, :].float().unsqueeze(0))
+    next_token = scores[0].argmax().view(1, 1)
+    seen_buf[0, seen_len] = next_token[0, 0]
+    seen_len += 1
+
+    cache_position = torch.zeros(1, dtype=torch.long, device=runner.device)
+
+    # Per-step timing, skip first step (matches ttnn methodology)
     decode_times = []
-    pos = actual_len
-    next_tensor = torch.zeros(1, 1, dtype=torch.long, device=device)
-    cache_position = torch.zeros(1, dtype=torch.long, device=device)
-
-    for _ in range(decode_tokens):
-        next_tensor[0, 0] = next_id
-        cache_position[0] = pos
-        with torch.no_grad():
-            sync(device)
+    with torch.no_grad():
+        for step in range(decode_tokens):
+            cache_position[0] = actual_len + step
+            sync(runner.device)
             t0 = time.time()
-            out = model(next_tensor, past_key_values=cache, use_cache=True,
-                        cache_position=cache_position, position_ids=cache_position.unsqueeze(0))
-            sync(device)
+            out = runner.model(next_token, past_key_values=cache, use_cache=True,
+                               cache_position=cache_position,
+                               position_ids=cache_position.unsqueeze(0))
+            sync(runner.device)
             decode_times.append((time.time() - t0) * 1000)
-        next_id = pick_next(out.logits, all_ids, rep_processor, device)
-        all_ids.append(next_id)
-        pos += 1
-        if next_id == tokenizer.eos_token_id:
-            break
-
-    generated_ids = all_ids[actual_len:]
+            scores = runner.rep_processor(seen_buf[:, :seen_len],
+                                          out.logits[0, -1, :].float().unsqueeze(0))
+            next_token = scores[0].argmax().view(1, 1)
+            seen_buf[0, seen_len] = next_token[0, 0]
+            seen_len += 1
 
     steady = decode_times[1:] if len(decode_times) > 1 else decode_times
-    avg_ms = sum(steady) / len(steady)
-    return prefill_ms, 1000.0 / avg_ms, generated_ids
+    tok_s = 1000.0 / (sum(steady) / len(steady))
+
+    generated_ids = seen_buf[0, actual_len:seen_len].tolist()
+    if runner.tokenizer.eos_token_id in generated_ids:
+        generated_ids = generated_ids[:generated_ids.index(runner.tokenizer.eos_token_id)]
+
+    return prefill_ms, tok_s, generated_ids
 
 
-def print_summary(model_name, device, load_s, results):
-    print("=" * 70)
+def print_summary(model_name: str, device: str, load_s: float, results: list):
+    print(f"{'='*70}")
     print(f"  SUMMARY: {model_name.upper()} (HuggingFace {device.upper()})")
     print(f"  Model load: {load_s:.1f} s")
-    print("-" * 70)
-    print("  Prompt         Tokens  TTFT (ms)  Decode tok/s")
-    print("-" * 70)
+    print(f"{'─'*70}")
+    print("  Prompt        Tokens  TTFT (ms)  Decode tok/s")
+    print(f"{'─'*70}")
     for r in results:
         print(f"  {r['prompt']}  tokens={r['tokens']}  ttft={r['ttft_ms']:.1f}ms  decode={r['decode_toks']:.2f} tok/s")
-    print("=" * 70)
+    print(f"{'='*70}\n")
 
 
-def run_bench(model_name, decode_tokens=DECODE_TOKENS, device="cpu", compile=True):
+def run_bench(model_name: str, decode_tokens: int = DECODE_TOKENS, device: str = "cpu", compile: bool = True):
     model_id = MODELS[model_name]
 
     print(f"\n{'='*70}")
     print(f"  Model : {model_id}")
     print(f"  Device: {device.upper()}")
-    print(f"  Decode : {decode_tokens} tokens per prompt")
+    print(f"  Decode: {decode_tokens} tokens per prompt")
     print(f"{'='*70}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
@@ -215,21 +237,26 @@ def run_bench(model_name, decode_tokens=DECODE_TOKENS, device="cpu", compile=Tru
         HybridMambaAttentionDynamicCache,
     )
 
+    runner = BenchRunner(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        cache_class=HybridMambaAttentionDynamicCache,
+        rep_processor=RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY),
+    )
+
     if device == "cuda":
-        warmup_cuda(model, tokenizer, device, HybridMambaAttentionDynamicCache)
+        warmup_cuda(runner)
+    elif compile:
+        warmup_cpu(runner)
 
-    rep_processor = RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY)
     results = []
-
     for prompt_label, prompt_text in PROMPTS.items():
         input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"].to(device)
         actual_len = input_ids.shape[1]
         print(f"── {prompt_label}  (actual tokens: {actual_len}) ──────────────────")
 
-        prefill_ms, tok_s, generated_ids = bench_prompt(
-            model, input_ids, decode_tokens, rep_processor, tokenizer, device,
-            HybridMambaAttentionDynamicCache,
-        )
+        prefill_ms, tok_s, generated_ids = bench_prompt(runner, input_ids, decode_tokens)
         response = tokenizer.decode(generated_ids, skip_special_tokens=True)
         print(f"  Prompt   : {prompt_text}")
         print(f"  Response : {response}")
@@ -253,16 +280,20 @@ def main():
     parser.add_argument("--model", choices=list(MODELS.keys()) + ["all"], default="all")
     parser.add_argument("--decode-tokens", type=int, default=DECODE_TOKENS)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
-    parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--compile", action="store_true", default=False,
+                        help="Enable torch.compile (default: off)")
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but no GPU found")
 
+    compile = args.compile
+
     models = list(MODELS.keys()) if args.model == "all" else [args.model]
     for m in models:
-        result = run_bench(m, args.decode_tokens, args.device, compile=not args.no_compile)
-        out_path = f"bench_results_hf_{result['model']}_{args.device}.json"
+        result = run_bench(m, args.decode_tokens, args.device, compile=compile)
+        compile_suffix = "_compile" if compile else ""
+        out_path = f"bench_results_hf_{result['model']}_{args.device}{compile_suffix}.json"
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2)
         print(f"Results saved to {out_path}")

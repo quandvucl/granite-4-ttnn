@@ -2,16 +2,86 @@
 
 \subsection{On-Device Execution Strategy}
 
-All 40 decoder layers execute on-device end-to-end: the hidden state tensor $h \in \mathbb{R}^{1 \times 1 \times S \times H}$ is uploaded once at the start of prefill and remains on DRAM across all layers and all decode steps. PCIe transfers occur only for (a) token embedding lookup (host-side), (b) LM head logits read-back (one tensor per step), and (c) routing logits during prefill (amortised over $S$ tokens; for decode the router runs on-device).
+All 40 decoder layers run on-device end-to-end: the hidden state (a vector of size $H$ representing the model's current understanding) is sent to the device once at the start of prefill and stays in DRAM across all layers and all decode steps. The only data that travels back to the host per step is the final logits (one score per vocabulary word): the host CPU selects the highest-scoring token, looks up its embedding, and writes that embedding back to the device as the input for the next step. Token selection runs on the host because it involves conditional logic that cannot be recorded into a fixed trace: for example, a \emph{repetition penalty} boosts the scores of tokens not yet seen (to avoid the model repeating itself), then the highest-scoring token is selected. The transfer is small: the logits tensor has one value per vocabulary word ($100{,}352$ words~\citep{ibmgranite2025tinyconfig} $\times$ 2\,B/element $\approx 196\,\text{KB}$), which is negligible compared to the ${\approx}95\,\text{ms}$ decode step time. Expert routing, which during prefill spans the full prompt, also runs on-device during decode.
 
-Mamba2 decode runs the recurrent step (Equations~\ref{eq:state}--\ref{eq:output}) entirely on device. The SSM state $\mathbf{h}$ is maintained as a persistent DRAM tensor across decode steps, updated in-place via a pointer swap after each step.
+The Mamba-2 recurrent step (Equations~\ref{eq:state}--\ref{eq:output}) runs entirely on-device. The SSM state $\mathbf{h}$ lives in a fixed DRAM location and is updated in-place at every decode step, so it is never transferred to the host.
 
 \subsection{Mesh Sharding and Fabric}
+\label{sec:mesh-sharding}
 
-On a 1$\times$4 mesh with fabric enabled, tensor parallelism applies to:
+The tiny model uses a 1$\times$4 mesh (one row of 4 chips). As noted in Section~\ref{sec:arch}, hardware trace requires all inter-chip communication to run along a single row or column -- a 1$\times$4 mesh satisfies this because all 4 chips sit in one row. Four chips also provide enough DRAM to hold the tiny model's weights (Section~\ref{sec:mem-fit}). With fabric enabled, different parts of the model are split across the 4 chips in different ways:
 \begin{itemize}
-\item \textbf{MoE experts}: sharded across 4 devices via \texttt{ShardTensor2dMesh(dims=(None,1))}; reduced via \texttt{all\_gather(cluster\_axis=1)}.
-\item \textbf{Mamba in-projection}: column-parallel across devices (shards the combined gate+xBC+dt output), reduced via \texttt{all\_gather(dim=3, cluster\_axis=1)} after projection.
-\item \textbf{Mamba out-projection}: each chip computes its share of the output; contributions are collected and summed across devices via \texttt{all\_gather(dim=3, cluster\_axis=1)}.
-\item \textbf{Attention, shared MLP, norms}: weights replicated on all devices; independent compute, no reduce.
+\item \textbf{MoE experts}: split evenly across the 4 chips (expert parallelism from Section~\ref{sec:ep-moe}). After each chip computes its local partial result, the partial vectors are collected over the inter-chip links and summed.
+\item \textbf{Mamba projections}: $W_{\mathrm{in}}$ has shape $H \times M$: the input is an $H$-element hidden state vector $\mathbf{x}$, and multiplying it by $W_{\mathrm{in}}$ produces an $M$-element output vector $\mathbf{y}$, where each output value $y_j = \mathbf{x} \cdot W_{:,j}$ (dot product of the full input with column $j$).
+
+  To illustrate with a small example, suppose $H{=}4$, $M{=}4$, $N{=}2$ chips, input $\mathbf{x} = [x_1, x_2, x_3, x_4]$, and $W_{\mathrm{in}}$ with entries $W_{ij}$. The correct output is $y_j = x_1 W_{1j} + x_2 W_{2j} + x_3 W_{3j} + x_4 W_{4j}$.
+
+  \textbf{Vertical split} (by columns, what this implementation uses): chip 0 holds columns 1--2, chip 1 holds columns 3--4. Both chips have the full input $\mathbf{x}$ and each computes complete dot products for its own columns:
+  \begin{align*}
+    \text{chip 0} &: y_1 = \mathbf{x} \cdot W_{:,1},\quad y_2 = \mathbf{x} \cdot W_{:,2} \\
+    \text{chip 1} &: y_3 = \mathbf{x} \cdot W_{:,3},\quad y_4 = \mathbf{x} \cdot W_{:,4}
+  \end{align*}
+  Each chip produces a different part of the output with no overlap, so the results are \textbf{concatenated}: $[y_1, y_2, y_3, y_4]$.
+
+  \textbf{Horizontal split} (by rows): chip 0 holds rows 1--2, chip 1 holds rows 3--4. Neither chip has all the rows needed to complete a dot product, so each produces a \emph{partial} sum for every output value:
+  \begin{align*}
+    \text{chip 0} &: \tilde{y}_j = x_1 W_{1j} + x_2 W_{2j} \quad \text{for } j = 1,2,3,4 \\
+    \text{chip 1} &: \hat{y}_j = x_3 W_{3j} + x_4 W_{4j} \quad \text{for } j = 1,2,3,4
+  \end{align*}
+  Both chips contribute a piece of every output value, so the results must be \textbf{summed element-wise} to recover $y_j = \tilde{y}_j + \hat{y}_j$ for all $j$.
+
+  Concatenation is cheaper than an element-wise sum across chips, so the vertical split is preferred. The same column split is applied to $W_{\mathrm{out}}$.
+\item \textbf{All-gather after each projection.} After each sharded projection, the inter-chip links perform an \emph{all-gather}: each chip sends its local piece to every other chip, so all chips end up with the complete result. For the Mamba vertical split, this means chip 0 sends $[y_1,y_2]$ to chip 1 and receives $[y_3,y_4]$ back -- both chips end up with $[y_1,y_2,y_3,y_4]$. For MoE, the all-gather instead accumulates the partial sums so every chip holds $y_j = \tilde{y}_j + \hat{y}_j$.
+
+\item \textbf{Attention, shared MLP, norms -- not sharded.} Recall from Section~\ref{sec:mamba2-decode} that the Mamba block produces its output $\mathbf{y}$ (Equation~\ref{eq:output}), which is projected back to hidden size $H$ by $W_{\mathrm{out}}$ and added to the original hidden state $\mathbf{x}$ as a residual connection -- giving a new $H$-element hidden state. After the all-gather on $W_{\mathrm{out}}$'s output, every chip holds this same complete $H$-element vector and can run these components independently with no further communication. Every chip therefore stores an identical full copy of these weights:
+  \begin{itemize}
+    \item \emph{Attention} (4 layers): Q and O project $H{\to}H$ ($1536{\times}1536$); K and V use grouped-query attention and project $H{\to}512$ ($1536{\times}512$ each).\\
+      Total: $(2{\times}1536{\times}1536 + 2{\times}1536{\times}512){\times}2\,\text{B} \approx 12.6\,\text{MB}$ per layer.
+    \item \emph{Shared MLP} (40 layers): gate+up ($1536{\times}1024$) and down ($512{\times}1536$). Total: $(1536{\times}1024 + 512{\times}1536){\times}2\,\text{B} \approx 4.7\,\text{MB}$ per layer.
+    \item \emph{RMS norms}: RMS norm normalises the hidden state, then scales each of the $H$ dimensions by a learned weight: $H{\times}2\,\text{B} = 1536{\times}2 = 3\,\text{KB}$ per norm.
+  \end{itemize}
+  All affordable within the 12\,GB per-chip budget.
+\item \textbf{LM head}: the final projection from hidden size $H$ to vocabulary size ($100{,}352$ words) is column-sharded across the 4 chips, so each chip holds a $H{\times}25{,}088$ slice and computes logits for its share of the vocabulary. The partial logits slices are concatenated over the inter-chip links to reconstruct the full logit vector before token selection.
 \end{itemize}
+
+\subsection{Decode Trace: Warmup, Capture, and Replay}
+\label{sec:trace-impl-detail}
+
+As described in Section~\ref{sec:exec-model}, a \emph{trace} records the full sequence of operations once (\emph{capture}), then replays it with a single device command (\emph{replay}), eliminating the per-operation PCIe overhead. Before capture, however, the model must run at least two non-trace decode steps (\emph{warmup}):
+\begin{itemize}
+  \item \textbf{Step 1 -- kernel compilation.} Each operation (e.g.\ a matrix multiply) is implemented as a low-level program called a \emph{kernel}. TTNN compiles each kernel for a specific tensor shape -- the compiled code has the input dimensions hard-coded for performance, so a kernel compiled for a $256{\times}H$ input tensor (prefill, 256 tokens) cannot be reused for a $1{\times}H$ input tensor (decode, 1 token). TTNN compiles lazily: it only compiles a kernel the first time that shape is encountered. In the benchmark, a short warm-up prefill runs first to compile all prefill-shape kernels. The decode warmup steps then follow; the first one triggers compilation of all decode-shape kernels.
+  \item \textbf{Step 2 -- address stabilisation.} The trace records the DRAM address of the SSM state tensor $\mathbf{h}$ so it can read and update it during every replay. TTNN may assign $\mathbf{h}$ its final address only after the first decode step completes. The second warmup step ensures this address has settled; if the trace were captured after only one step, it might record the wrong address and read garbage values during every replay.
+\end{itemize}
+
+After warmup, capture begins. A trace records operations with their DRAM addresses fixed at capture time. Each token is represented as a vector of size $H$ (the embedding table maps a token ID to an $H$-element vector, which feeds directly into the first decoder layer as the hidden state). Because all token embeddings have this same size $H$, the host can reuse the same fixed-address DRAM buffer (\texttt{\_decode\_trace\_input}) for every replay -- it simply overwrites the buffer with the new token's embedding values before each replay. A trace is a list of operations to re-execute. At replay time, each operation re-reads from the same DRAM addresses that were recorded during capture. The first operation in the trace is:
+\begin{equation}
+\mathbf{h} \leftarrow \mathtt{ttnn.add}(\mathtt{\_decode\_trace\_input},\ \mathtt{\_trace\_zeros})
+\end{equation}
+where \texttt{\_trace\_zeros} is a second fixed-address buffer filled with zeros. This \texttt{add} is a no-op (adding zeros changes nothing), but it is the operation that makes the trace re-read from \texttt{\_decode\_trace\_input} at replay time. The host writes the new token's embedding into that buffer just before each replay, and this \texttt{add} picks it up.
+
+The benchmark script follows this sequence:
+\begin{enumerate}
+\item Run prefill on the full prompt (split into chunks of 256 if longer).
+\item Run 2 non-trace decode steps (warmup).
+\item Capture the trace with a zeros embedding.
+\item Each decode step: overwrite \texttt{\_decode\_trace\_input} with the token embedding, then replay the trace with a single device command.
+\end{enumerate}
+
+\subsection{CPU and CUDA Baselines with \texttt{torch.compile}}
+
+To validate correctness and provide a performance comparison against the TT hardware implementation, I run the same Granite models through the standard HuggingFace pipeline on CPU and CUDA. This baseline optionally applies \texttt{torch.compile} to close the gap between interpreted PyTorch and an optimised backend.
+
+\textbf{CUDA}: Three compiler options are configured:
+\begin{itemize}
+  \item \textbf{Triton autotuning} (\texttt{max\_autotune\_gemm}): Triton is the GPU kernel compiler used by \texttt{torch.compile}. A GPU executes threads in groups of 32 called \emph{warps}; multiple warps are organised into a \emph{thread block}, which is the unit of work assigned to one set of GPU cores. For a matrix multiply, a thread block handles a sub-matrix called a \emph{tile}: it loads that tile from global memory into fast on-chip shared memory, computes the partial products, then moves to the next tile. There are many valid tile size choices (e.g.\ $64{\times}64$, $128{\times}64$, $256{\times}32$), and the fastest choice depends on the matrix dimensions and the specific GPU. With autotuning enabled, Triton benchmarks a set of candidate tile sizes and keeps the fastest one; this search runs once during the warmup pass and the winner is reused for all subsequent calls with the same shape.
+
+  \item \textbf{Shape padding} (\texttt{shape\_padding}): as established earlier, a kernel is a low-level program compiled for a specific operation. The GPU runs one thread per element, each thread with its own index, and groups 32 threads into a warp that executes together. If the matrix has 33 columns, two warps are launched: warp 1 contains 32 threads for indices 0--31, warp 2 contains 32 threads for indices 32--63. But only index 32 is a real column; indices 33--63 do not exist. Each thread computes a memory address from its index and accesses it -- the kernel has no automatic awareness of the matrix boundary. The 31 threads with indices 33--63 will therefore access memory beyond the matrix, overwriting whatever data is stored there. To prevent this, the kernel must include an explicit guard: \texttt{if (col < N) \{ access memory \}}. This guard is part of the kernel, so every thread in every warp executes it on every memory access, including all the valid threads in warp 1.
+
+  Padding appends zeros to round the dimension up to the next multiple of 32 (e.g.\ $H{=}1536 \to 2048$). Every group is then fully covered by valid elements, no copy ever exceeds the boundary, and the compiler removes the guard entirely.
+
+  \item \textbf{CUDA graph replay disabled}: a CUDA graph, like TTNN's hardware trace, captures a sequence of GPU operations and replays them with a single launch, but requires all memory addresses to be fixed at capture time. The Mamba SSM state and the attention KV cache are updated in-place every step and their addresses change with sequence position, so they cannot be frozen into a static graph.
+\end{itemize}
+
+\textbf{CPU}: With \texttt{cpp\_wrapper} enabled, \texttt{torch.compile} generates a C++ entry point that calls the compiled kernels directly. Without it, the compiled code is still reached through the Python interpreter, which adds a per-call dispatch cost on every operation along the decode path. The C++ wrapper eliminates this overhead.
+
+On CUDA, after compilation a \emph{warmup} pass runs two representative prompt lengths through a full prefill and 20 decode steps each, so all Triton kernels are compiled and cached before timing begins.

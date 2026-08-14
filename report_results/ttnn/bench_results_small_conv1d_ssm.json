@@ -1,0 +1,50 @@
+{
+  "model": "small",
+  "load_s": 464.1991786956787,
+  "num_devices": 8,
+  "chunk_size": 256,
+  "use_conv1d_kernel": true,
+  "use_ssm_kernel": true,
+  "results": [
+    {
+      "prompt": "short_8",
+      "tokens": 5,
+      "ttft_ms": 1407.7439308166504,
+      "decode_toks": 5.885140046078682,
+      "prompt_text": "The capital of France is",
+      "response": " Paris."
+    },
+    {
+      "prompt": "short_10",
+      "tokens": 8,
+      "ttft_ms": 1490.6847476959229,
+      "decode_toks": 5.836762095246159,
+      "prompt_text": "The largest planet in our solar system is",
+      "response": " Jupiter, with a diameter of about 88,846 miles (142,984 kilometers). It's so"
+    },
+    {
+      "prompt": "medium_32",
+      "tokens": 25,
+      "ttft_ms": 1837.5248908996582,
+      "decode_toks": 5.853059100845028,
+      "prompt_text": "Artificial intelligence is transforming many industries. Machine learning models can now perform tasks that previously required human expertise, such as image recognition",
+      "response": " and natural language processing.\n\n**Example:**  \n- **Image Recognition**: AI algorithms analyze images to identify objects"
+    },
+    {
+      "prompt": "long_128",
+      "tokens": 96,
+      "ttft_ms": 1917.6061153411865,
+      "decode_toks": 5.849443423438738,
+      "prompt_text": "Large language models have become increasingly capable over recent years. These models are trained on vast amounts of text data and can generate coherent, contextually appropriate responses across a wide range of topics. They are used in applications ranging from customer service chatbots to code generation tools, scientific research assistants, and creative writing aids. The architecture underlying most of these models is the transformer, which uses self-attention mechanisms to capture long-range dependencies in text. Recent hybrid architectures combine transformers with state-space models",
+      "response": " or recurrent layers for improved efficiency.\n\nThe rapid progress has raised important questions about safety: how do we ensure"
+    },
+    {
+      "prompt": "long_256",
+      "tokens": 176,
+      "ttft_ms": 2789.5872592926025,
+      "decode_toks": 5.860015159666228,
+      "prompt_text": "The field of natural language processing has undergone a remarkable transformation with the advent of large-scale pretrained language models. These systems, trained on hundreds of billions of tokens of text from the internet and other sources, have demonstrated surprising emergent capabilities including multi-step reasoning, in-context learning, and instruction following. The scaling laws governing these models suggest that performance on many tasks continues to improve predictably with increases in model size, dataset size, and compute budget. This has motivated the development of increasingly large models, from hundreds of millions to hundreds of billions of parameters. However, serving these models efficiently at inference time presents significant engineering challenges, particularly for applications requiring low latency responses. Speculative decoding, quantization, and hardware-specific optimizations are among the techniques used to address these challenges. Hybrid architectures that combine attention layers with state-space models like Mamba offer promising tradeoffs between computational efficiency and modeling capability",
+      "response": ".\n\nIn this talk I will give an overview about how we can serve LLMs more efficient by using"
+    }
+  ]
+}

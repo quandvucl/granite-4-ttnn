@@ -77,15 +77,19 @@ class GraniteTTMoE:
                 ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None
             )
         elif self._is_multirow:
-            effective_devices = self.num_devices
-            while effective_devices > 1 and self.num_experts % effective_devices != 0:
-                effective_devices -= 1
-            self.effective_cols = effective_devices
-            self.effective_devs = effective_devices
-            self.experts_per_device = self.num_experts // effective_devices
-            self._ep_mapper = ttnn.ShardTensorToMesh(
-                self.device, dim=1,
-            ) if effective_devices > 1 else (
+            # Shard experts across rows only; columns replicate.
+            # For 8×4: 72 experts / 8 rows = 9 per device, same shard replicated 4×.
+            # ShardTensor2dMesh(dims=(-1, None)) shards dim-1 (expert) across rows,
+            # replicates across cols — correct weight layout for row-parallel EP.
+            effective_rows = self._mesh_rows
+            while effective_rows > 1 and self.num_experts % effective_rows != 0:
+                effective_rows -= 1
+            self.effective_cols = effective_rows
+            self.effective_devs = effective_rows
+            self.experts_per_device = self.num_experts // effective_rows
+            self._ep_mapper = ttnn.ShardTensor2dMesh(
+                self.device, dims=(1, None), mesh_shape=device.shape,
+            ) if effective_rows > 1 else (
                 ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh else None
             )
         else:
@@ -378,18 +382,13 @@ class GraniteTTMoE:
             result_tt = ttnn.sum(gathered_tt, dim=1, keepdim=True, memory_config=MC)
             gathered_tt.deallocate(True)
         elif self._is_multirow and self.effective_devs > 1:
-            if self._mesh_cols == 1:
-                # 8×1 mesh: gather along rows, trace-safe (mesh_shape[1]=1 → not is_true_2d_mesh).
-                gathered_tt = self._all_gather_row(local_sum_tt, dim=1, memory_config=MC)
-                local_sum_tt.deallocate(True)
-                result_tt = ttnn.sum(gathered_tt, dim=1, keepdim=True, memory_config=MC)
-                gathered_tt.deallocate(True)
-            else:
-                # 2×4 mesh: all_reduce, non-trace (FABRIC_2D + is_true_2d_mesh).
-                after_cols = ttnn.all_reduce(local_sum_tt, cluster_axis=1, memory_config=MC)
-                local_sum_tt.deallocate(True)
-                result_tt = ttnn.all_reduce(after_cols, cluster_axis=0, memory_config=MC)
-                after_cols.deallocate(True)
+            # EP is row-sharded on any multirow mesh (8×1 or 8×4).
+            # Columns always replicate the same expert shards → reduce rows only.
+            # all_gather_row is trace-safe: cluster_axis=0, FABRIC_1D avoids composite path.
+            gathered_tt = self._all_gather_row(local_sum_tt, dim=1, memory_config=MC)
+            local_sum_tt.deallocate(True)
+            result_tt = ttnn.sum(gathered_tt, dim=1, keepdim=True, memory_config=MC)
+            gathered_tt.deallocate(True)
         else:
             result_tt = local_sum_tt
 
