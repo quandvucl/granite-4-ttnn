@@ -1,0 +1,9 @@
+\section{Conclusion}
+
+This project ports Granite-4.0-h-tiny and Granite-4.0-h-small to Tenstorrent Wormhole hardware and benchmarks them against an NVIDIA A100 and CPU. The tiny model (4 chips) achieves 10.65--10.69 tok/s, which is ${\approx}18\%$ faster than the A100 (8.5--9.0 tok/s) and ${\approx}4\times$ faster than CPU. The small model (8 chips) achieves 5.84--5.89 tok/s, which is ${\approx}20\%$ below the A100 (7.1--8.2 tok/s) because reading the larger model's weights across 8 chips takes more time than the A100 can match at this scale, but is still ${\approx}9\times$ faster than CPU.
+
+The key enabler for the tiny model result is decode trace: recording the full set of operations once and replaying it for every token removes the per-token overhead of sending commands from the host to the device. A critical implementation detail is that trace recording must happen outside the generation loop — recording inside the loop causes all state updates to lag by one step, producing incorrect output. This was fixed by capturing the trace in a separate setup step before generation begins.
+
+Two custom fused kernels (\texttt{ssm\_update} and \texttt{conv1d\_decode}) reduce the number of memory reads per Mamba2 step. At batch size 1 the gains are modest (${\approx}1$--2\%) because most time is spent reading weights from memory rather than doing arithmetic, but the gains are expected to be larger at higher batch sizes. Prefill chunk size tuning shows that $C{=}256$ gives the best decode throughput.
+
+The main challenges encountered during porting — including weight quantisation, SSM state management across chunked prefill, expert-parallel weight sharding, and collective operation ordering — are documented in Section~\ref{sec:challenges} as a reference for future ports of similar hybrid models to Wormhole hardware.

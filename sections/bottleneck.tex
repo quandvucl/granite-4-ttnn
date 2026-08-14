@@ -1,0 +1,56 @@
+\section{Current Bottleneck and Trace Performance}
+\label{sec:bottleneck}
+
+\subsection{Measured Decode Latency (With Trace)}
+
+Table~\ref{tab:timing} shows the per-component timing for a single generation step on the 1$\times$4 Wormhole mesh with trace enabled, averaged over 16 steady-state steps (steps 3--18, after 2 warmup and 1 first-trace-replay step).
+
+\begin{table}[h]
+\caption{Generation step timing (Granite-4.0-h-tiny, 1$\times$4 mesh, fabric + trace enabled).}
+\label{tab:timing}
+\begin{tabular}{lrr}
+\toprule
+Component & Time (ms) & \% of total \\
+\midrule
+Mamba2 (36 layers) & 52--58 & 54--61\% \\
+MoE + Shared MLP (40 layers) & 62--68 & 65--71\% \\
+Attention (4 layers) & 1.8--2.0 & $\sim$2\% \\
+\midrule
+Total (trace replay) & $\approx$95 & \\
+Throughput & \multicolumn{2}{c}{10.5--10.6 tok/s} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+With trace enabled, the single \texttt{execute\_trace} command replaces $\approx$500 individual host-to-device round-trips. The step time drops from 130--145\,ms (no trace) to $\approx$95\,ms, a $\approx$33\% improvement. Mamba2 remains the largest contributor because its per-layer recurrent operations are compute- and memory-bound; MoE all-gather operations overlap with compute during replay.
+
+\subsection{Bypass-Mode Off-by-One Discovery}
+
+During development, an early inline capture strategy (triggering trace capture inside the generation loop at step $t$) produced incoherent responses across all prompts. Step-by-step token comparison showed that WITH TRACE, step $t$'s top token matched NO TRACE step $t-1$ -- a consistent one-step lag. This was due to how the Metal framework handles trace recording:
+
+\begin{enumerate}
+\item \texttt{begin\_trace\_capture()} calls \texttt{set\_bypass\_mode(true)} on all device CQs.
+\item All ops between \texttt{begin} and \texttt{end} are recorded into a host-side buffer but \textbf{not dispatched} to the device.
+\item KV cache writes (\texttt{paged\_update\_cache}) and SSM state updates (\texttt{ttnn.assign}) inside the capture window are recorded but never executed.
+\item The device's state at the end of capture is identical to its state before capture began.
+\item The captured step's \texttt{execute\_trace} replay then processes the \emph{current} embedding with the \emph{previous} device state, producing the same output as step $t-1$.
+\end{enumerate}
+
+This is not a bug in Metal; it is how the framework enables fixed memory addresses. The solution is to capture the trace with a dummy input \emph{outside} the generation loop (Algorithm~\ref{alg:trace}), so the recording step never corrupts the autoregressive state.
+
+\subsection{Latency Decomposition}
+
+We decompose the decode step latency into four components:
+\begin{equation}
+T_{\mathrm{step}} = T_{\mathrm{dispatch}} + T_{\mathrm{compute}} + T_{\mathrm{fabric}} + T_{\mathrm{DRAM}}
+\label{eq:roofline}
+\end{equation}
+Without trace, $T_{\mathrm{dispatch}}$ from $\approx$500 host-to-device round-trips dominates, accounting for most of the 130--145\,ms step time.
+
+With trace, $T_{\mathrm{dispatch}}$ drops to $\approx$1\,ms (one replay command), reducing step time to $\approx$95\,ms. The remaining time is split across $T_{\mathrm{compute}}$ (arithmetic), $T_{\mathrm{fabric}}$ (collective operations), and $T_{\mathrm{DRAM}}$ (weight reads); measuring inside the trace would be needed to separate these components.
+
+\subsection{Path Forward}
+
+\textbf{Fused SSM kernel.} The \texttt{ssm\_update} kernel (Algorithm~\ref{alg:kernel}) reduces Mamba per-layer DRAM passes from 5 to 3 and saves 4 dispatches per layer. With trace, the dispatch saving is already collapsed; the primary remaining benefit is eliminating one 768\,KB intermediate DRAM write per layer, reducing $T_{\mathrm{DRAM}}$.
+
+\textbf{Fabric throughput.} The all-gather collectives for expert-parallel MoE are a significant contributor to the remaining 95\,ms step time. Profiling the per-all-gather latency inside trace replay and exploring ring-topology scheduling are the next steps to reduce this overhead.

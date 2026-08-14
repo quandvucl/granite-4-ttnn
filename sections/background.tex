@@ -1,0 +1,147 @@
+\section{Background}
+
+\subsection{Tenstorrent Wormhole Platform}
+\label{sec:arch}
+
+\subsubsection{Galaxy 32: the multi-chip system}
+
+The system used in this work is Tenstorrent's Galaxy 32, a machine containing 32 Wormhole chips arranged in a 4$\times$8 mesh~\citep{tenstorrent2023galaxy}. The chips are connected by built-in inter-chip links, so data can move between chips without going through the host CPU. This is important for splitting a large model across many chips and combining results on-device during inference.
+
+The system software uses these links to move data between chips, for example to gather partial results from many chips and combine them into one final output. In this work, communication is routed along one row or one column of the mesh at a time. This is required for hardware trace replay (Section~\ref{sec:trace-impl}): the full 2D routing mode is not trace-safe on this hardware stack, whereas single-axis (1D) routing is; Section~\ref{sec:trace-impl} explains the constraint.
+
+The host machine connects to the Galaxy 32 over PCIe. From the host's point of view, the 32-chip system looks like a single device. The host sends commands over the PCIe link, and the chips work together through the built-in chip network to carry them out.
+
+\subsubsection{Single Wormhole chip architecture}
+
+Each of the 32 chips is a Wormhole chip -- Tenstorrent's second-generation AI accelerator~\citep{tenstorrent2023wormhole}. A single chip contains a 2D grid of compute cores arranged in an 8$\times$10 grid. Of these grid positions, 64 are programmable worker cores (called Tensix cores) that execute AI kernels; the remaining positions are occupied by dedicated hardware for other tasks: 6 DRAM controllers (circuits that manage data transfers between the chip and its off-chip memory), 16 Ethernet cores (small processors that handle chip-to-chip network traffic), and an ARC management processor (a low-power core that handles boot, power, and device initialisation).
+
+\subsubsection{Memory hierarchy}
+
+\textbf{L1 (on-chip SRAM).} Each Tensix core has 1.43\,MiB of on-chip SRAM called L1~\citep{tenstorrent2023wormhole}. The 64 compute cores provide 91.5\,MiB total worker L1 per chip. Unlike a CPU's hardware cache which automatically copies data in and out, L1 here is software-managed: the programmer must explicitly load data into L1 before using it and write results back to DRAM afterwards. Programs that run on a Tensix core are called \emph{kernels}. When one computation feeds directly into the next, the result would normally be written to DRAM only to be read back immediately -- wasting bandwidth. Tenstorrent's Metal programming framework avoids this by letting the programmer designate named regions of L1 as \emph{circular buffers}: the first kernel writes its result into a labelled L1 slot, and the next kernel reads from that same slot, never touching DRAM for that intermediate value.
+
+\textbf{DRAM (off-chip).} Each chip has 12\,GB of off-chip DRAM for storing model weights and activations~\citep{tenstorrent2023wormhole}. TTNN organises tensor data (e.g.\ a weight matrix) into fixed 32$\times$32-element blocks called \emph{tiles} -- the smallest unit a Tensix core can request from DRAM. This work uses interleaved layout for all weight matrices and activations: tiles are scattered across DRAM so many cores can fetch different parts of the same matrix in parallel.
+
+Table~\ref{tab:mem} summarises the memory tiers on a single chip.
+
+\begin{table}[h]
+\caption{Memory tiers on a single Wormhole chip~\citep{tenstorrent2023wormhole}.}
+\label{tab:mem}
+\begin{tabular}{ll}
+\toprule
+Level & Size \\
+\midrule
+L1 (per core) & 1.43\,MiB \\
+L1 (chip total) & 91.5\,MiB \\
+DRAM (per chip) & 12\,GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{TTNN execution model}
+\label{sec:exec-model}
+
+The host CPU triggers each operation on a Wormhole chip by writing a command over the PCIe link -- one command per operation (e.g.\ a matrix multiply, an element-wise multiply). Each command incurs a fixed cost to send it over PCIe, regardless of how much arithmetic the operation actually performs. When generating one token at a time, the model issues many such commands per token, and the cumulative cost of sending them all dominates the time to generate a single token, making the PCIe link the bottleneck rather than the compute hardware itself.
+
+\textbf{Hardware trace (replay).} TTNN lets you record a full sequence of operations once, then replay the entire sequence later with just one command, eliminating the per-command PCIe cost. While recording, operations are stored but not executed on the device; Section~\ref{sec:challenges} discusses why this matters for correctness. The implementation is in Section~\ref{sec:trace-impl}.
+
+\subsection{Granite-4.0-h Model Variants}
+\label{sec:granite-variants}
+
+This work evaluates two model variants -- Granite-4.0-h-tiny~\citep{ibmgranite2025tiny} and Granite-4.0-h-small~\citep{ibmgranite2025small}. Both have the same structure: 40 decoder layers, where each layer first mixes sequence information (using Mamba-2 for 36 of the layers, attention for the other 4), then applies a Mixture-of-Experts (MoE) feed-forward transformation. Table~\ref{tab:arch} compares their key dimensions.
+
+\begin{table}[h]
+\caption{Granite-4.0-h architectural dimensions: tiny vs.\ small \citep{ibmgranite2025tinyconfig,ibmgranite2025smallconfig}.}
+\label{tab:arch}
+\begin{tabular}{lll}
+\toprule
+ & Tiny & Small \\
+\midrule
+Mamba-2 blocks & 36 & 36 \\
+Attention blocks & 4 & 4 \\
+Hidden size $H$ & 1536 & 4096 \\
+\midrule
+Number of MoE experts & 64 & 72 \\
+Experts active per token & 6 & 10 \\
+\midrule
+Total weights & 13.9\,GB & 64.4\,GB \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+\noindent\footnotesize{Total weight sizes read from \texttt{metadata.total\_size} in the HuggingFace checkpoint index files \citep{ibmgranite2025tinyindex,ibmgranite2025smallindex}.}
+\end{table}
+
+As shown in Figure~\ref{fig:granite-arch}, every decoder layer consists of two blocks stacked in sequence. The first is a \emph{mixer block}: either a Mamba-2 block (36 of the 40 layers) or an attention block (the remaining 4). The second is an \emph{MoE block}: a router selects a few experts from a larger pool and combines their outputs, with a shared MLP running in parallel and added to the result.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\columnwidth]{imgs/granite-4-hybrid-architecture.png}
+  \caption{The Granite hybrid architecture, as implemented in Granite-4.0-H-Tiny~\citep{ibmgranite2025announcement}.}
+  \label{fig:granite-arch}
+\end{figure}
+
+\subsection{Mamba-2 Block}
+\label{sec:mamba2-decode}
+
+Mamba-2 is a \emph{state-space model} (SSM): instead of storing every past token in a key-value cache (as attention does), it compresses the entire conversation history into a fixed-size recurrent state~\citep{dao2024transformers}. Running a language model has two phases. In the \emph{prefill} phase, the model processes the entire input prompt, updating the recurrent state for each token in sequence. In the \emph{decode} phase, the model generates new tokens one at a time; each step takes the token produced by the previous step, updates the fixed-size state, and produces the next output token. This work focuses on the decode phase. Each decode step through a Mamba-2 block has two parts: a \emph{Projection} that transforms the incoming hidden state into the values needed for the memory update, and a \emph{Selective SSM} (the recurrent memory update step) that updates the stored memory with the new token and produces the output.
+
+\subsubsection{Projection}
+
+A \emph{projection} is a learned matrix multiplication that maps the hidden state to a different set of values needed by subsequent steps. The \emph{Input} in Figure~\ref{fig:granite-arch} is the hidden state (the vector representing the model's current understanding at that layer). It is first normalised (RMS norm), then two parallel projections are applied.
+
+The \emph{left projection} produces four values:
+\begin{itemize}
+  \item $\Delta$ -- how much the memory should change at this step: a large $\Delta$ means the memory updates strongly; a small $\Delta$ means it mostly retains the previous state.
+  \item $\sigma$ -- the content of the current token.
+  \item $C$ -- what to look for when reading from memory: determines which parts of the stored state are extracted as output.
+  \item $B$ -- how strongly to write the current token into memory.
+\end{itemize}
+$\sigma$, $B$, and $C$ are concatenated and passed together through a \emph{Convolution}: a weighted sum over a fixed window of 4 tokens -- the current token and the 3 preceding ones. This window size (4) is a fixed architectural parameter of the model. To look back 3 steps, the 3 most recent values of $\sigma$, $B$, $C$ are kept in a small tensor called the \emph{convolution cache}, which is updated at every decode step. Only $\Delta$ bypasses the Convolution and goes directly to the Selective SSM.
+
+The \emph{right projection} produces a separate $\sigma$ used as the \emph{output gate}: after the Selective SSM produces its output, it is multiplied element-wise by this $\sigma$ to selectively suppress or amplify features, then passed through a final projection back to the original hidden size.
+
+\subsubsection{Selective SSM}
+
+The Selective SSM maintains a fixed-size state $\mathbf{h}$ -- a matrix that summarises all tokens seen so far. The state is split across $H_m$ independent \emph{heads}, similar to how attention uses multiple heads to capture different aspects of the sequence. Each head is a $D \times N$ matrix ($64 \times 128$ for the tiny model): $D$ features, each summarised into $N$ values that encode its history across all past tokens.
+
+Each decode step updates the state and reads an output from it in two operations:
+
+\textbf{State update} (Equation~\ref{eq:state}):
+\begin{align}
+  \mathbf{h} &\leftarrow \underbrace{\exp(\Delta \odot A)}_{\text{forget factor}} \odot\, \mathbf{h}\ +\ \underbrace{(\Delta\,\sigma) \odot B}_{\text{new token contribution}} \label{eq:state}
+\end{align}
+The forget factor (controlled by $\Delta$ and the learned matrix $A$) determines how much of the old state to retain: a value near 1 keeps it, near 0 discards it. The new token contribution (controlled by $\Delta$, $\sigma$, and $B$) writes the current token into the state. $\Delta$ therefore acts as a gate that scales both how much to remember and how much to write.
+
+\textbf{Output read} (Equation~\ref{eq:output}):
+\begin{align}
+  y &= \mathbf{h} \cdot C \label{eq:output}
+\end{align}
+$C$ selects which information to extract from the state.
+
+\subsection{MoE Block}
+\label{sec:ep-moe}
+
+The MoE block, shown in Figure~\ref{fig:granite-arch}, contains $E$ experts (64 for tiny, 72 for small), each a small MLP. A \emph{router} selects only the top-$k$ experts per token (6 for tiny, 10 for small) and combines their outputs. The remaining experts are not executed -- the model has many expert parameters but only a small fraction is activated per token.
+
+Storing all $E$ experts on a single chip is not feasible given DRAM constraints. Instead, I apply \emph{expert parallelism} (EP): the expert weights are split evenly across chips, so each chip stores and executes only its local share. Since the router may select experts spread across different chips, each chip computes a \emph{partial contribution} -- it runs all its local experts, multiplies each output by its routing weight (zero for unselected experts), and sums them into a single vector. These partial vectors are then collected from all chips over the inter-chip links and summed to produce the final MoE output.
+
+\subsection{Fitting Granite-4.0-h-tiny into the Memory Hierarchy}
+\label{sec:mem-fit}
+
+This section checks that the tiny model fits within the 12\,GB per-chip DRAM limit (Table~\ref{tab:mem}). All weights are stored in bfloat16 (a 16-bit floating-point format, 2\,B/element).
+
+The dominant costs per chip are:
+\begin{itemize}
+  \item \textbf{Mamba-2 projection weights} ($W_{\mathrm{in}}$, $W_{\mathrm{out}}$, 36 layers). Both projections from Section~\ref{sec:mamba2-decode} are implemented as a single matrix multiply using $W_{\mathrm{in}}$. Recall from Section~\ref{sec:mamba2-decode} that $H_m{=}48$ is the number of SSM heads and $D{=}64$ is the number of features per head. $W_{\mathrm{in}}$ maps the hidden state (a vector of size $H{=}1536$) to all outputs at once: the output gate (size $H_m{\times}D = 48{\times}64 = 3072$, matching the SSM output size so it can be multiplied element-wise with it) + $\sigma$ (size 3072) + $B$ (size 128) + $C$ (size 128) + $\Delta$ (size 48) $= 6448$ total. This gives a weight matrix of shape $1536{\times}6448$, costing $1536{\times}6448{\times}2\,\text{B} \approx 18.9\,\text{MB}$. $W_{\mathrm{out}}$ maps the SSM output (size $3072$) back to the original hidden size ($H{=}1536$): shape $3072{\times}1536$, costing $3072{\times}1536{\times}2\,\text{B} \approx 9.0\,\text{MB}$. Combined, $W_{\mathrm{in}} + W_{\mathrm{out}} \approx 18.9 + 9.0 = 27.9\,\text{MB}$ per layer, $\times\,36$ layers $\approx$ \textbf{1\,GB}.
+  \item \textbf{Mamba-2 recurrent state} (36 layers). Three tensors must be read and updated on every decode step, so they live in DRAM and are streamed each time:
+  \begin{itemize}
+    \item \emph{SSM state} $\mathbf{h}$: the recurrent memory from Section~\ref{sec:mamba2-decode}, shaped $H_m{\times}D{\times}N = 48{\times}64{\times}128$ \to$ At 2\,B/element: $48{\times}64{\times}128{\times}2\,\text{B} = 768\,\text{KB}$.
+    \item \emph{Learned matrix} $A$: the fixed forget-factor weights from Equation~\ref{eq:state}, the same shape as $\mathbf{h}$, $768\,\text{KB}$.
+    \item \emph{Convolution cache}: introduced in Section~\ref{sec:mamba2-decode}, this stores the 3 most recent values of $\sigma$, $B$, $C$ so the Convolution (window size 4) can cover the current token and the 3 preceding ones. Updated every decode step. Size $832\,\text{KB}$.
+  \end{itemize}
+  Total per layer: $768 + 768 + 832\,\text{KB} \approx 2.32\,\text{MB}$. $\times\,36$ layers $\approx$ \textbf{83.5\,MB}.
+  \item \textbf{MoE expert weights} (64 experts split evenly across 4 chips = 16 per chip, 40 layers). Each expert's MLP has two weight matrices: a gate+up projection (maps hidden size $1536 \to$ intermediate size $1024$, so $1024{\times}1536$ elements) and a down projection (maps back $512{\times}1536$ elements), each at 2\,B/element (bfloat16). Per chip per layer: $16{\times}(1024{\times}1536 + 512{\times}1536){\times}2\,\text{B} = 72\,\text{MB}$. $\times\,40$ layers $\approx$ \textbf{2.88\,GB}.
+\end{itemize}
+
+The total fits comfortably within 12\,GB. However, the 83.5\,MB recurrent state alone nearly fills the 91.5\,MiB of total L1 across all cores, and the weight matrices are far too large for L1. Consequently, all weights and recurrent state reside permanently in DRAM and must be streamed on every decode step.
+

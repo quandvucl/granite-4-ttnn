@@ -1,0 +1,21 @@
+\section{Introduction}
+
+Large language models (LLMs) have become a fundamental component of modern AI systems, with most implementations heavily optimized for GPU-based platforms such as NVIDIA A100. However, the increasing demand for efficient inference and cost-effective deployment has led to the emergence of alternative AI accelerators, including the Tenstorrent Wormhole architecture.
+
+This project explores porting Granite-4.0-h small and tiny models -- IBM's hybrid language models combining recurrent and attention layers with sparse expert routing -- from the standard HuggingFace/PyTorch stack to Tenstorrent Wormhole on Galaxy 32. On a GPU, hundreds of operations in a forward pass run efficiently with mature GPU runtimes. On Wormhole, each operation must be explicitly sent from the host CPU to the device one at a time. Each send takes a fixed time regardless of how much computation the operation actually performs. During token generation -- where the model processes just one token at a time -- this per-operation cost accumulates and becomes the main performance limit. Section~\ref{sec:arch} describes the hardware in detail.
+
+The key research questions addressed in this work are:
+\begin{itemize}
+\item What numerical and architectural challenges arise when porting a hybrid recurrent-attention model with sparse expert routing from HuggingFace to Wormhole?
+\item Why does the cost of sending each operation from the host to the device become the main bottleneck during token generation, and which optimisations reduce this overhead?
+\item When model weights are split across several chips, what additional communication and memory constraints must the implementation satisfy to keep generation fast and correct?
+\end{itemize}
+
+The contributions of this project are:
+\begin{itemize}
+\item Complete working implementations of Granite-4.0-h-tiny (4 Wormhole chips) and Granite-4.0-h-small (8 chips), with token generation throughput benchmarked against NVIDIA A100 and CPU baselines.
+\item A systematic description of the numerical, architectural, and toolchain challenges encountered during the port (Section~\ref{sec:challenges}).
+\item A custom on-chip kernel for the recurrent state-update that reduces memory traffic and command count per token.
+\item A working implementation of whole-model trace recording and replay, where the full per-token forward pass is recorded once and replayed with a single command per token.
+\item Empirical token generation throughput measurements and per-component timing analysis.
+\end{itemize}

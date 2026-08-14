@@ -1,0 +1,47 @@
+{
+    "model": "small",
+    "backend": "hf_cuda",
+    "load_s": 14.653464317321777,
+    "results": [
+        {
+            "prompt": "short_8",
+            "tokens": 5,
+            "ttft_ms": 789.8111343383789,
+            "decode_toks": 7.115626215172134,
+            "prompt_text": "The capital of France is",
+            "response": " Paris."
+        },
+        {
+            "prompt": "short_10",
+            "tokens": 8,
+            "ttft_ms": 736.9785308837891,
+            "decode_toks": 8.147043028698237,
+            "prompt_text": "The largest planet in our solar system is",
+            "response": " Jupiter. It has a diameter of about 88,846 miles (142,984 kilometers), which makes"
+        },
+        {
+            "prompt": "medium_32",
+            "tokens": 25,
+            "ttft_ms": 758.2693099975586,
+            "decode_toks": 8.128284709037047,
+            "prompt_text": "Artificial intelligence is transforming many industries. Machine learning models can now perform tasks that previously required human expertise, such as image recognition",
+            "response": " and natural language processing.\n\nHowever these systems are often opaque \"black boxes\" whose decision-making processes cannot be"
+        },
+        {
+            "prompt": "long_128",
+            "tokens": 98,
+            "ttft_ms": 778.4328460693359,
+            "decode_toks": 8.119601334319604,
+            "prompt_text": "Large language models have become increasingly capable over recent years. These models are trained on vast amounts of text data and can generate coherent, contextually appropriate responses across a wide range of topics. They are used in applications ranging from customer service chatbots to code generation tools, scientific research assistants, and creative writing aids. The architecture underlying most of these models is the transformer, which uses self-attention mechanisms to capture long-range dependencies in text. Recent hybrid architectures combine transformers with state-space models",
+            "response": " or recurrent neural networks for improved efficiency.\n\nThe training process involves unsupervised learning where large corpora ("
+        },
+        {
+            "prompt": "long_256",
+            "tokens": 181,
+            "ttft_ms": 789.0419960021973,
+            "decode_toks": 8.056976894310369,
+            "prompt_text": "The field of natural language processing has undergone a remarkable transformation with the advent of large-scale pretrained language models. These systems, trained on hundreds of billions of tokens of text from the internet and other sources, have demonstrated surprising emergent capabilities including multi-step reasoning, in-context learning, and instruction following. The scaling laws governing these models suggest that performance on many tasks continues to improve predictably with increases in model size, dataset size, and compute budget. This has motivated the development of increasingly large models, from hundreds of millions to hundreds of billions of parameters. However, serving these models efficiently at inference time presents significant engineering challenges, particularly for applications requiring low latency responses. Speculative decoding, quantization, and hardware-specific optimizations are among the techniques used to address these challenges. Hybrid architectures that combine attention layers with state-space models like Mamba offer promising tradeoffs between computational efficiency and modeling capability",
+            "response": ".\n\nDespite their impressive abilities across diverse domains such as mathematics (OpenAI 2023), coding assistance ,"
+        }
+    ]
+}

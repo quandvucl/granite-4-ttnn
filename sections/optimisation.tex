@@ -1,0 +1,102 @@
+\section{Optimisation}
+\label{sec:optimisation}
+
+\subsection{Fused SSM State-Update Kernel}
+\label{sec:ssm-kernel}
+
+Because each TTNN operation is a separate command to the device, sequential operations on the same tensor each read it from DRAM independently — there is no automatic reuse of the value from the previous operation. Without the custom kernel, the Mamba-2 recurrent step (Equations~\ref{eq:state}--\ref{eq:output}) is implemented as four sequential TTNN operations, each reading the full $H_m \times D \times N$ state tensor from DRAM: (1) compute $\exp(\Delta \odot A) \odot \mathbf{h} + (\Delta\,\sigma) \odot B$ to get the new state, (2) write the new state back to the fixed-address DRAM buffer, (3) multiply the state element-wise by $C$ (which selects what to extract from memory), and (4) sum over $N$ to produce the per-head output.
+
+Before the kernel is called, the projection step (Section~\ref{sec:mamba2-decode}) has already combined $\Delta$, $\sigma$, $B$, and $A$ into two tensors: $\mathit{dBx} = (\Delta\,\sigma) \odot B$ (the new token contribution from Equation~\ref{eq:state}) and $\mathit{dA} = \exp(\Delta \odot A)$ (the forget factor). Both have shape $H_m \times D \times N$ and are what the kernel receives.
+
+The custom Metal kernel \texttt{ssm\_update} fuses all four steps into a single DRAM pass. Algorithm~\ref{alg:kernel} shows its structure. Rather than writing intermediate results back to DRAM, the kernel keeps them in on-chip L1 circular buffers, writing only the updated state $\mathbf{h}$ and the output $\mathbf{y}$ to DRAM. This eliminates three redundant DRAM reads and replaces four separate host-to-device commands with one per Mamba layer.
+
+\begin{algorithm}[h]
+\caption{SSM update kernel (\texttt{ssm\_update})}
+\label{alg:kernel}
+\begin{algorithmic}[1]
+\Require $\mathit{dBx} = (\Delta\,\sigma)\odot B,\ \mathit{dA} = \exp(\Delta\odot A) \in \mathbb{R}^{H_m \times D \times N}$ (from Eq.~\ref{eq:state}, in DRAM)
+\Require $\mathbf{h} \in \mathbb{R}^{H_m \times D \times N}$ (current SSM state, in DRAM)
+\Require $C \in \mathbb{R}^{H_m \times N}$ (selects what to extract from state, Eq.~\ref{eq:output}, in DRAM)
+\Ensure  $\mathbf{h}$ updated in-place (written back to DRAM)
+\Ensure  Output $\mathbf{y} \in \mathbb{R}^{H_m \times D}$ (written to DRAM)
+\Statex
+\Comment{All intermediate values stay in L1 circular buffers}
+\ForAll{$N$-tiles $n$}                              \Comment{\textbf{Phase 1}: update state}
+  \State Read $\mathit{dBx}[:,n]$, $\mathit{dA}[:,n]$, $\mathbf{h}[:,n]$ from DRAM $\to$ L1
+  \State $\mathbf{h}[:,n] \leftarrow \mathit{dA}[:,n] \odot \mathbf{h}[:,n] + \mathit{dBx}[:,n]$ \hfill (in L1)
+  \State Write $\mathbf{h}[:,n]$ to DRAM; keep copy in L1 staging buffer
+\EndFor
+\ForAll{$N$-tiles $n$}                              \Comment{\textbf{Phase 2}: extract output using $C$}
+  \State $\mathbf{yc}[:,n] \leftarrow \mathbf{h}[:,n] \odot C[:,n]$ \hfill (row broadcast over $D$, in L1)
+\EndFor
+\State $\mathbf{y}[:] \leftarrow \sum_n \mathbf{yc}[:,n]$ \Comment{\textbf{Phase 3}: reduce over $N$, write $\mathbf{y}$ to DRAM}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Fused Convolution Kernel}
+\label{sec:conv1d-kernel}
+
+Recall from Section~\ref{sec:mamba2-decode} that the convolution cache is a $K{=}4$ row tensor, where each row holds one token's $\sigma$, $B$, and $C$ values concatenated. Row 0 is the oldest token; row 3 is the most recent. Each decode step must: (1) remove the oldest row and move the remaining three rows down, (2) write the current token's $\sigma$, $B$, $C$ values into the now-empty row 3, (3) compute the weighted sum $\sum_{k=0}^{K-1} \mathit{row}[k] \odot w[k]$ (element-wise, summed over the $K$ lags), (4) add a learned bias, and (5) apply SiLU activation.
+
+Without the custom kernel, the shift requires three separate copy operations (row 1 $\to$ row 0, row 2 $\to$ row 1, row 3 $\to$ row 2), followed by one write to insert the new token into row 3. The weighted sum requires four element-wise multiplies ($\mathit{row}[0]\odot w[0]$, $\mathit{row}[1]\odot w[1]$, $\mathit{row}[2]\odot w[2]$, $\mathit{row}[3]\odot w[3]$) and three adds to sum them (summing four values always takes three additions). Bias and SiLU each add one more operation — twelve host-to-device commands in total, each reading the cache tensor from DRAM.
+
+The custom Metal kernel \texttt{conv1d\_decode} fuses all five steps into a single host-to-device command. It reads the old cache and the new input once from DRAM, performs the shift, weighted sum, bias add, and SiLU entirely in L1, and writes the updated cache and output back to DRAM in one pass. Like \texttt{ssm\_update}, it uses pre-allocated fixed-address output buffers so the result is trace-safe.
+
+\subsection{Whole-Model Decode Trace}
+\label{sec:trace-impl}
+
+Without trace, every TTNN operation in a single decode step requires a separate host-to-device round-trip over PCIe, and the cumulative overhead dominates step latency. The Metal trace mechanism (described in Section~\ref{sec:trace-impl-detail}) records the entire forward pass once and replays it with a single device command. Algorithm~\ref{alg:trace} summarises the warmup, capture, and replay sequence.
+
+\begin{algorithm}[h]
+\caption{Decode trace: warmup, capture, and replay}
+\label{alg:trace}
+\begin{algorithmic}[1]
+\Statex \textbf{Initialisation} (once, before generation)
+\State Run one prefill pass to compile all prefill-shape kernels
+\State Run 2 non-trace decode steps \Comment{step 1: compile decode-shape kernels; step 2: stabilise DRAM addresses}
+\State Allocate fixed-address buffer \texttt{\_decode\_trace\_input} (size $H$, all zeros)
+\State Begin trace capture
+\State \hspace{1em} $\mathbf{h} \leftarrow \mathtt{\_decode\_trace\_input} + \mathbf{0}$
+\State \hspace{1em} Run full forward pass
+\State End trace capture
+\Statex
+\Statex \textbf{Generation loop} (one step per token)
+\ForAll{decode steps $t = 1, 2, \ldots$}
+  \State Write token $t$'s embedding into \texttt{\_decode\_trace\_input} via \texttt{ttnn.assign}
+  \State \texttt{ttnn.execute\_trace()}
+  \State Read logits; select next token on host CPU
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Chunked-Prefill Chunk Size Tuning}
+\label{sec:chunk-tune}
+
+Prefill is processed in chunks of $C$ tokens. To choose the best value, $C \in \{192, 256, 320, 384, 512\}$ was tested on both models running on TT hardware with both fused kernels and trace enabled. The five evaluation prompts produce 5, 8, 25, 96, and 176 tokens after Granite tokenisation. Table~\ref{tab:chunk} shows TTFT for the two longest (96 and 176 tokens, where chunk size could matter) and mean decode throughput across all five.
+
+\begin{table}[h]
+\caption{Effect of prefill chunk size on TTFT and decode throughput (TT hardware, both fused kernels and trace enabled).}
+\label{tab:chunk}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrr}
+\toprule
+Model & Chunk & \multicolumn{2}{c}{TTFT (ms)} & Decode \\
+\cmidrule(lr){3-4}
+ & size & 96-token prompt & 176-token prompt & (tok/s) \\
+\midrule
+\multirow{5}{*}{tiny} & 192 & 1112.9 & 1675.9 & 10.64 \\
+ & 256 & 1104.7 & 1663.8 & \textbf{10.67} \\
+ & 320 & 1114.6 & 1669.2 & 10.65 \\
+ & 384 & \textbf{1104.6} & \textbf{1656.1} & 10.63 \\
+ & 512 & 1109.7 & 1666.6 & 10.65 \\
+\midrule
+\multirow{5}{*}{small} & 192 & 1911.1 & 2808.9 & \textbf{5.86} \\
+ & 256 & 1917.6 & \textbf{2789.6} & \textbf{5.86} \\
+ & 320 & 1909.6 & 2825.1 & 5.85 \\
+ & 384 & \textbf{1901.6} & 2836.8 & 5.84 \\
+ & 512 & 1939.0 & 2823.5 & \textbf{5.86} \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+All values produce essentially identical TTFT and decode throughput for both models, so chunk size has no measurable effect. $C{=}256$ is used as the default: it achieves the highest mean decode throughput for the tiny model (10.67 tok/s) and ties for the highest for the small model (5.86 tok/s).

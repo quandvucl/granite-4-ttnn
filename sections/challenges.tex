@@ -1,0 +1,44 @@
+\section{Porting Challenges}
+\label{sec:challenges}
+
+Porting from the HuggingFace reference implementation to on-device TTNN execution required resolving challenges in three categories.
+
+\subsection{Numerical Precision}
+
+\subsubsection{Tile-layout quantisation}
+
+TTNN operates on 32-element tiles and requires all tensors in bfloat16 (or lower) tile layout. HuggingFace uses 32-bit float accumulation in several places (notably SSM state updates and normalisation). Converting these to bfloat16 without extra precision guards caused top-1 token predictions to diverge from the HuggingFace reference within the first few decode steps across all five evaluation prompts. The solution was to enable higher-precision accumulation on RMSNorm and matrix-multiply operations (\texttt{fp32\_dest\_acc\_en=True}), and keep the SSM state in bfloat16 with high-precision internal accumulators. After applying these guards, the tiny model produces coherent, on-topic responses that match the A100 reference for all five prompts (Section~\ref{sec:eval-quality}).
+
+\subsubsection{MoE weight quantisation}
+
+For the small model, MoE expert weights are stored in \texttt{bfloat8\_b} (8-bit block float) to reduce per-device DRAM from $\sim$36\,MB/layer to $\sim$18\,MB/layer, a necessary compression given the 12\,GB DRAM per chip. The tiny model's MoE weights remain in bfloat16, as its smaller hidden size (1536 vs.\ 4096) means the memory saving does not justify the quantisation overhead. Activations remain in bfloat16 for both models.
+
+The small model produces coherent, on-topic responses across all five evaluation prompts under this quantisation (Section~\ref{sec:eval-quality}).
+
+\subsubsection{Logits gather axis on multi-chip mesh}
+
+As described in Section~\ref{sec:mesh-sharding}, the LM head weight is column-sharded across the 4 chips, so each chip produces logits for only its slice of the vocabulary. TTNN's \texttt{ConcatMeshToTensor} composer requires explicitly specifying the concatenation axis to reconstruct the full logit vector. Using the wrong axis (dim=0 instead of dim=3 in TTNN's 4D tile layout) produced scrambled logits that generated coherent-looking but semantically wrong tokens. This was diagnosed by comparing token-id sequences between the TT and HuggingFace paths and corrected for both models.
+
+\subsection{Architectural Adaptation}
+
+\subsubsection{Mamba2 state persistence}
+
+HuggingFace's \texttt{MambaCache} stores the SSM state as a list of tensors indexed by layer, updated via \texttt{.copy\_()} into a pre-allocated PyTorch tensor. TTNN requires a persistent fixed-address DRAM tensor because trace replay records specific buffer addresses. The port replaced the list-based cache with a \texttt{ttnn.Tensor} per layer, and the state update writes the new state into the same fixed-address buffer via \texttt{ttnn.assign} rather than reallocating a new tensor, preserving the address recorded in the trace so every replay reads and writes the correct location.
+
+A second problem came from how TTNN manages tensor memory. TTNN tracks how many references point to each tensor; freeing a tensor that is still referenced elsewhere causes the device to silently read from freed memory and return zeros. The original code freed the old state tensor and created a new one, which also assigned a new DRAM address to \texttt{self.\_ssm\_state\_tt}. The trace, which had recorded the old address, then read from the wrong location on every replay. Writing the updated state into the original buffer via \texttt{ttnn.assign} fixes both issues: the old address is kept, and no tensor is freed while still in use.
+
+\subsubsection{MoE expert sharding mismatch}
+
+Granite-4.0-h uses 64 experts for the tiny model and 72 experts for the small model. On a 1$\times$4 mesh, 64 divides evenly into 16 experts per device. On an 8$\times$1 mesh, 72 divides into 9 experts per device. Each device runs all its local experts and multiplies each output by the corresponding routing weight; unselected experts have a routing weight of zero and therefore contribute nothing to the sum. This differs from the HuggingFace implementation, which skips unselected experts entirely, and required re-implementing the MoE forward pass from scratch using TTNN matmuls and an explicit routing-weight multiply.
+
+\subsection{Toolchain Limitations}
+
+\subsubsection{No native Mamba2 chunk-scan kernel}
+
+The HuggingFace Mamba2 implementation uses two Triton kernels for decode: \texttt{causal\_\allowbreak conv1d\_\allowbreak update} (a fused causal convolution step) and \texttt{selective\_state\_update} (a fused recurrent state update). Neither has an equivalent in the TTNN Metal kernel library at the time of writing. Both were initially implemented using sequential TTNN ops, and two custom Metal kernels — \texttt{conv1d\_decode} and \texttt{ssm\_update} — were written to replace them. Both are described in Section~\ref{sec:optimisation}.
+
+\subsubsection{Trace capture must run outside the generation loop}
+
+As described in Section~\ref{sec:exec-model}, during trace capture operations are stored but not executed on the device. This means the model state --- the SSM recurrent state and the attention past-token cache --- is not updated during capture. If capture is triggered inside the generation loop at step $t$, the device state is still from step $t-1$ when the trace runs, so all replays produce the wrong output: every generated token is shifted by one position. This was confirmed by observing that the output with trace at step $t$ matched the output without trace at step $t-1$.
+
+The fix is to capture the trace once before generation begins, using a dummy (zeros) input that does not affect the model state. The capture procedure is described in Section~\ref{sec:trace-impl-detail}.
