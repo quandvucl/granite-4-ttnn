@@ -9,7 +9,7 @@ from utils.device import _make_mesh_mapper
 def make_segment_sum_masks(chunk_size: int, device):
     """Pre-compute the two triangular masks used by segment_sum_ttnn.
 
-    Returns (mask_lower_tt, mask_diag_tt) — [chunk_size, chunk_size] TTNN tensors.
+    Returns (mask_lower_tt, mask_diag_tt) - [chunk_size, chunk_size] TTNN tensors.
     Call once at model init and pass via masks= to avoid repeated PCIe uploads.
     """
     mesh_mapper = _make_mesh_mapper(device)

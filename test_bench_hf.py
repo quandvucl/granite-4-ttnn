@@ -3,10 +3,10 @@
 Benchmark Granite models on CPU/HuggingFace: model load time + prefill + decode.
 
 Usage:
-  python generate_with_warmup.py                        # tiny + small, all prompts
-  python generate_with_warmup.py --model tiny           # tiny only
-  python generate_with_warmup.py --model small          # small only
-  python generate_with_warmup.py --decode-tokens 30     # more decode steps
+  python test_bench_hf.py                        # tiny + small, all prompts
+  python test_bench_hf.py --model tiny           # tiny only
+  python test_bench_hf.py --model small          # small only
+  python test_bench_hf.py --decode-tokens 30     # more decode steps
 """
 
 import argparse
@@ -69,7 +69,7 @@ class BenchRunner:
     model: Any
     tokenizer: Any
     device: str
-    cache_class: Any  # HybridMambaAttentionDynamicCache
+    cache_class: Any
     rep_processor: RepetitionPenaltyLogitsProcessor
 
 
@@ -163,7 +163,6 @@ def bench_prompt(runner: BenchRunner, input_ids: torch.Tensor, decode_tokens: in
     sync(runner.device)
     prefill_ms = (time.time() - t0) * 1000
 
-    # Pre-allocate seen_ids buffer — avoids list→tensor each step
     seen_buf = torch.empty(1, actual_len + decode_tokens + 1, dtype=torch.long, device=runner.device)
     seen_buf[0, :actual_len] = input_ids[0]
     seen_len = actual_len
@@ -176,7 +175,6 @@ def bench_prompt(runner: BenchRunner, input_ids: torch.Tensor, decode_tokens: in
 
     cache_position = torch.zeros(1, dtype=torch.long, device=runner.device)
 
-    # Per-step timing, skip first step (matches ttnn methodology)
     decode_times = []
     with torch.no_grad():
         for step in range(decode_tokens):
@@ -232,7 +230,6 @@ def run_bench(model_name: str, decode_tokens: int = DECODE_TOKENS, device: str =
     model, load_s = load_model(model_id, device, compile=compile)
     print(f"\nModel load: {load_s:.1f} s\n")
 
-    # Deferred import: module is registered dynamically via trust_remote_code
     from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (  # noqa: PLC0415
         HybridMambaAttentionDynamicCache,
     )

@@ -1,5 +1,5 @@
 """
-Host-side launcher for ssm_update — fused Metal kernel that computes:
+Host-side launcher for ssm_update - fused Metal kernel that computes:
   h_out[d,n] = dBx[d,n] + dA[d,n] * state[d,n]
   yc[d,n]    = h_out[d,n] * C[h%32, n]   (C row-broadcast over D)
   y[d]       = sum_n(yc[d,n])             (reduce over N)
@@ -19,12 +19,12 @@ Returns:
 The caller is responsible for D-skip:  y_out = y_tt[:,:,:,0] + D * x
 
 Hot-path dispatch cost:
-  First call  — builds and caches static plan (CBs, CT args, KernelDescriptor shells,
+  First call  - builds and caches static plan (CBs, CT args, KernelDescriptor shells,
                 core list with static per-core args).
-  Subsequent  — builds fresh RuntimeArgs by filling only the address slots per core,
+  Subsequent  - builds fresh RuntimeArgs by filling only the address slots per core,
                 then wraps in ProgramDescriptor and calls generic_op.
   The plan cache avoids re-computing grid split, CT args, CBDescriptors, and the
-  core_list itself; only the 3×RuntimeArgs allocation + address fill remains on the
+  core_list itself; only the 3xRuntimeArgs allocation + address fill remains on the
   hot path (~180 µs/layer vs ~500 µs without caching).
 """
 
@@ -59,7 +59,7 @@ def _get_scaler(device):
 class _SsmPlan:
     """Cached static dispatch data for one (device, B, H, D, N, cache_bust_id) combination.
 
-    core_list: [(cx, cy, wpc, cur), ...] — pre-computed per-core static args.
+    core_list: [(cx, cy, wpc, cur), ...] - pre-computed per-core static args.
                Only addresses change per call; these are constant.
     """
     __slots__ = [
@@ -69,12 +69,13 @@ class _SsmPlan:
         'cbs',
         'is_mesh', 'mesh_rows', 'mesh_cols',
         'scaler_tt',
-        'reader_src', 'writer_src', 'compute_src',  # kernel source paths (cached strings)
+        'reader_src', 'writer_src', 'compute_src',
     ]
 
 
 def _build_plan(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt, y_tt,
                 scaler_tt, cache_bust_id):
+    """Build static dispatch plan: grid split, CB descriptors, compile-time args."""
     sh = dBx_tt.shape
     B, H, D, N = sh[0], sh[1], sh[2], sh[3]
 
@@ -144,7 +145,7 @@ def _build_plan(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt, y_tt,
         make_cb(0), make_cb(1), make_cb(2), make_cb(3), make_cb(4),
         make_cb(5, Nt), make_cb(6, Nt),
         make_cb(16), make_cb(17),
-        # Dummy CB7: encodes cache_bust_id so each Mamba layer gets a unique program hash,
+        # CB7 size encodes cache_bust_id so each Mamba layer gets a unique program hash,
         # preventing cross-layer generic_op cache collisions with stale L1 CB addresses.
         ttnn.CBDescriptor(
             total_size=(cache_bust_id + 1) * tile_bytes,
@@ -177,6 +178,7 @@ def _build_plan(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt, y_tt,
 
 def _make_runtime_args(plan, dBx_addr, dA_addr, state_addr, C_addr,
                        scaler_addr, hout_addr, y_addr):
+    """Fill per-core address slots into RuntimeArgs structures."""
     reader_rt  = ttnn.RuntimeArgs()
     writer_rt  = ttnn.RuntimeArgs()
     compute_rt = ttnn.RuntimeArgs()
@@ -191,6 +193,7 @@ def _make_runtime_args(plan, dBx_addr, dA_addr, state_addr, C_addr,
 
 
 def _make_program(plan, reader_rt, writer_rt, compute_rt):
+    """Assemble a ProgramDescriptor from the cached plan and fresh runtime args."""
     reader_kern = ttnn.KernelDescriptor(
         kernel_source=plan.reader_src,
         source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -235,9 +238,9 @@ def ssm_update(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt=None, y_tt=None,
         device                   : single TT device or MeshDevice
         hout_tt                  : optional pre-allocated [1, H, D, N] output (trace-safe)
         y_tt                     : optional pre-allocated [1, H, D, 1] output (trace-safe)
-        cache_bust_id            : per-layer integer (e.g. layer_idx) that differentiates the
-                                   generic_op program hash across Mamba layers, preventing
-                                   cross-layer cache collisions with stale L1 CB addresses.
+        cache_bust_id            : per-layer integer that differentiates the generic_op
+                                   program hash across Mamba layers, preventing cross-layer
+                                   cache collisions with stale L1 CB addresses.
 
     Returns:
         (hout_tt, y_tt) where

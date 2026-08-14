@@ -1,5 +1,3 @@
-// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
-// SPDX-License-Identifier: Apache-2.0
 //
 // Compute kernel: conv1d_decode
 //
@@ -56,10 +54,10 @@ void kernel_main() {
 
     constexpr uint32_t K = CONV_K;
 
-    // DST slot assignments (K=4 → max slot used = 2*4+1 = 9, well within 16)
-    // new_cache[k] → DST slot k           (k=0..K-1)
-    // product[k]   → DST slot K+k         (k=0..K-1, reused for accumulation)
-    // bias/out     → DST slot 2*K
+    // DST slot assignments (K=4, max slot used = 2*4+1 = 9, well within 16)
+    // new_cache[k]: DST slot k           (k=0..K-1)
+    // product[k]:   DST slot K+k         (k=0..K-1, reused for accumulation)
+    // bias/out:     DST slot 2*K
 
     for (uint32_t ci = 0; ci < num_c; ++ci) {
         cb_wait_front(cb_cache, K);

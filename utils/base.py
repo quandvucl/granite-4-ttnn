@@ -27,7 +27,7 @@ def to_tt_tensor(
         TTNN tensor
 
     Note:
-        Always use ROW_MAJOR_LAYOUT for CPU→TT transfers to prevent
+        Always use ROW_MAJOR_LAYOUT for CPU->TT transfers to prevent
         tile padding corruption. Convert to TILE_LAYOUT for computation.
         For mesh tensors:
         - Use mesh_mapper for explicit sharding/replication strategy

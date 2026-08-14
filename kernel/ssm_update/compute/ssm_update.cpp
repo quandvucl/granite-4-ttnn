@@ -1,5 +1,3 @@
-// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
-// SPDX-License-Identifier: Apache-2.0
 //
 // Compute kernel: ssm_update
 //
@@ -41,53 +39,56 @@
 
 using namespace ckernel;
 
-void kernel_main() {
-    uint32_t num_groups  = get_arg_val<uint32_t>(0);
-    uint32_t Nt          = get_arg_val<uint32_t>(1);
-    uint32_t Dt          = get_arg_val<uint32_t>(2);
+void kernel_main()
+{
+    uint32_t num_groups = get_arg_val<uint32_t>(0);
+    uint32_t Nt = get_arg_val<uint32_t>(1);
+    uint32_t Dt = get_arg_val<uint32_t>(2);
     uint32_t start_group = get_arg_val<uint32_t>(3);
 
-    constexpr auto cb_dBx    = tt::CBIndex::c_0;
-    constexpr auto cb_dA     = tt::CBIndex::c_1;
-    constexpr auto cb_state  = tt::CBIndex::c_2;
-    constexpr auto cb_C      = tt::CBIndex::c_3;
+    constexpr auto cb_dBx = tt::CBIndex::c_0;
+    constexpr auto cb_dA = tt::CBIndex::c_1;
+    constexpr auto cb_state = tt::CBIndex::c_2;
+    constexpr auto cb_C = tt::CBIndex::c_3;
     constexpr auto cb_scaler = tt::CBIndex::c_4;
     constexpr auto cb_hout_s = tt::CBIndex::c_5;
-    constexpr auto cb_yc     = tt::CBIndex::c_6;
-    constexpr auto cb_hout   = tt::CBIndex::c_16;
-    constexpr auto cb_y      = tt::CBIndex::c_17;
+    constexpr auto cb_yc = tt::CBIndex::c_6;
+    constexpr auto cb_hout = tt::CBIndex::c_16;
+    constexpr auto cb_y = tt::CBIndex::c_17;
 
     cb_wait_front(cb_scaler, 1);
 
-    for (uint32_t g = 0; g < num_groups; ++g) {
-        uint32_t grp  = start_group + g;
-        uint32_t h    = grp / Dt;
+    for (uint32_t g = 0; g < num_groups; ++g)
+    {
+        uint32_t grp = start_group + g;
+        uint32_t h = grp / Dt;
         uint32_t h_row = h & 31u;
 
-        // ── Phase 1: h_out = dBx + dA * state ────────────────────────────────
+        // Phase 1: h_out = dBx + dA * state
         // Pack h_out to both cb_hout (writer output) and cb_hout_s (staging for Phase 2).
         init_sfpu(cb_dBx, cb_hout);
 
-        for (uint32_t n = 0; n < Nt; ++n) {
-            cb_wait_front(cb_dBx,   1);
-            cb_wait_front(cb_dA,    1);
+        for (uint32_t n = 0; n < Nt; ++n)
+        {
+            cb_wait_front(cb_dBx, 1);
+            cb_wait_front(cb_dA, 1);
             cb_wait_front(cb_state, 1);
-            cb_reserve_back(cb_hout,   1);
+            cb_reserve_back(cb_hout, 1);
             cb_reserve_back(cb_hout_s, 1);
 
             tile_regs_acquire();
 
             copy_tile_to_dst_init_short(cb_dBx);
-            copy_tile(cb_dBx,   0, 0);
+            copy_tile(cb_dBx, 0, 0);
             copy_tile_to_dst_init_short(cb_dA);
-            copy_tile(cb_dA,    0, 1);
+            copy_tile(cb_dA, 0, 1);
             copy_tile_to_dst_init_short(cb_state);
             copy_tile(cb_state, 0, 2);
 
             mul_binary_tile_init();
-            mul_binary_tile(1, 2, 1);   // DST[1] = dA * state
+            mul_binary_tile(1, 2, 1); // DST[1] = dA * state
             add_binary_tile_init();
-            add_binary_tile(0, 1, 0);   // DST[0] = h_out
+            add_binary_tile(0, 1, 0); // DST[0] = h_out
 
             tile_regs_commit();
             tile_regs_wait();
@@ -100,18 +101,19 @@ void kernel_main() {
 
             tile_regs_release();
 
-            cb_pop_front(cb_dBx,   1);
-            cb_pop_front(cb_dA,    1);
+            cb_pop_front(cb_dBx, 1);
+            cb_pop_front(cb_dA, 1);
             cb_pop_front(cb_state, 1);
         }
 
-        // ── Phase 2: yc = h_out * C[h_row, :] via row-broadcast multiply ────
+        // Phase 2: yc = h_out * C[h_row, :] via row-broadcast multiply
         init_bcast<ELWMUL, BroadcastType::ROW>(cb_hout_s, cb_C, cb_yc);
 
-        for (uint32_t n = 0; n < Nt; ++n) {
+        for (uint32_t n = 0; n < Nt; ++n)
+        {
             cb_wait_front(cb_hout_s, 1);
-            cb_wait_front(cb_C,      1);
-            cb_reserve_back(cb_yc,   1);
+            cb_wait_front(cb_C, 1);
+            cb_reserve_back(cb_yc, 1);
 
             acquire_dst();
             mul_tiles_bcast_rows(cb_hout_s, cb_C, 0, 0, 0, h_row);
@@ -120,15 +122,16 @@ void kernel_main() {
             release_dst();
 
             cb_pop_front(cb_hout_s, 1);
-            cb_pop_front(cb_C,      1);
+            cb_pop_front(cb_C, 1);
         }
 
-        // ── Phase 3: y = sum_n(yc) via REDUCE_ROW ────────────────────────────
+        // Phase 3: y = sum_n(yc) via REDUCE_ROW
         cb_reserve_back(cb_y, 1);
         reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_yc, cb_scaler, cb_y);
         acquire_dst();
 
-        for (uint32_t n = 0; n < Nt; ++n) {
+        for (uint32_t n = 0; n < Nt; ++n)
+        {
             cb_wait_front(cb_yc, 1);
             reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_yc, cb_scaler, 0, 0, 0);
             cb_pop_front(cb_yc, 1);

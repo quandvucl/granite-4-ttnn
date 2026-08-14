@@ -13,7 +13,6 @@ import argparse
 import json
 import os
 import time
-import sys
 import torch
 import ttnn
 
@@ -93,12 +92,7 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
     num_experts  = getattr(hf_config, "num_local_experts", 1)
     full_mesh_size = full_mesh.get_num_devices()
 
-    # Device count is limited to the largest power-of-2 (or supported mesh shape)
-    # that fits in the available mesh AND divides the expert count for EP sharding.
-    # Attention runs replicated when num_devices > num_kv_heads — no KV sharding needed.
-    # MoE effective_devices logic in moe_tt.py handles non-divisor counts gracefully.
     num_devices = min(requested_devices, full_mesh_size)
-    # Snap to largest entry in MESH_SHAPE_MAP that does not exceed num_devices
     num_devices = max(k for k in MESH_SHAPE_MAP if isinstance(k, int) and k <= num_devices)
 
     print(f"\n{'='*70}")
@@ -118,9 +112,6 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # ── Model load ──────────────────────────────────────────────────────
-        # 2D meshes (rows>1 AND cols>1) require FABRIC_1D for trace safety:
-        # FABRIC_2D + is_true_2d_mesh → composite all-gather (dynamic alloc) → non-traceable.
         resolved_shape = MESH_SHAPE_MAP[num_devices]
         _is_2d_mesh = resolved_shape[0] > 1 and resolved_shape[1] > 1
         effective_fabric_1d = use_fabric_1d or _is_2d_mesh
@@ -164,7 +155,6 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
                 scores = rep_processor(seen, scores)
             return scores[0].argmax().item()
 
-        # ── Warmup + trace capture (once, before benchmarking) ──────────────
         print("  Warming up and capturing decode trace...", flush=True)
         warmup_ids = tokenizer("Once upon a time in a land far away", return_tensors="pt")["input_ids"]
         tt_model.reset_cache()
@@ -198,7 +188,6 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             context_ids = input_ids[0].tolist()
             next_id = pick_next(logits, context_ids)
 
-            # All decode steps use trace (captured once during warmup above).
             decode_times = []
             generated_ids = [next_id]
             next_tensor = torch.zeros((1, 1), dtype=input_ids.dtype)
@@ -220,7 +209,6 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             print(f"  Prompt   : {prompt_text}")
             print(f"  Response : {response}")
 
-            # Skip first step (first trace replay after reset_cache, slightly slower)
             steady = decode_times[1:] if len(decode_times) > 1 else decode_times
             avg_ms = sum(steady) / len(steady)
             tok_s  = 1000.0 / avg_ms
@@ -236,7 +224,6 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
                 "response": response,
             })
 
-        # ── Summary table ───────────────────────────────────────────────────
         print(f"{'='*70}")
         print(f"  SUMMARY: {model_name.upper()} on {num_devices} devices")
         print(f"  Model load: {load_s:.1f} s")
@@ -259,7 +246,7 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
 
     finally:
         if device is not full_mesh:
-            ttnn.close_mesh_device(device)  # release submesh devices back to full_mesh
+            ttnn.close_mesh_device(device)
 
 
 def main():
@@ -297,8 +284,6 @@ def main():
     rows, cols = (int(x) for x in args.mesh.split("x"))
     use_fabric = rows * cols > 1
     fabric_ok = False
-    # Galaxy fabric requires the full 8x4 mesh to be opened — fabric sync is system-wide.
-    # Always open full mesh, then carve out the requested submesh inside run_bench.
     GALAXY_SHAPE = ttnn.MeshShape(8, 4)
     full_mesh = None
     if use_fabric:

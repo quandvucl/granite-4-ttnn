@@ -1,4 +1,4 @@
-"""Hybrid Granite decoder layer — hidden_states stays on TTNN throughout all 40 layers."""
+"""Hybrid Granite decoder layer - hidden_states stays on TTNN throughout all 40 layers."""
 
 import sys
 from pathlib import Path
@@ -15,12 +15,14 @@ from models.tt_transformers.tt.common import Mode
 
 
 def _replicate(tensor: torch.Tensor, device, dtype, layout=ttnn.TILE_LAYOUT) -> ttnn.Tensor:
+    """Upload a CPU tensor to device, replicating across all mesh devices."""
     mapper = ttnn.ReplicateTensorToMesh(device) if hasattr(device, "get_num_devices") else None
     return ttnn.from_torch(tensor, device=device, dtype=dtype, layout=layout, mesh_mapper=mapper,
                            memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
 def _tt_to_torch(tt: ttnn.Tensor, shape) -> torch.Tensor:
+    """Gather a TTNN tensor from mesh and return as a CPU torch tensor."""
     device = tt.device()
     if hasattr(device, "get_num_devices") and device.get_num_devices() > 1:
         result = ttnn.to_torch(tt, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0))[0:1]
@@ -123,8 +125,7 @@ class TTGraniteDecoderLayer:
         else:
             self.simple_attention = None
             if hasattr(hf_layer, "mamba") and use_tt_mamba:
-                # Small on 4 dev (H=4096): replicated = 3.5 GB bf8 → OOM. TP required.
-                # Tiny (H=1536, 4 devices): TP also works; unified threshold with MLP.
+                # Small on 4 dev (H=4096): replicated = 3.5 GB bf8 -> OOM. TP required.
                 _num_dev = device.get_num_devices() if self.is_mesh else 1
                 _mamba_tp = self.is_mesh and _num_dev > 4
                 self.mamba = TensorParallelMamba(
@@ -151,6 +152,7 @@ class TTGraniteDecoderLayer:
         cache_position=None,
         has_previous_state=None,
     ) -> ttnn.Tensor:
+        """Run one decoder layer (mixer + MLP with residual connections)."""
         seq_len = len(cache_position) if cache_position is not None else hidden_states.shape[2]
         mode = Mode.DECODE if seq_len == 1 else Mode.PREFILL
         if not hasattr(cache_manager, "hybrid_cache"):
@@ -192,6 +194,7 @@ class TTGraniteDecoderLayer:
     def _attention_forward(self, normed, cache_manager, position_ids,
                            attention_mask, position_embeddings,
                            cache_position, seq_len) -> ttnn.Tensor:
+        """Dispatch to TTNN attention or HF fallback."""
         if self.simple_attention is not None:
             return self.simple_attention.forward(
                 normed, position_ids=position_ids, cache_manager=cache_manager,
@@ -209,6 +212,7 @@ class TTGraniteDecoderLayer:
 
     def _mamba_forward(self, normed, cache_manager, position_ids,
                        cache_position, seq_len) -> ttnn.Tensor:
+        """Dispatch to TTNN Mamba or HF fallback."""
         start_pos = position_ids[0, 0].item()
         if cache_position is None:
             cache_position = torch.arange(start_pos, start_pos + seq_len)
@@ -236,6 +240,7 @@ class TTGraniteDecoderLayer:
                           self.device, self.dtype)
 
     def _mlp_forward(self, normed, seq_len, mode) -> ttnn.Tensor:
+        """Run MoE + shared MLP and return their sum."""
         hidden_size = self.config.hidden_size
 
         if self.tt_moe is not None and (seq_len == 1 or seq_len >= 32):
@@ -258,9 +263,9 @@ class TTGraniteDecoderLayer:
         return out
 
     def reset_cache(self):
+        """Zero KV cache (attention) or SSM/conv state (Mamba) in-place to preserve trace addresses."""
         if self.is_attention_layer and self.simple_attention is not None:
             attn = self.simple_attention
-            # In-place zero so device addresses stay fixed (trace bakes in addresses).
             zeros_k = ttnn.zeros_like(attn.cache_k)
             ttnn.assign(zeros_k, attn.cache_k)
             zeros_k.deallocate(True)

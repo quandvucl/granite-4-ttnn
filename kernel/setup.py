@@ -1,9 +1,6 @@
 """
 Build the mamba2_ssm_decode fused op shared library.
 
-Headers: v0.67.0-rc12 source (extracted to tt-metal-headers/ to match installed binary v0.67.0)
-Binary:  /work/tt-granite/env/lib/python3.10/site-packages/ttnn/build/lib/_ttnncpp.so
-
 Usage (from /work/tt-granite/kernel/):
     source /work/tt-granite/env/bin/activate
     python setup.py
@@ -15,29 +12,24 @@ import subprocess
 from pathlib import Path
 
 HERE = Path(__file__).parent.resolve()
-# Headers extracted from tt-metal v0.67.0-rc12 (matching installed binary version)
 HDR = HERE / "tt-metal-headers"
 TTNN_SITE = Path("/work/tt-granite/env/lib/python3.10/site-packages/ttnn")
 
 def build():
+    """Compile mamba2_ssm_decode.cpp into libmamba2_ssm_decode.so."""
     include_dirs = [
         str(HDR / "ttnn/cpp"),
         str(HDR / "ttnn/api"),
         str(HDR / "tt_stl"),
-        str(HDR / "tt_metal/api"),               # provides tt-metalium/queue_id.hpp etc.
-        # fmt from torch (header-only, FMT_HEADER_ONLY)
+        str(HDR / "tt_metal/api"),
         str(TTNN_SITE.parent / "torch/include"),
-        # CPM dependencies (header-only loggers/utils)
         "/work/tt-metal/.cpmcache/tt-logger/d2339ce68562cae34cd95f3fece7fd94eb0529b7/include",
         "/work/tt-metal/.cpmcache/spdlog/b1c2586bb5c35a7929362e87f62433eb68206873/include",
         "/work/tt-metal/.cpmcache/reflect/f93e77475670eaeacf332927dfe8b50e3f3812e0",
         "/work/tt-metal/.cpmcache/nlohmann_json/798e0374658476027d9723eeb67a262d0f3c8308/include",
         "/work/tt-metal/.cpmcache/enchantum/2fb7ab238e36c101b9848892ddb6382276b65837/enchantum/include",
-        # umd device types
         str(HERE / "tt-metal-headers/umd"),
-        # tracy profiler (header-only, disable profiling)
         "/work/tt-metal/tt_metal/third_party/tracy/public",
-        # installed headers
         str(TTNN_SITE / "tt_metal/api"),
         str(TTNN_SITE / "tt_metal/hostdevcommon/api"),
     ]
@@ -47,7 +39,7 @@ def build():
         "-O2",
         "-fPIC",
         "-DFMT_HEADER_ONLY=1",
-        "-w",  # suppress warnings from tt-metal headers
+        "-w",
     ]
 
     link_flags = [

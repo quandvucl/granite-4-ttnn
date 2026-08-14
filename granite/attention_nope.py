@@ -5,8 +5,7 @@ import ttnn
 
 
 class AttentionNoPE:
-    """TTNN attention without position embeddings (Granite uses NoPE).
-    """
+    """On-device attention without position embeddings, with paged KV cache."""
 
     def __init__(
         self,
@@ -42,7 +41,6 @@ class AttentionNoPE:
                 mesh_mapper=mesh_mapper,
             )
 
-        # Fuse Q/K/V weights into a single matrix
         qkv_size = num_heads * head_dim + 2 * num_kv_heads * head_dim
         qkv_weight = torch.zeros((qkv_size, hidden_size), dtype=torch.bfloat16)
         q_end = num_heads * head_dim
@@ -54,7 +52,6 @@ class AttentionNoPE:
         self.wqkv = _upload(qkv_weight.T.contiguous())
         self.wo   = _upload(o_weight.to(torch.bfloat16).T.contiguous())
 
-        # KV cache — replicated on all devices
         cache_k = torch.zeros((1, num_kv_heads, max_seq_len, head_dim))
         cache_v = torch.zeros((1, num_kv_heads, max_seq_len, head_dim))
         self.cache_k = _upload(cache_k, dt=ttnn.bfloat16)
@@ -63,7 +60,7 @@ class AttentionNoPE:
         self._mesh_mapper = mesh_mapper
         self._is_mesh = is_mesh
 
-        # Pre-allocated position tensor for trace-safe decode (avoids new alloc each step).
+        # Pre-allocated for trace safety - avoids new device allocation each decode step.
         self._cur_pos_tt = ttnn.from_torch(
             torch.zeros(1, dtype=torch.int32), device=device,
             layout=ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -81,12 +78,12 @@ class AttentionNoPE:
     def forward(
         self,
         hidden_states,
-        position_ids: torch.Tensor = None,  # Ignored for NoPE
-        cos: torch.Tensor = None,  # Ignored for NoPE
-        sin: torch.Tensor = None,  # Ignored for NoPE
-        cache_manager=None,        # Unused: TTNN has its own on-device KV cache
+        position_ids: torch.Tensor = None,
+        cos: torch.Tensor = None,
+        sin: torch.Tensor = None,
+        cache_manager=None,
     ):
-        """TTNN forward pass - no position embeddings (NoPE)."""
+        """Run prefill or decode attention; cos/sin/cache_manager unused (NoPE, on-device KV)."""
         from utils import to_tt_tensor, to_torch_tensor
 
         if isinstance(hidden_states, torch.Tensor):
@@ -101,10 +98,8 @@ class AttentionNoPE:
         is_decode = (seq_len == 1)
         start_pos = position_ids[0, 0].item() if position_ids is not None else 0
 
-        # QKV Projection
         xqkv_fused = ttnn.linear(hidden_tt, self.wqkv, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
-        # Create QKV Heads
         if is_decode:
             xqkv_fused = ttnn.reshape(xqkv_fused, [1, 1, seq_len, -1])
             q_heads, k_heads, v_heads = ttnn.experimental.nlp_create_qkv_heads_decode(
@@ -124,7 +119,6 @@ class AttentionNoPE:
             )
         ttnn.deallocate(xqkv_fused)
 
-        # KV Cache Update
         keys, values = self.cache_k, self.cache_v
 
         if is_decode:
@@ -155,7 +149,6 @@ class AttentionNoPE:
             num_blocks = (total_len + block_size - 1) // block_size
 
             if start_pos == 0:
-                # First prefill chunk: fill from block 0, use local K/V for attention.
                 page_table_torch = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
                 page_table = ttnn.from_torch(
                     page_table_torch, device=self.device, layout=ttnn.ROW_MAJOR_LAYOUT,
@@ -174,8 +167,6 @@ class AttentionNoPE:
                 ttnn.deallocate(k_heads)
                 ttnn.deallocate(v_heads)
             else:
-                # Subsequent prefill chunk: fill only new K/V into cache at correct offset,
-                # then attend to full accumulated cache (positions 0..start_pos+seq_len-1).
                 first_new_block = start_pos // block_size
                 new_blocks = num_blocks - first_new_block
                 page_table_torch = torch.arange(
@@ -191,18 +182,15 @@ class AttentionNoPE:
                 ttnn.deallocate(k_heads)
                 ttnn.deallocate(v_heads)
 
-                # Attend to full accumulated cache: slice [1, nKH, total_len, D].
-                # Build explicit mask: q[i] (at position start_pos+i) attends to k[j]
-                # iff j <= start_pos + i.  Shape: [1, 1, seq_len, total_len].
-                row = torch.arange(seq_len).unsqueeze(1)          # [seq_len, 1]
-                col = torch.arange(total_len).unsqueeze(0)        # [1, total_len]
-                mask_torch = (col <= (start_pos + row)).to(torch.bfloat16)  # [seq_len, total_len]
-                # TTNN uses -inf for masked positions; convert bool mask to additive mask
+                row = torch.arange(seq_len).unsqueeze(1)
+                col = torch.arange(total_len).unsqueeze(0)
+                mask_torch = (col <= (start_pos + row)).to(torch.bfloat16)
+                # TTNN uses -inf for masked positions; convert bool mask to additive mask.
                 mask_add = torch.where(
                     mask_torch.bool(),
                     torch.zeros_like(mask_torch),
                     torch.full_like(mask_torch, float("-inf")),
-                ).unsqueeze(0).unsqueeze(0)                       # [1, 1, seq_len, total_len]
+                ).unsqueeze(0).unsqueeze(0)
                 mask_tt = ttnn.from_torch(
                     mask_add, device=self.device, dtype=ttnn.bfloat16,
                     layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -228,7 +216,6 @@ class AttentionNoPE:
             )
             ttnn.deallocate(attn_output)
 
-        # Output Projection — stay on device, reshape to [1, 1, S, H]
         output_tt = ttnn.linear(attn_output_concat, self.wo, dtype=self.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(attn_output_concat)
 

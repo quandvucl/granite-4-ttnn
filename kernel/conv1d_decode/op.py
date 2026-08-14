@@ -1,5 +1,5 @@
 """
-Host-side launcher for conv1d_decode — fused Mamba2 causal conv1d decode step.
+Host-side launcher for conv1d_decode - fused Mamba2 causal conv1d decode step.
 
 Computes in one kernel dispatch:
   new_cache[k] = cache[k+1]   k=0..K-2    (shift left)
@@ -7,13 +7,13 @@ Computes in one kernel dispatch:
   out = silu(sum_k(new_cache[k] * w[k]) + bias)
 
 Expected shapes (bfloat16, TILE_LAYOUT, on device):
-  xBC_new_tt   : [1, 1, C, 1]   — new token's pre-conv values
-  conv_cache_tt: [1, K, C, 1]   — shift-register cache (k=0 oldest, k=K-1 newest)
-  conv_w_tt    : [1, K, C, 1]   — weight columns (k=0 oldest lag)
-  conv_bias_tt : [1, 1, C, 1]   — optional bias (pass None to skip)
+  xBC_new_tt   : [1, 1, C, 1]   - new token's pre-conv values
+  conv_cache_tt: [1, K, C, 1]   - shift-register cache (k=0 oldest, k=K-1 newest)
+  conv_w_tt    : [1, K, C, 1]   - weight columns (k=0 oldest lag)
+  conv_bias_tt : [1, 1, C, 1]   - optional bias (pass None to skip)
 
 Returns:
-  (new_cache_tt, conv_out_tt) — both same shapes as inputs; new_cache_tt written
+  (new_cache_tt, conv_out_tt) - both same shapes as inputs; new_cache_tt written
   in-place to conv_cache_tt's buffer (via assign) for trace-safety.
 
 Hot-path dispatch: plan cached after first call per (device, C, K).
@@ -21,7 +21,6 @@ Hot-path dispatch: plan cached after first call per (device, C, K).
 
 import math
 import os
-import torch
 import ttnn
 
 KERNEL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +29,7 @@ _plan_cache: dict = {}
 
 
 class _Conv1dPlan:
+    """Cached static dispatch data for one (device, C, K, bias) combination."""
     __slots__ = [
         'core_grid', 'core_list',
         'Ct', 'K',
@@ -43,6 +43,7 @@ class _Conv1dPlan:
 
 def _build_plan(xBC_new_tt, conv_cache_tt, conv_w_tt, conv_bias_tt,
                 device, new_cache_tt, conv_out_tt):
+    """Build static dispatch plan: grid split, CB descriptors, compile-time args."""
     sh = xBC_new_tt.shape   # [1, 1, C, 1]
     C = sh[2]
     K = conv_cache_tt.shape[1]
@@ -136,6 +137,7 @@ def _build_plan(xBC_new_tt, conv_cache_tt, conv_w_tt, conv_bias_tt,
 
 def _make_runtime_args(plan, xBC_addr, cache_addr, w_addr, bias_addr,
                        new_cache_addr, out_addr):
+    """Fill per-core address slots into RuntimeArgs structures."""
     reader_rt  = ttnn.RuntimeArgs()
     writer_rt  = ttnn.RuntimeArgs()
     compute_rt = ttnn.RuntimeArgs()
@@ -150,6 +152,7 @@ def _make_runtime_args(plan, xBC_addr, cache_addr, w_addr, bias_addr,
 
 
 def _make_program(plan, reader_rt, writer_rt, compute_rt):
+    """Assemble a ProgramDescriptor from the cached plan and fresh runtime args."""
     reader_kern = ttnn.KernelDescriptor(
         kernel_source=plan.reader_src,
         source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -189,10 +192,10 @@ def conv1d_decode(xBC_new_tt, conv_cache_tt, conv_w_tt, conv_bias_tt,
                   device, new_cache_tt=None, conv_out_tt=None):
     """
     Args:
-        xBC_new_tt   : [1, 1, C, 1]  bfloat16 tile-layout  — new token pre-conv
-        conv_cache_tt: [1, K, C, 1]  bfloat16 tile-layout  — shift-register (fixed addr)
-        conv_w_tt    : [1, K, C, 1]  bfloat16 tile-layout  — weights (constant)
-        conv_bias_tt : [1, 1, C, 1]  bfloat16 tile-layout  — bias (or None)
+        xBC_new_tt   : [1, 1, C, 1]  bfloat16 tile-layout  - new token pre-conv
+        conv_cache_tt: [1, K, C, 1]  bfloat16 tile-layout  - shift-register (fixed addr)
+        conv_w_tt    : [1, K, C, 1]  bfloat16 tile-layout  - weights (constant)
+        conv_bias_tt : [1, 1, C, 1]  bfloat16 tile-layout  - bias (or None)
         device       : single TT device or MeshDevice
         new_cache_tt : optional pre-allocated [1, K, C, 1] output (trace-safe)
         conv_out_tt  : optional pre-allocated [1, 1, C, 1] output (trace-safe)
@@ -223,9 +226,6 @@ def conv1d_decode(xBC_new_tt, conv_cache_tt, conv_w_tt, conv_bias_tt,
         )
     plan = _plan_cache[plan_key]
 
-    # Use xBC address as dummy bias address when no bias (reader won't read it)
-    bias_addr_fn = (lambda d: d.buffer_address()) if not plan.is_mesh else None
-
     if plan.is_mesh:
         xBC_devs    = ttnn.get_device_tensors(xBC_new_tt)
         cache_devs  = ttnn.get_device_tensors(conv_cache_tt)
@@ -239,6 +239,7 @@ def conv1d_decode(xBC_new_tt, conv_cache_tt, conv_w_tt, conv_bias_tt,
             for col in range(plan.mesh_cols):
                 di    = row * plan.mesh_cols + col
                 coord = ttnn.MeshCoordinate(row, col)
+                # Use xBC address as dummy bias address when no bias (reader won't read it).
                 bias_addr = bias_devs[di].buffer_address() if plan.bias_valid \
                             else xBC_devs[di].buffer_address()
                 r, w, c = _make_runtime_args(
@@ -258,6 +259,7 @@ def conv1d_decode(xBC_new_tt, conv_cache_tt, conv_w_tt, conv_bias_tt,
             input_tensors.append(conv_bias_tt)
         ttnn.generic_op(input_tensors + [new_cache_tt, conv_out_tt], mesh_prog_desc)
     else:
+        # Use xBC address as dummy bias address when no bias (reader won't read it).
         bias_addr = conv_bias_tt.buffer_address() if plan.bias_valid \
                     else xBC_new_tt.buffer_address()
         r, w, c = _make_runtime_args(
