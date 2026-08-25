@@ -35,6 +35,8 @@ where step 1 is excluded because it is slightly slower after a cache reset. At e
 \end{equation}
 Dividing a positive logit by $p{>}1$ lowers it, and multiplying a negative logit by $p$ makes it more negative. Both operations reduce the probability of repeating already-seen tokens.
 
+\textbf{Time to first token (TTFT)} is the time from sending the full prompt to receiving the first generated token, covering the entire prefill pass.
+
 \subsection{Results}
 
 \subsubsection{Kernel ablation}

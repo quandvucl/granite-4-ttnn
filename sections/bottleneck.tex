@@ -29,7 +29,7 @@ With trace enabled, the single \texttt{execute\_trace} command replaces $\approx
 During development, an early inline capture strategy (triggering trace capture inside the generation loop at step $t$) produced incoherent responses across all prompts. Step-by-step token comparison showed that WITH TRACE, step $t$'s top token matched NO TRACE step $t-1$ -- a consistent one-step lag. This was due to how the Metal framework handles trace recording:
 
 \begin{enumerate}
-\item \texttt{begin\_trace\_capture()} calls \texttt{set\_bypass\_mode(true)} on all device CQs.
+\item \texttt{begin\_trace\_capture()} calls \texttt{set\_bypass\_mode(true)} on all device CQs (command queues -- the ordered lists of pending operations waiting to run on the device).
 \item All ops between \texttt{begin} and \texttt{end} are recorded into a host-side buffer but \textbf{not dispatched} to the device.
 \item KV cache writes (\texttt{paged\_update\_cache}) and SSM state updates (\texttt{ttnn.assign}) inside the capture window are recorded but never executed.
 \item The device's state at the end of capture is identical to its state before capture began.
@@ -51,6 +51,6 @@ With trace, $T_{\mathrm{dispatch}}$ drops to $\approx$1\,ms (one replay command)
 
 \subsection{Path Forward}
 
-\textbf{Fused SSM kernel.} The \texttt{ssm\_update} kernel (Algorithm~\ref{alg:kernel}) reduces Mamba per-layer DRAM passes from 5 to 3 and saves 4 dispatches per layer. With trace, the dispatch saving is already collapsed; the primary remaining benefit is eliminating one 768\,KB intermediate DRAM write per layer, reducing $T_{\mathrm{DRAM}}$.
+\textbf{Fused SSM kernel.} The \texttt{ssm\_update} kernel (Algorithm~\ref{alg:kernel}) reduces Mamba per-layer DRAM passes from 5 to 3 and saves 4 dispatches per layer. With trace, the dispatch saving is already collapsed; the primary remaining benefit is eliminating one 768\,KiB intermediate DRAM write per layer, reducing $T_{\mathrm{DRAM}}$.
 
 \textbf{Fabric throughput.} The all-gather collectives for expert-parallel MoE are a significant contributor to the remaining 95\,ms step time. Profiling the per-all-gather latency inside trace replay and exploring ring-topology scheduling are the next steps to reduce this overhead.
