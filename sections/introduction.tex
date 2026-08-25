@@ -15,7 +15,7 @@ The contributions of this project are:
 \begin{itemize}
 \item Complete working implementations of Granite-4.0-h-tiny (4 Wormhole chips) and Granite-4.0-h-small (8 chips), with token generation throughput benchmarked against NVIDIA A100 and CPU baselines.
 \item A systematic description of the numerical, architectural, and toolchain challenges encountered during the port (Section~\ref{sec:challenges}).
-\item A custom on-chip kernel for the recurrent state-update that reduces memory traffic and command count per token.
+\item A custom on-chip kernel for the recurrent state-update that reduced memory traffic and command count per token.
 \item A working implementation of whole-model trace recording and replay, where the full per-token forward pass is recorded once and replayed with a single command per token.
 \item Empirical token generation throughput measurements and per-component timing analysis.
 \end{itemize}
