@@ -11,7 +11,7 @@ TTNN operates on 32-element tiles and requires all tensors in bfloat16 (or lower
 
 \subsubsection{MoE weight quantisation}
 
-For the small model, MoE expert weights are stored in \texttt{bfloat8\_b} (8-bit block float) to reduce per-device DRAM from $\sim$36\,MiB/layer to $\sim$18\,MiB/layer, a necessary compression given the 12\,GB DRAM per chip. The tiny model's MoE weights remain in bfloat16, as its smaller hidden size (1536 vs.\ 4096) means the memory saving does not justify the quantisation overhead. Activations remain in bfloat16 for both models.
+For the small model, MoE expert weights are stored in \texttt{bfloat8\_b} (8-bit block float) to reduce per-device DRAM from $\sim$36\,MiB/layer to $\sim$18\,MiB/layer, a necessary compression given the 12\,GiB DRAM per chip. The tiny model's MoE weights remain in bfloat16, as its smaller hidden size (1536 vs.\ 4096) means the memory saving does not justify the quantisation overhead. Activations remain in bfloat16 for both models.
 
 The small model produces coherent, on-topic responses across all five evaluation prompts under this quantisation (Section~\ref{sec:eval-quality}).
 

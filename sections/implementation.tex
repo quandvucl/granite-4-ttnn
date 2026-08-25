@@ -40,7 +40,7 @@ The tiny model uses a 1$\times$4 mesh (one row of 4 chips). As noted in Section~
     \item \emph{Shared MLP} (40 layers): gate+up ($1536{\times}1024$) and down ($512{\times}1536$). Total: $(1536{\times}1024 + 512{\times}1536){\times}2\,\text{B} = 4.5\,\text{MiB}$ per layer.
     \item \emph{RMS norms}: RMS norm normalises the hidden state, then scales each of the $H$ dimensions by a learned weight: $H{\times}2\,\text{B} = 1536{\times}2 = 3\,\text{KiB}$ per norm.
   \end{itemize}
-  All affordable within the 12\,GB per-chip budget.
+  All affordable within the 12\,GiB per-chip budget.
 \item \textbf{LM head}: the final projection from hidden size $H$ to vocabulary size ($100{,}352$ words) is column-sharded across the 4 chips, so each chip holds a $H{\times}25{,}088$ slice and computes logits for its share of the vocabulary. The partial logits slices are concatenated over the inter-chip links to reconstruct the full logit vector before token selection.
 \end{itemize}
 
