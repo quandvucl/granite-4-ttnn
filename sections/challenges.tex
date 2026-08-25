@@ -35,7 +35,7 @@ Granite-4.0-h uses 64 experts for the tiny model and 72 experts for the small mo
 
 \subsubsection{No native Mamba2 chunk-scan kernel}
 
-The HuggingFace Mamba2 implementation uses two Triton kernels for decode: \texttt{causal\_\allowbreak conv1d\_\allowbreak update} (a fused causal convolution step) and \texttt{selective\_state\_update} (a fused recurrent state update). Neither has an equivalent in the TTNN Metal kernel library at the time of writing. Both were initially implemented using sequential TTNN ops, and two custom Metal kernels — \texttt{conv1d\_decode} and \texttt{ssm\_update} — were written to replace them. Both are described in Section~\ref{sec:optimisation}.
+The HuggingFace Mamba2 implementation uses two Triton kernels for decode: \texttt{causal\_\allowbreak conv1d\_\allowbreak update} (a fused causal convolution step) and \texttt{selective\_\allowbreak state\_\allowbreak update} (a fused recurrent state update). Neither has an equivalent in the TTNN Metal kernel library at the time of writing. Both were initially implemented using sequential TTNN ops, and two custom Metal kernels — \texttt{conv1d\_decode} and \texttt{ssm\_update} — were written to replace them. Both are described in Section~\ref{sec:optimisation}.
 
 \subsubsection{Trace capture must run outside the generation loop}
 

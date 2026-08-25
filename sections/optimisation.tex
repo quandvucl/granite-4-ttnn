@@ -72,7 +72,7 @@ Without trace, every TTNN operation in a single decode step requires a separate 
 \subsection{Chunked-Prefill Chunk Size Tuning}
 \label{sec:chunk-tune}
 
-Prefill is processed in chunks of $C$ tokens. To choose the best value, $C \in \{192, 256, 320, 384, 512\}$ was tested on both models running on TT hardware with both fused kernels and trace enabled. The five evaluation prompts produce 5, 8, 25, 96, and 176 tokens after Granite tokenisation. Table~\ref{tab:chunk} shows TTFT for the two longest (96 and 176 tokens, where chunk size could matter) and mean decode throughput across all five.
+Prefill is processed in chunks of $C$ tokens. To choose the best value, $C \in \{192, 256, 320, 384, 512\}$ was tested on both models running on TT hardware with both fused kernels and trace enabled. The five evaluation prompts produce 5, 8, 25, 96, and 176 tokens after Granite tokenisation. \textbf{Time to first token (TTFT)} is the elapsed time from sending the full prompt to receiving the first generated token, covering the entire prefill pass. Table~\ref{tab:chunk} shows TTFT for the two longest (96 and 176 tokens, where chunk size could matter) and mean decode throughput across all five.
 
 \begin{table}[h]
 \caption{Effect of prefill chunk size on TTFT and decode throughput (TT hardware, both fused kernels and trace enabled).}
