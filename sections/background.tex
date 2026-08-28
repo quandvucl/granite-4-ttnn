@@ -3,9 +3,11 @@
 \subsection{Tenstorrent Wormhole Platform}
 \label{sec:arch}
 
+The Tenstorrent Wormhole chip and Galaxy 32 system are described fully in \citep{tenstorrent_wormhole,tenstorrent_galaxy}. The following subsections summarise the aspects relevant to this project.
+
 \subsubsection{Galaxy 32: the multi-chip system}
 
-The system used in this work is Tenstorrent's Galaxy 32, a machine containing 32 Wormhole chips arranged in a 4$\times$8 mesh~\citep{tenstorrent2023galaxy}. The chips are connected by built-in inter-chip links, so data can move between chips without going through the host CPU. This is important for splitting a large model across many chips and combining results on-device during inference.
+The system used in this work is Tenstorrent's Galaxy 32, a machine containing 32 Wormhole chips arranged in a 4$\times$8 mesh~\citep{tenstorrent_galaxy}. The chips are connected by built-in inter-chip links, so data can move between chips without going through the host CPU. This is important for splitting a large model across many chips and combining results on-device during inference.
 
 The system software uses these links to move data between chips, for example to gather partial results from many chips and combine them into one final output. In this work, communication is routed along one row or one column of the mesh at a time. This is required for hardware trace replay (Section~\ref{sec:trace-impl}): the full 2D routing mode is not trace-safe on this hardware stack, whereas single-axis (1D) routing is; Section~\ref{sec:trace-impl} explains the constraint.
 
@@ -13,18 +15,18 @@ The host machine connects to the Galaxy 32 over PCIe. From the host's point of v
 
 \subsubsection{Single Wormhole chip architecture}
 
-Each of the 32 chips is a Wormhole chip -- Tenstorrent's second-generation AI accelerator~\citep{tenstorrent2023wormhole}. A single chip contains a 2D grid of compute cores arranged in an 8$\times$10 grid. Of these grid positions, 64 are programmable worker cores (called Tensix cores) that execute AI kernels; the remaining positions are occupied by dedicated hardware for other tasks: 6 DRAM controllers (circuits that manage data transfers between the chip and its off-chip memory), 16 Ethernet cores (small processors that handle chip-to-chip network traffic), and an ARC management processor (a low-power core that handles boot, power, and device initialisation).
+Each of the 32 chips is a Wormhole chip -- Tenstorrent's second-generation AI accelerator~\citep{tenstorrent_wormhole}. A single chip contains a 2D grid of compute cores arranged in an 8$\times$10 grid. Of these grid positions, 64 are programmable worker cores (called Tensix cores) that execute AI kernels; the remaining positions are occupied by dedicated hardware for other tasks: 6 DRAM controllers (dedicated hardware that moves data between the chip and its off-chip memory), 16 Ethernet cores (small processors that handle chip-to-chip network traffic), and an ARC (Argonaut RISC Core~\citep{mips_arc}) management processor -- a low-power embedded CPU that handles boot, power, and device initialisation.
 
 \subsubsection{Memory hierarchy}
 
-\textbf{L1 (on-chip SRAM).} Each Tensix core has 1.43\,MiB of on-chip SRAM called L1~\citep{tenstorrent2023wormhole}. The 64 compute cores provide 91.5\,MiB total worker L1 per chip. Unlike a CPU's hardware cache which automatically copies data in and out, L1 here is software-managed: the programmer must explicitly load data into L1 before using it and write results back to DRAM afterwards. Programs that run on a Tensix core are called \emph{kernels}. When one computation feeds directly into the next, the result would normally be written to DRAM only to be read back immediately -- wasting bandwidth. Tenstorrent's Metal programming framework avoids this by letting the programmer connect kernels through named L1 regions called \emph{circular buffers}~\citep{ttmetal2024buffertypes}: one kernel writes its result into the buffer and the next kernel reads from it, keeping the intermediate value in L1 without ever writing it to DRAM.
+\textbf{L1 (on-chip SRAM).} Each Tensix core has 1.43\,MiB of on-chip SRAM called L1~\citep{tenstorrent_wormhole}. The 64 compute cores provide 91.5\,MiB total worker L1 per chip. Unlike a CPU's hardware cache which automatically copies data in and out, L1 here is software-managed: the programmer must explicitly load data into L1 before using it and write results back to DRAM afterwards. Programs that run on a Tensix core are called \emph{kernels}. When one computation feeds directly into the next, the result would normally be written to DRAM only to be read back immediately -- wasting bandwidth. Tenstorrent's Metal programming framework avoids this by letting the programmer connect kernels through named L1 regions called \emph{circular buffers}~\citep{ttmetal_buffertypes}: one kernel writes its result into the buffer and the next kernel reads from it, keeping the intermediate value in L1 without ever writing it to DRAM.
 
-\textbf{DRAM (off-chip).} Each chip has 12\,GiB of off-chip DRAM for storing model weights and activations~\citep{tenstorrent2023wormhole}.\footnote{Tenstorrent markets this as 12\,GB; \texttt{wormhole\_implementation.hpp}~\citep{ttmetal2024whdram} defines \texttt{NUM\_DRAM\_BANKS\,=\,6} and \texttt{DRAM\_BANK\_SIZE\,=\,2\,147\,483\,648} ($= 2^{31}$ bytes $= 2$\,GiB), giving $6 \times 2^{31} = 12$\,GiB exactly. The table therefore uses GiB.} TTNN organises tensor data (e.g.\ a weight matrix) into fixed 32$\times$32-element blocks called \emph{tiles} -- the smallest unit a Tensix core can request from DRAM. This work uses interleaved layout for all weight matrices and activations: tiles are scattered across DRAM so many cores can fetch different parts of the same matrix in parallel.
+\textbf{DRAM (off-chip).} Each chip has 12\,GiB of off-chip DRAM for storing model weights and activations~\citep{tenstorrent_wormhole}.\footnote{Tenstorrent markets this as 12\,GB; \texttt{wormhole\_implementation.hpp}~\citep{ttmetal_whdram} defines \texttt{NUM\_DRAM\_BANKS\,=\,6} and \texttt{DRAM\_BANK\_SIZE\,=\,2\,147\,483\,648} ($= 2^{31}$ bytes $= 2$\,GiB), giving $6 \times 2^{31} = 12$\,GiB exactly. The table therefore uses GiB.} TTNN organises tensor data (e.g.\ a weight matrix) into fixed 32$\times$32-element blocks called \emph{tiles} -- the smallest unit a Tensix core can request from DRAM. This work uses interleaved layout for all weight matrices and activations: tiles are scattered across DRAM so many cores can fetch different parts of the same matrix in parallel.
 
 Table~\ref{tab:mem} summarises the memory tiers on a single chip.
 
 \begin{table}[h]
-\caption{Memory tiers on a single Wormhole chip~\citep{tenstorrent2023wormhole}.}
+\caption{Memory tiers on a single Wormhole chip~\citep{tenstorrent_wormhole}.}
 \label{tab:mem}
 \begin{tabular}{ll}
 \toprule
@@ -47,7 +49,9 @@ The host CPU triggers each operation on a Wormhole chip by writing a command ove
 \subsection{Granite-4.0-h Model Variants}
 \label{sec:granite-variants}
 
-This work evaluates two model variants -- Granite-4.0-h-tiny~\citep{ibmgranite2025tiny} and Granite-4.0-h-small~\citep{ibmgranite2025small}. Both have the same structure: 40 decoder layers, where each layer first mixes sequence information (using Mamba-2 for 36 of the layers, attention for the other 4), then applies a Mixture-of-Experts (MoE) feed-forward transformation. Table~\ref{tab:arch} compares their key dimensions.
+The Granite-4.0-h model family is described in the IBM model cards~\citep{ibmgranite2025tiny,ibmgranite2025small} and the release announcement~\citep{ibmgranite2025announcement}. The following subsections summarise the architecture as relevant to this port.
+
+This work evaluates two model variants -- Granite-4.0-h-tiny~\citep{ibmgranite2025tiny} and Granite-4.0-h-small~\citep{ibmgranite2025small}. Both have the same structure: 40 decoder layers, where each layer first mixes sequence information (using Mamba-2 for 36 of the layers, attention for the other 4), then applies a Mixture-of-Experts (MoE~\citep{shazeer2017outrageously}) feed-forward transformation. Table~\ref{tab:arch} compares their key dimensions.
 
 \begin{table}[h]
 \caption{Granite-4.0-h architectural dimensions: tiny vs.\ small \citep{ibmgranite2025tinyconfig,ibmgranite2025smallconfig}.}
@@ -83,11 +87,13 @@ As shown in Figure~\ref{fig:granite-arch}, every decoder layer consists of two b
 \subsection{Mamba-2 Block}
 \label{sec:mamba2-decode}
 
+The Mamba-2 architecture is introduced in \citep{dao2024transformers}, and the description below follows that paper as applied in Granite-4.0-h~\citep{ibmgranite2025tiny}.
+
 Mamba-2 is a \emph{state-space model} (SSM): instead of storing every past token in a key-value cache (as attention does), it compresses the entire conversation history into a fixed-size recurrent state~\citep{dao2024transformers}. Running a language model has two phases. In the \emph{prefill} phase, the model processes the entire input prompt, updating the recurrent state for each token in sequence. In the \emph{decode} phase, the model generates new tokens one at a time; each step takes the token produced by the previous step, updates the fixed-size state, and produces the next output token. This work focuses on the decode phase. Each decode step through a Mamba-2 block has two parts: a \emph{Projection} that transforms the incoming hidden state into the values needed for the memory update, and a \emph{Selective SSM} (the recurrent memory update step) that updates the stored memory with the new token and produces the output.
 
 \subsubsection{Projection}
 
-A \emph{projection} is a learned matrix multiplication that maps the hidden state to a different set of values needed by subsequent steps. The \emph{Input} in Figure~\ref{fig:granite-arch} is the hidden state (the vector representing the model's current understanding at that layer). It is first normalised (RMS norm), then two parallel projections are applied.
+The projection step described here follows \citep{dao2024transformers} (Section~3). A \emph{projection} is a learned matrix multiplication that transforms the hidden state into the specific values the recurrent memory update needs: how much to update the memory ($\Delta$), what to write into it ($\sigma$, $B$), and what to read back out ($C$). The \emph{Input} in Figure~\ref{fig:granite-arch} is the hidden state (the vector representing the model's current understanding at that layer). It is first normalised (RMS norm), then two parallel projections are applied.
 
 The \emph{left projection} produces four values:
 \begin{itemize}
@@ -120,6 +126,8 @@ $C$ selects which information to extract from the state.
 
 \subsection{MoE Block}
 \label{sec:ep-moe}
+
+The Mixture-of-Experts architecture was introduced in \citep{shazeer2017outrageously}, and expert parallelism for large-scale training is described in \citep{lepikhin2021gshard}. The following describes the specific configuration used in Granite-4.0-h~\citep{ibmgranite2025tiny,ibmgranite2025small}.
 
 The MoE block, shown in Figure~\ref{fig:granite-arch}, contains $E$ experts (64 for tiny, 72 for small), each a small MLP. A \emph{router} selects only the top-$k$ experts per token (6 for tiny, 10 for small) and combines their outputs. The remaining experts are not executed -- the model has many expert parameters but only a small fraction is activated per token.
 

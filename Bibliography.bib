@@ -1,4 +1,4 @@
-@misc{tenstorrent2023wormhole,
+@misc{tenstorrent_wormhole,
   author       = {{Tenstorrent}},
   title        = {Wormhole Architecture Overview},
   year         = {n.d.},
@@ -6,12 +6,20 @@
   note         = {Accessed: 2026-08-25}
 }
 
-@misc{tenstorrent2023galaxy,
+@misc{tenstorrent_n300,
+  author       = {{Tenstorrent}},
+  title        = {Wormhole n300 AI Accelerator Card},
+  year         = {n.d.},
+  howpublished = {\url{https://docs.tenstorrent.com/aibs/wormhole/index.html}},
+  note         = {Accessed: 2026-08-28; n300 Total Board Power: 300\,W across two Wormhole chips (150\,W per chip)}
+}
+
+@misc{tenstorrent_galaxy,
   author       = {{Tenstorrent}},
   title        = {Galaxy -- 32-Chip Wormhole System},
   year         = {n.d.},
   howpublished = {\url{https://tenstorrent.com/hardware/galaxy}},
-  note         = {Accessed: 2026-08-25}
+  note         = {Accessed: 2026-08-28; system power: 6--8\,kW average, 11\,kW maximum}
 }
 
 @misc{nvidia2020a100,
@@ -38,7 +46,7 @@
   archiveprefix = {arXiv}
 }
 
-@misc{ttmetal2024constants,
+@misc{ttmetal_constants,
   author       = {{Tenstorrent}},
   title        = {tt-metalium \texttt{constants.hpp}},
   year         = {n.d.},
@@ -46,7 +54,7 @@
   note         = {Source: \texttt{tt\_metal/api/tt-metalium/constants.hpp}; defines \texttt{BFLOAT8\_B\_TILE\_HW = TILE\_HW + 64} with comment ``1B per BFP8 datum + 4x16B exponent section''}
 }
 
-@misc{ttmetal2024buffertypes,
+@misc{ttmetal_buffertypes,
   author       = {{Tenstorrent}},
   title        = {tt-metalium \texttt{buffer\_types.hpp} and \texttt{memory\_config.hpp}},
   year         = {n.d.},
@@ -110,7 +118,7 @@
   note         = {Accessed: 2026-08-25; \texttt{metadata.total\_size} field gives total checkpoint bytes in bfloat16}
 }
 
-@misc{ttmetal2024whdram,
+@misc{ttmetal_whdram,
   author       = {{Tenstorrent}},
   title        = {tt-metalium \texttt{wormhole\_implementation.hpp}},
   year         = {n.d.},
@@ -118,7 +126,15 @@
   note         = {Source: \texttt{tt\_metal/third\_party/umd/device/api/\allowbreak umd/device/arch/wormhole\_implementation.hpp}; defines \texttt{NUM\_DRAM\_BANKS\,=\,6} and \texttt{DRAM\_BANK\_SIZE\,=\,2147483648}}
 }
 
-@misc{nvidia2023cudaprog,
+@misc{pytorch_compile,
+  author       = {{PyTorch}},
+  title        = {\texttt{torch.compile} Documentation},
+  year         = {n.d.},
+  howpublished = {\url{https://docs.pytorch.org/docs/2.11/generated/torch.compile.html}},
+  note         = {Version 2.11; Accessed: 2026-08-28}
+}
+
+@misc{nvidia_cudaprog,
   author       = {{NVIDIA}},
   title        = {{CUDA C++ Programming Guide}},
   year         = {n.d.},
@@ -131,5 +147,54 @@
   title         = {{GShard}: Scaling Giant Models with Conditional Computation and Automatic Sharding},
   year          = {2021},
   eprint        = {2006.16668},
+  archiveprefix = {arXiv}
+}
+
+@misc{shazeer2017outrageously,
+  author        = {Noam Shazeer and Azalia Mirhoseini and Krzysztof Maziarz and Andy Davis and Quoc Le and Geoffrey Hinton and Jeff Dean},
+  title         = {Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer},
+  year          = {2017},
+  eprint        = {1701.06538},
+  archiveprefix = {arXiv}
+}
+
+@misc{mips_arc,
+  author       = {{MIPS}},
+  title        = {{ARC} Processor Solutions},
+  year         = {n.d.},
+  howpublished = {\url{https://mips.com/processor-solutions/arc-processors/}},
+  note         = {Accessed: 2026-08-28}
+}
+
+@inproceedings{he2025waferllm,
+  author    = {C. He and Y. Huang and P. Mu and Z. Miao and J. Xue and L. Ma and F. Yang and L. Mai},
+  title     = {{WaferLLM}: Large Language Model Inference at Wafer Scale},
+  booktitle = {Proceedings of the 19th USENIX Symposium on Operating Systems Design and Implementation (OSDI)},
+  pages     = {257--273},
+  year      = {2025},
+  url       = {https://www.usenix.org/system/files/osdi25-he.pdf}
+}
+
+@misc{sambanova2025dataflow,
+  author       = {{SambaNova Systems}},
+  title        = {{SambaNova} Dataflow Architecture},
+  year         = {n.d.},
+  howpublished = {\url{https://sambanova.ai/products/dataflow-architecture}},
+  note         = {Accessed: 2026-08-28}
+}
+
+@misc{groq2025lpu,
+  author       = {{Groq}},
+  title        = {What is a {Language Processing Unit}?},
+  year         = {2025},
+  howpublished = {\url{https://groq.com/blog/the-groq-lpu-explained}},
+  note         = {Accessed: 2026-08-28}
+}
+
+@misc{leviathan2023fast,
+  author        = {Yaniv Leviathan and Matan Kalman and Yossi Matias},
+  title         = {Fast Inference from Transformers via Speculative Decoding},
+  year          = {2023},
+  eprint        = {2211.17192},
   archiveprefix = {arXiv}
 }
