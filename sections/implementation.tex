@@ -2,12 +2,16 @@
 
 \subsection{On-Device Execution Strategy}
 
+The implementation of the full model forward pass is in \texttt{granite/\allowbreak model.py}. The script that runs the full benchmark --- compiling kernels, capturing the decode trace, and measuring throughput --- is in \texttt{test\_bench.py} (\texttt{run\_bench}).
+
 All 40 decoder layers run on-device end-to-end: the hidden state (a vector of size $H$ representing the model's current understanding) is sent to the device once at the start of prefill and stays in DRAM across all layers and all decode steps. The only data that travels back to the host per step is the final logits (one score per vocabulary word): the host CPU selects the highest-scoring token, looks up its embedding, and writes that embedding back to the device as the input for the next step. Token selection runs on the host because it involves conditional logic that cannot be recorded into a fixed trace: for example, a \emph{repetition penalty} boosts the scores of tokens not yet seen (to avoid the model repeating itself), then the highest-scoring token is selected. The transfer is small: the logits tensor has one value per vocabulary word ($100{,}352$ words~\citep{ibmgranite2025tinyconfig} $\times$ 2\,B/element $\approx 196\,\text{KiB}$), which is negligible compared to the ${\approx}95\,\text{ms}$ decode step time. Expert routing, which during prefill spans the full prompt, also runs on-device during decode.
 
 The Mamba-2 recurrent step (Equations~\ref{eq:state}--\ref{eq:output}) runs entirely on-device. The SSM state $\mathbf{h}$ lives in a fixed DRAM location and is updated in-place at every decode step, so it is never transferred to the host.
 
 \subsection{Mesh Sharding and Fabric}
 \label{sec:mesh-sharding}
+
+The code that distributes model weights across chips is in \texttt{granite/\allowbreak model.py} (\texttt{GraniteModel.\_\_init\_\_}) for the Mamba and attention weights, and in \texttt{granite/\allowbreak moe\_tt.py} for the expert weights.
 
 The tiny model uses a 1$\times$4 mesh (one row of 4 chips). As noted in Section~\ref{sec:arch}, hardware trace requires all inter-chip communication to run along a single row or column -- a 1$\times$4 mesh satisfies this because all 4 chips sit in one row. Four chips also provide enough DRAM to hold the tiny model's weights (Section~\ref{sec:mem-fit}). With fabric enabled, different parts of the model are split across the 4 chips in different ways:
 \begin{itemize}
@@ -47,6 +51,8 @@ The tiny model uses a 1$\times$4 mesh (one row of 4 chips). As noted in Section~
 \subsection{Decode Trace: Warmup, Capture, and Replay}
 \label{sec:trace-impl-detail}
 
+The code that records the full sequence of operations once and replays it for every token is in \texttt{granite/\allowbreak model.py} (\texttt{GraniteModel.\allowbreak capture\_decode\_trace}). The preparatory steps that run before recording begins --- compiling the low-level programs for each operation and letting memory addresses settle --- are in \texttt{test\_bench.py} (\texttt{run\_bench}).
+
 As described in Section~\ref{sec:exec-model}, a \emph{trace} records the full sequence of operations once (\emph{capture}), then replays it with a single device command (\emph{replay}), eliminating the per-operation PCIe overhead. Before capture, however, the model must run at least two non-trace decode steps (\emph{warmup}):
 \begin{itemize}
   \item \textbf{Step 1 -- kernel compilation.} Each operation (e.g.\ a matrix multiply) is implemented as a low-level program called a \emph{kernel}. TTNN compiles each kernel for a specific tensor shape -- the compiled code has the input dimensions hard-coded for performance, so a kernel compiled for a $256{\times}H$ input tensor (prefill, 256 tokens) cannot be reused for a $1{\times}H$ input tensor (decode, 1 token). TTNN compiles lazily: it only compiles a kernel the first time that shape is encountered. In the benchmark, a short warm-up prefill runs first to compile all prefill-shape kernels. The decode warmup steps then follow; the first one triggers compilation of all decode-shape kernels.
@@ -69,11 +75,11 @@ The benchmark script follows this sequence:
 
 \subsection{CPU and CUDA Baselines with \texttt{torch.compile}}
 
-To validate correctness and provide a performance comparison against the TT hardware implementation, I run the same Granite models through the standard HuggingFace pipeline on CPU and CUDA. This baseline optionally applies \texttt{torch.compile} to close the gap between interpreted PyTorch and an optimised backend.
+To validate correctness and provide a performance comparison against the TT hardware implementation, I run the same Granite models through the standard HuggingFace pipeline on CPU and CUDA (implemented in \texttt{test\_bench\_hf.py}). This baseline optionally applies \texttt{torch.compile} to close the gap between interpreted PyTorch and an optimised backend.
 
 \textbf{CUDA}: Three compiler options are configured:
 \begin{itemize}
-  \item \textbf{Triton autotuning} (\texttt{max\_autotune\_gemm}): Triton is the GPU kernel compiler used by \texttt{torch.compile}. A GPU executes threads in groups of 32 called \emph{warps}~\citep{nvidia2023cudaprog}; multiple warps are organised into a \emph{thread block}, which is the unit of work assigned to one set of GPU cores. For a matrix multiply, a thread block handles a sub-matrix called a \emph{tile}: it loads that tile from global memory into fast on-chip shared memory, computes the partial products, then moves to the next tile. There are many valid tile size choices (e.g.\ $64{\times}64$, $128{\times}64$, $256{\times}32$), and the fastest choice depends on the matrix dimensions and the specific GPU. With autotuning enabled, Triton benchmarks a set of candidate tile sizes and keeps the fastest one; this search runs once during the warmup pass and the winner is reused for all subsequent calls with the same shape.
+  \item \textbf{Triton autotuning} (\texttt{max\_autotune\_gemm}): Triton is the GPU kernel compiler used by \texttt{torch.compile}~\citep{pytorch_compile}. A GPU executes threads in groups of 32 called \emph{warps}~\citep{nvidia_cudaprog}; multiple warps are organised into a \emph{thread block}, which is the unit of work assigned to one set of GPU cores. For a matrix multiply, a thread block handles a sub-matrix called a \emph{tile}: it loads that tile from global memory into fast on-chip shared memory, computes the partial products, then moves to the next tile. There are many valid tile size choices (e.g.\ $64{\times}64$, $128{\times}64$, $256{\times}32$), and the fastest choice depends on the matrix dimensions and the specific GPU. With autotuning enabled, Triton benchmarks a set of candidate tile sizes and keeps the fastest one; this search runs once during the warmup pass and the winner is reused for all subsequent calls with the same shape.
 
   \item \textbf{Shape padding} (\texttt{shape\_padding}): as established earlier, a kernel is a low-level program compiled for a specific operation. The GPU runs one thread per element, each thread with its own index, and groups 32 threads into a warp that executes together. If the matrix has 33 columns, two warps are launched: warp 1 contains 32 threads for indices 0--31, warp 2 contains 32 threads for indices 32--63. But only index 32 is a real column; indices 33--63 do not exist. Each thread computes a memory address from its index and accesses it -- the kernel has no automatic awareness of the matrix boundary. The 31 threads with indices 33--63 will therefore access memory beyond the matrix, overwriting whatever data is stored there. To prevent this, the kernel must include an explicit guard: \texttt{if (col < N) \{ access memory \}}. This guard is part of the kernel, so every thread in every warp executes it on every memory access, including all the valid threads in warp 1.
 

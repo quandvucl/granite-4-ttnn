@@ -40,6 +40,8 @@ Dividing a positive logit by $p{>}1$ lowers it, and multiplying a negative logit
 \subsubsection{Kernel ablation}
 \label{sec:eval-kernel-ablation}
 
+A \emph{kernel ablation} measures the contribution of each optimisation in isolation by disabling one component at a time and observing the effect on throughput. Table~\ref{tab:kernel-ablation} shows decode throughput for each combination of the two fused kernels (\texttt{ssm\_update} and \texttt{conv1d\_decode}, described in Section~\ref{sec:optimisation}), with trace always enabled.
+
 \begin{table}[h]
 \caption{Decode throughput (tok/s) by fused kernel configuration, averaged across all five prompts (C=256). Both kernels active is the default used in all subsequent tables.}
 \label{tab:kernel-ablation}
