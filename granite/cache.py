@@ -4,7 +4,7 @@ from typing import List, Optional
 
 
 class MambaCacheManager:
-    """Tracks decode position; hybrid_cache (HuggingFace) is attached externally."""
+    """Tracks decode position."""
 
     def __init__(
         self,
@@ -17,11 +17,14 @@ class MambaCacheManager:
         self.attention_layer_indices = attention_layer_indices or [5, 15, 25, 35]
         self.current_position = 0
 
+    # Update the current decode position.
     def increment_position(self, num_tokens: int = 1):
         self.current_position += num_tokens
 
+    # Get the current decode position.
     def get_position(self) -> int:
         return self.current_position
 
+    # Reset the current decode position to 0.
     def reset(self):
         self.current_position = 0

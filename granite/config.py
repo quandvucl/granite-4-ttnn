@@ -8,7 +8,7 @@ import ttnn
 
 @dataclass
 class TTGraniteConfig:
-    """Tenstorrent Granite model configuration (architecture + TT-specific settings)."""
+    """Tenstorrent Granite model configuration."""
 
     # Architecture (from HF config)
     hidden_size: int = 1536
@@ -29,6 +29,8 @@ class TTGraniteConfig:
     max_cache_length: int = 2048
     batch_size: int = 1
 
+    # We want to validate that the attention_layer_indices are within the range of num_hidden_layers.
+    # This can be done in a post-init method.
     def __post_init__(self):
         for idx in self.attention_layer_indices:
             if idx >= self.num_hidden_layers:
@@ -49,20 +51,31 @@ class TTGraniteConfig:
             "max_position_embeddings": hf_config.max_position_embeddings,
             "rms_norm_eps": hf_config.rms_norm_eps,
         }
-        for attr in ("residual_multiplier", "attention_layer_indices",
-                     "logits_scaling", "embedding_multiplier"):
+        for attr in (
+            "residual_multiplier",
+            "attention_layer_indices",
+            "logits_scaling",
+            "embedding_multiplier",
+        ):
             if hasattr(hf_config, attr):
                 cfg[attr] = getattr(hf_config, attr)
         cfg.update(kwargs)
         return cls(**cfg)
 
+    # Get the corresponding TTNN dtype for the model's dtype string.
     def get_ttnn_dtype(self):
-        mapping = {"bfloat16": ttnn.bfloat16, "bfloat8": ttnn.bfloat8_b, "float32": ttnn.float32}
+        mapping = {
+            "bfloat16": ttnn.bfloat16,
+            "bfloat8": ttnn.bfloat8_b,
+            "float32": ttnn.float32,
+        }
         if self.dtype not in mapping:
             raise ValueError(f"Unsupported dtype: {self.dtype}")
         return mapping[self.dtype]
 
     def print_summary(self):
-        print(f"  hidden={self.hidden_size}  layers={self.num_hidden_layers}"
-              f"  attn_layers={self.attention_layer_indices}"
-              f"  dtype={self.dtype}  cache={self.max_cache_length}")
+        print(
+            f"  hidden={self.hidden_size}  layers={self.num_hidden_layers}"
+            f"  attn_layers={self.attention_layer_indices}"
+            f"  dtype={self.dtype}  cache={self.max_cache_length}"
+        )

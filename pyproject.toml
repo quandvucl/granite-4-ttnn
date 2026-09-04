@@ -1,0 +1,9 @@
+[tool.black]
+profile = "black"
+# Excludes both 'models' and 'env' folders at the project root
+extend-exclude = '^/models/|^/env/'
+
+[tool.isort]
+profile = "black"  # Align isort with Black's formatting rules
+# Skips both 'models' and 'env' directories
+skip = ["models", "env"]

@@ -1,7 +1,8 @@
 //
 // Compute kernel: conv1d_decode
 //
-// Fused causal conv1d decode step for Mamba2.
+// Shifts the conv cache, applies the convolution weights, adds optional bias, and applies silu
+// to produce one output token for the Mamba2 causal conv1d decode step.
 //
 // For each C-tile c:
 //   1. Shift: new_cache[k] = old_cache[k+1]  k=0..K-2

@@ -9,10 +9,12 @@ Usage:
   python test_bench.py --decode-tokens 30     # more decode steps
     python test_bench.py --model small --device-counts 24,32  # sweep Galaxy layouts
 """
+
 import argparse
 import json
 import os
 import time
+
 import torch
 import ttnn
 
@@ -20,17 +22,17 @@ os.environ.setdefault(
     "TT_MESH_GRAPH_DESC_PATH",
     "/work/tt-metal/tt_metal/fabric/mesh_graph_descriptors/single_galaxy_mesh_graph_descriptor.textproto",
 )
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
 
 MODELS = {
-    "tiny":  ("ibm-granite/granite-4.0-h-tiny",  4),
+    "tiny": ("ibm-granite/granite-4.0-h-tiny", 4),
     "small": ("ibm-granite/granite-4.0-h-small", 8),
 }
 
 PROMPTS = {
-    "short_8":   "The capital of France is",
-    "short_10":  "The largest planet in our solar system is",
+    "short_8": "The capital of France is",
+    "short_10": "The largest planet in our solar system is",
     "medium_32": (
         "Artificial intelligence is transforming many industries. "
         "Machine learning models can now perform tasks that previously required human expertise, "
@@ -69,10 +71,10 @@ REPETITION_PENALTY = 1.3
 
 
 MESH_SHAPE_MAP = {
-    1:  ttnn.MeshShape(1, 1),
-    2:  ttnn.MeshShape(1, 2),
-    4:  ttnn.MeshShape(1, 4),
-    8:  ttnn.MeshShape(8, 1),
+    1: ttnn.MeshShape(1, 1),
+    2: ttnn.MeshShape(1, 2),
+    4: ttnn.MeshShape(1, 4),
+    8: ttnn.MeshShape(8, 1),
     24: ttnn.MeshShape(6, 4),
     16: ttnn.MeshShape(4, 4),
     32: ttnn.MeshShape(8, 4),
@@ -80,24 +82,44 @@ MESH_SHAPE_MAP = {
 }
 
 
-def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather=True, requested_devices_override=None, mesh_key=None, use_fabric_1d=False, hf_model=None, use_conv1d_kernel=True, use_ssm_kernel=True, chunk_size=256):
+def run_bench(
+    model_name,
+    full_mesh,
+    decode_tokens=DECODE_TOKENS,
+    use_all_gather=True,
+    requested_devices_override=None,
+    mesh_key=None,
+    use_fabric_1d=False,
+    hf_model=None,
+    use_conv1d_kernel=True,
+    use_ssm_kernel=True,
+    chunk_size=256,
+):
     from granite.model import TTGraniteMoeHybridForCausalLM
     from utils import to_torch_tensor
 
     model_id, default_requested_devices = MODELS[model_name]
-    requested_devices = requested_devices_override if requested_devices_override is not None else default_requested_devices
+    requested_devices = (
+        requested_devices_override
+        if requested_devices_override is not None
+        else default_requested_devices
+    )
 
     hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     num_kv_heads = hf_config.num_key_value_heads
-    num_experts  = getattr(hf_config, "num_local_experts", 1)
+    num_experts = getattr(hf_config, "num_local_experts", 1)
     full_mesh_size = full_mesh.get_num_devices()
 
     num_devices = min(requested_devices, full_mesh_size)
-    num_devices = max(k for k in MESH_SHAPE_MAP if isinstance(k, int) and k <= num_devices)
+    num_devices = max(
+        k for k in MESH_SHAPE_MAP if isinstance(k, int) and k <= num_devices
+    )
 
     print(f"\n{'='*70}")
     print(f"  Model  : {model_id}")
-    print(f"  Devices: {num_devices}  (requested {requested_devices}, KV heads {num_kv_heads}, experts {num_experts})")
+    print(
+        f"  Devices: {num_devices}  (requested {requested_devices}, KV heads {num_kv_heads}, experts {num_experts})"
+    )
     print(f"  Decode : {decode_tokens} tokens per prompt")
     print(f"{'='*70}")
 
@@ -131,9 +153,13 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             use_ssm_kernel=use_ssm_kernel,
         )
         if hf_model is not None:
-            tt_model = TTGraniteMoeHybridForCausalLM.from_hf_model(hf_model, device, **_common_kwargs)
+            tt_model = TTGraniteMoeHybridForCausalLM.from_hf_model(
+                hf_model, device, **_common_kwargs
+            )
         else:
-            tt_model = TTGraniteMoeHybridForCausalLM.from_pretrained(model_id, device, **_common_kwargs)
+            tt_model = TTGraniteMoeHybridForCausalLM.from_pretrained(
+                model_id, device, **_common_kwargs
+            )
         load_s = time.time() - t_load0
         print(f"\nModel load: {load_s:.1f} s\n")
 
@@ -151,12 +177,16 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             valid = [tid for tid in seen_ids if tid < vocab_size]
             if valid:
                 seen = torch.tensor([valid], dtype=torch.long)
-                rep_processor = RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY)
+                rep_processor = RepetitionPenaltyLogitsProcessor(
+                    penalty=REPETITION_PENALTY
+                )
                 scores = rep_processor(seen, scores)
             return scores[0].argmax().item()
 
         print("  Warming up and capturing decode trace...", flush=True)
-        warmup_ids = tokenizer("Once upon a time in a land far away", return_tensors="pt")["input_ids"]
+        warmup_ids = tokenizer(
+            "Once upon a time in a land far away", return_tensors="pt"
+        )["input_ids"]
         tt_model.reset_cache()
         logits = tt_model.forward(warmup_ids)
         ttnn.synchronize_device(device)
@@ -175,7 +205,9 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
             input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"]
             actual_len = input_ids.shape[1]
 
-            print(f"── {prompt_label}  (actual tokens: {actual_len}) ──────────────────")
+            print(
+                f"── {prompt_label}  (actual tokens: {actual_len}) ──────────────────"
+            )
 
             tt_model.reset_cache()
 
@@ -211,18 +243,20 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
 
             steady = decode_times[1:] if len(decode_times) > 1 else decode_times
             avg_ms = sum(steady) / len(steady)
-            tok_s  = 1000.0 / avg_ms
+            tok_s = 1000.0 / avg_ms
 
             print(f"  TTFT: {prefill_ms:.1f} ms  |  Decode: {tok_s:.2f} tok/s")
 
-            results.append({
-                "prompt": prompt_label,
-                "tokens": actual_len,
-                "ttft_ms": prefill_ms,
-                "decode_toks": tok_s,
-                "prompt_text": prompt_text,
-                "response": response,
-            })
+            results.append(
+                {
+                    "prompt": prompt_label,
+                    "tokens": actual_len,
+                    "ttft_ms": prefill_ms,
+                    "decode_toks": tok_s,
+                    "prompt_text": prompt_text,
+                    "response": response,
+                }
+            )
 
         print(f"{'='*70}")
         print(f"  SUMMARY: {model_name.upper()} on {num_devices} devices")
@@ -231,7 +265,9 @@ def run_bench(model_name, full_mesh, decode_tokens=DECODE_TOKENS, use_all_gather
         print("  Prompt        Tokens  TTFT (ms)  Decode tok/s")
         print(f"{'─'*70}")
         for r in results:
-            print(f"  {r['prompt']}  tokens={r['tokens']}  ttft={r['ttft_ms']:.1f}ms  decode={r['decode_toks']:.2f} tok/s")
+            print(
+                f"  {r['prompt']}  tokens={r['tokens']}  ttft={r['ttft_ms']:.1f}ms  decode={r['decode_toks']:.2f} tok/s"
+            )
         print(f"{'='*70}\n")
 
         return {
@@ -253,7 +289,9 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark Granite models")
     parser.add_argument("--model", choices=list(MODELS.keys()) + ["all"], default="all")
     parser.add_argument("--decode-tokens", type=int, default=DECODE_TOKENS)
-    parser.add_argument("--mesh", default="8x4", help="Mesh shape, e.g. 8x4 (default) or 1x1")
+    parser.add_argument(
+        "--mesh", default="8x4", help="Mesh shape, e.g. 8x4 (default) or 1x1"
+    )
     parser.add_argument(
         "--device-counts",
         default=None,
@@ -289,11 +327,15 @@ def main():
     if use_fabric:
         try:
             ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_2D)
-            full_mesh = ttnn.open_mesh_device(mesh_shape=GALAXY_SHAPE, trace_region_size=268435456)
+            full_mesh = ttnn.open_mesh_device(
+                mesh_shape=GALAXY_SHAPE, trace_region_size=268435456
+            )
             fabric_ok = True
             print("[info] fabric enabled (2D)")
         except Exception as e:
-            print(f"[warn] fabric open failed ({type(e).__name__}), retrying without fabric")
+            print(
+                f"[warn] fabric open failed ({type(e).__name__}), retrying without fabric"
+            )
             try:
                 ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
             except Exception:
@@ -305,13 +347,27 @@ def main():
     try:
         device_counts = None
         if args.device_counts:
-            device_counts = [int(part.strip()) for part in args.device_counts.split(",") if part.strip()]
+            device_counts = [
+                int(part.strip())
+                for part in args.device_counts.split(",")
+                if part.strip()
+            ]
 
         use_conv1d_kernel = not args.no_conv1d_kernel
         use_ssm_kernel = not args.no_ssm_kernel
         for model_name in models:
             if device_counts is None:
-                all_results.append(run_bench(model_name, full_mesh, args.decode_tokens, use_all_gather=fabric_ok, use_conv1d_kernel=use_conv1d_kernel, use_ssm_kernel=use_ssm_kernel, chunk_size=args.chunk_size))
+                all_results.append(
+                    run_bench(
+                        model_name,
+                        full_mesh,
+                        args.decode_tokens,
+                        use_all_gather=fabric_ok,
+                        use_conv1d_kernel=use_conv1d_kernel,
+                        use_ssm_kernel=use_ssm_kernel,
+                        chunk_size=args.chunk_size,
+                    )
+                )
             else:
                 for requested_devices in device_counts:
                     all_results.append(
@@ -342,10 +398,14 @@ def main():
     for result in all_results:
         suffix = f"_{result['num_devices']}" if args.device_counts else ""
         chunk_tag = f"_chunk{result['chunk_size']}" if args.chunk_size != 256 else ""
-        kernel_tag = ("_conv1d" if result["use_conv1d_kernel"] else "") + ("_ssm" if result["use_ssm_kernel"] else "")
+        kernel_tag = ("_conv1d" if result["use_conv1d_kernel"] else "") + (
+            "_ssm" if result["use_ssm_kernel"] else ""
+        )
         if not kernel_tag:
             kernel_tag = "_no_kernels"
-        out_path = f"bench_results_{result['model']}{suffix}{chunk_tag}{kernel_tag}.json"
+        out_path = (
+            f"bench_results_{result['model']}{suffix}{chunk_tag}{kernel_tag}.json"
+        )
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2)
         print(f"Results saved to {out_path}")

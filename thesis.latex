@@ -33,4 +33,17 @@
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{Bibliography}
 
+\appendix
+
+\section*{Access to Artefacts}
+
+The source code for this project is publicly available at:\\
+\url{https://github.com/quandvucl/granite-4-ttnn}
+
+\section*{Declarations}
+
+This report is submitted as part requirement for the MSc Artificial Intelligence and Data Engineering degree at UCL. It is substantially the result of my own work except where explicitly indicated in the text. I have read, understood and abided by the restrictions on the use of generative AI for this assignment.
+
+The report may be freely copied and distributed provided the source is explicitly acknowledged.
+
 \end{document}

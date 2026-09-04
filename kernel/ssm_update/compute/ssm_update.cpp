@@ -1,6 +1,8 @@
 //
 // Compute kernel: ssm_update
 //
+// Updates the SSM hidden state and computes the output contribution for one decode token.
+//
 // Per group (b, h, d_tile), for each N-tile n:
 //   h_out[d,n] = dBx[d,n] + dA[d,n] * state[d,n]
 //   yc[d,n]    = h_out[d,n] * C[h%32, n]    (row h%32 of C tile broadcast over D)

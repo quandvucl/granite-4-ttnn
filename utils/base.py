@@ -100,6 +100,7 @@ def to_torch_tensor(
     if hasattr(device, "get_num_devices") and device.get_num_devices() > 1:
         # Use auto_compose to properly gather sharded tensors
         from models.common.auto_compose import to_torch_auto_compose
+
         torch_tensor = to_torch_auto_compose(tt_tensor, device=device)
     else:
         torch_tensor = tt_tensor.cpu().to_torch()

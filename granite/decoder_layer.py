@@ -8,33 +8,54 @@ import ttnn
 
 sys.path.append(str(Path(__file__).parent.parent))
 from granite.cache import MambaCacheManager
+from granite.moe_tt import GraniteTTMoE
 from mamba import TensorParallelMamba
 from models.common.rmsnorm import RMSNorm
-from granite.moe_tt import GraniteTTMoE
 from models.tt_transformers.tt.common import Mode
 
 
-def _replicate(tensor: torch.Tensor, device, dtype, layout=ttnn.TILE_LAYOUT) -> ttnn.Tensor:
+def _replicate(
+    tensor: torch.Tensor, device, dtype, layout=ttnn.TILE_LAYOUT
+) -> ttnn.Tensor:
     """Upload a CPU tensor to device, replicating across all mesh devices."""
-    mapper = ttnn.ReplicateTensorToMesh(device) if hasattr(device, "get_num_devices") else None
-    return ttnn.from_torch(tensor, device=device, dtype=dtype, layout=layout, mesh_mapper=mapper,
-                           memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    # Depend on whether the device is a mesh or not, we may need to use a different mapper for replication.
+    mapper = (
+        ttnn.ReplicateTensorToMesh(device)
+        if hasattr(device, "get_num_devices")
+        else None
+    )
+    return ttnn.from_torch(
+        tensor,
+        device=device,
+        dtype=dtype,
+        layout=layout,
+        mesh_mapper=mapper,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
 
 
 def _tt_to_torch(tt: ttnn.Tensor, shape) -> torch.Tensor:
     """Gather a TTNN tensor from mesh and return as a CPU torch tensor."""
     device = tt.device()
     if hasattr(device, "get_num_devices") and device.get_num_devices() > 1:
-        result = ttnn.to_torch(tt, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0))[0:1]
+        # If the device is a mesh, we need to gather the tensor from all devices.
+        # mesh_composer = ttnn.ConcatMeshToTensor(device, dim=0) means that we will concatenate the tensor along the first dimension (dim=0) across all devices in the mesh.
+        result = ttnn.to_torch(
+            tt, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0)
+        )[0:1]
     else:
         result = tt.cpu().to_torch()
     return result.reshape(shape)
 
 
 class TTGraniteDecoderLayer:
-    """
-    Granite hybrid decoder layer.
-    hidden_states lives as a TTNN tensor [1, 1, S, H] for the full 40-layer stack.
+    """One Granite hybrid decoder layer: mixer + MoE block, both with residual connections.
+
+    Every layer has two sub-blocks (matching the architecture diagram):
+      1. Mixer: Mamba-2 (most layers) or NoPE self-attention (layers 5, 15, 25, 35)
+      2. MoE: router + 64 routed experts summed with 2 shared experts
+
+    Each sub-block follows the pattern: RMSNorm -> sub-block -> residual_multiplier * out + residual.
     """
 
     def __init__(
@@ -75,29 +96,50 @@ class TTGraniteDecoderLayer:
         self.mamba_chunk_size = mamba_chunk_size
         self.mamba_weight_dtype = mamba_weight_dtype
 
-        self.residual_multiplier = config.residual_multiplier if hasattr(config, "residual_multiplier") else 1.0
-        self.is_mesh = hasattr(device, "get_num_devices") and device.get_num_devices() > 1
+        self.residual_multiplier = (
+            config.residual_multiplier
+            if hasattr(config, "residual_multiplier")
+            else 1.0
+        )
+        self.is_mesh = (
+            hasattr(device, "get_num_devices") and device.get_num_devices() > 1
+        )
 
         rm = torch.tensor([[[[self.residual_multiplier]]]], dtype=torch.bfloat16)
         self.residual_multiplier_tt = _replicate(rm, device, ttnn.bfloat16)
 
         input_norm_sd = {"input_layernorm.weight": hf_layer.input_layernorm.weight}
         self.input_layernorm = RMSNorm(
-            device=device, dim=config.hidden_size,
-            state_dict=input_norm_sd, weight_key="input_layernorm",
-            weight_dtype=dtype, eps=config.rms_norm_eps, fp32_dest_acc_en=True,
+            device=device,
+            dim=config.hidden_size,
+            state_dict=input_norm_sd,
+            weight_key="input_layernorm",
+            weight_dtype=dtype,
+            eps=config.rms_norm_eps,
+            fp32_dest_acc_en=True,
         )
-        post_attn_norm_sd = {"post_attention_layernorm.weight": hf_layer.post_attention_layernorm.weight}
+        post_attn_norm_sd = {
+            "post_attention_layernorm.weight": hf_layer.post_attention_layernorm.weight
+        }
         self.post_attention_layernorm = RMSNorm(
-            device=device, dim=config.hidden_size,
-            state_dict=post_attn_norm_sd, weight_key="post_attention_layernorm",
-            weight_dtype=dtype, eps=config.rms_norm_eps, fp32_dest_acc_en=True,
+            device=device,
+            dim=config.hidden_size,
+            state_dict=post_attn_norm_sd,
+            weight_key="post_attention_layernorm",
+            weight_dtype=dtype,
+            eps=config.rms_norm_eps,
+            fp32_dest_acc_en=True,
         )
 
         if use_tt_moe and hasattr(hf_layer, "block_sparse_moe"):
-            self.tt_moe = GraniteTTMoE(hf_layer.block_sparse_moe, device,
-                                       weight_dtype=moe_weight_dtype, act_dtype=dtype,
-                                       use_all_gather=moe_use_all_gather, tt_ccl=tt_ccl)
+            self.tt_moe = GraniteTTMoE(
+                hf_layer.block_sparse_moe,
+                device,
+                weight_dtype=moe_weight_dtype,
+                act_dtype=dtype,
+                use_all_gather=moe_use_all_gather,
+                tt_ccl=tt_ccl,
+            )
         else:
             self.tt_moe = None
 
@@ -105,6 +147,7 @@ class TTGraniteDecoderLayer:
             head_dim = config.hidden_size // config.num_attention_heads
             if use_tt_attention:
                 from granite.attention_nope import AttentionNoPE
+
                 self.simple_attention = AttentionNoPE(
                     device=device,
                     q_weight=hf_layer.self_attn.q_proj.weight,
@@ -125,9 +168,10 @@ class TTGraniteDecoderLayer:
         else:
             self.simple_attention = None
             if hasattr(hf_layer, "mamba") and use_tt_mamba:
-                # Small on 4 dev (H=4096): replicated = 3.5 GB bf8 -> OOM. TP required.
                 _num_dev = device.get_num_devices() if self.is_mesh else 1
                 _mamba_tp = self.is_mesh and _num_dev > 4
+                # If the model is using Mamba, we initialize a TensorParallelMamba,
+                # which is a TTNN implementation of the Mamba layer.
                 self.mamba = TensorParallelMamba(
                     hf_mamba=hf_layer.mamba,
                     device=device,
@@ -148,33 +192,49 @@ class TTGraniteDecoderLayer:
         cache_manager: MambaCacheManager,
         position_ids: torch.Tensor,
         attention_mask=None,
-        position_embeddings=None,
         cache_position=None,
-        has_previous_state=None,
     ) -> ttnn.Tensor:
-        """Run one decoder layer (mixer + MLP with residual connections)."""
-        seq_len = len(cache_position) if cache_position is not None else hidden_states.shape[2]
+        """Run mixer then MoE block, each with RMSNorm + scaled residual."""
+        seq_len = (
+            len(cache_position)
+            if cache_position is not None
+            else hidden_states.shape[2]
+        )
         mode = Mode.DECODE if seq_len == 1 else Mode.PREFILL
         if not hasattr(cache_manager, "hybrid_cache"):
-            raise RuntimeError("hybrid_cache must be initialized before decoder layer forward")
+            raise RuntimeError(
+                "hybrid_cache must be initialized before decoder layer forward"
+            )
 
         residual = hidden_states
         normed = self.input_layernorm.forward(hidden_states, mode=mode)
 
         if self.is_attention_layer:
             mixer_out = self._attention_forward(
-                normed, cache_manager, position_ids,
-                attention_mask, position_embeddings, cache_position, seq_len,
+                normed,
+                cache_manager,
+                position_ids,
+                attention_mask,
+                cache_position,
+                seq_len,
             )
         else:
             mixer_out = self._mamba_forward(
-                normed, cache_manager, position_ids, cache_position, seq_len,
+                normed,
+                cache_manager,
+                position_ids,
+                cache_position,
+                seq_len,
             )
 
         normed.deallocate(True)
 
-        hidden_states = ttnn.mac(mixer_out, self.residual_multiplier_tt, residual,
-                                 memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        hidden_states = ttnn.mac(
+            mixer_out,
+            self.residual_multiplier_tt,
+            residual,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         mixer_out.deallocate(True)
         residual.deallocate(True)
 
@@ -184,20 +244,31 @@ class TTGraniteDecoderLayer:
         mlp_out = self._mlp_forward(normed2, seq_len, mode)
         normed2.deallocate(True)
 
-        hidden_states = ttnn.mac(mlp_out, self.residual_multiplier_tt, residual,
-                                 memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        hidden_states = ttnn.mac(
+            mlp_out,
+            self.residual_multiplier_tt,
+            residual,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         mlp_out.deallocate(True)
         residual.deallocate(True)
 
         return hidden_states
 
-    def _attention_forward(self, normed, cache_manager, position_ids,
-                           attention_mask, position_embeddings,
-                           cache_position, seq_len) -> ttnn.Tensor:
-        """Dispatch to TTNN attention or HF fallback."""
+    def _attention_forward(
+        self,
+        normed,
+        cache_manager,
+        position_ids,
+        attention_mask,
+        cache_position,
+        seq_len,
+    ) -> ttnn.Tensor:
+        """Run TTNN attention, or fall back to HF on CPU if use_tt_attention=False."""
         if self.simple_attention is not None:
             return self.simple_attention.forward(
-                normed, position_ids=position_ids, cache_manager=cache_manager,
+                normed,
+                position_ids=position_ids,
             )
         hs_torch = _tt_to_torch(normed, (1, seq_len, self.config.hidden_size))
         attn_out = self.hf_layer.self_attn(
@@ -207,12 +278,16 @@ class TTGraniteDecoderLayer:
             past_key_value=cache_manager.hybrid_cache,
             cache_position=cache_position,
         )[0]
-        return _replicate(attn_out.reshape(1, 1, seq_len, self.config.hidden_size),
-                          self.device, self.dtype)
+        return _replicate(
+            attn_out.reshape(1, 1, seq_len, self.config.hidden_size),
+            self.device,
+            self.dtype,
+        )
 
-    def _mamba_forward(self, normed, cache_manager, position_ids,
-                       cache_position, seq_len) -> ttnn.Tensor:
-        """Dispatch to TTNN Mamba or HF fallback."""
+    def _mamba_forward(
+        self, normed, cache_manager, position_ids, cache_position, seq_len
+    ) -> ttnn.Tensor:
+        """Run TTNN Mamba, or fall back to HF on CPU if use_tt_mamba=False."""
         start_pos = position_ids[0, 0].item()
         if cache_position is None:
             cache_position = torch.arange(start_pos, start_pos + seq_len)
@@ -226,8 +301,11 @@ class TTGraniteDecoderLayer:
             )
             if isinstance(out, ttnn.Tensor):
                 return out
-            return _replicate(out.reshape(1, 1, seq_len, self.config.hidden_size),
-                              self.device, self.dtype)
+            return _replicate(
+                out.reshape(1, 1, seq_len, self.config.hidden_size),
+                self.device,
+                self.dtype,
+            )
 
         hs_torch = _tt_to_torch(normed, (1, seq_len, self.config.hidden_size))
         out_torch = self.hf_layer.mamba(
@@ -236,11 +314,17 @@ class TTGraniteDecoderLayer:
             cache_position=cache_position,
             attention_mask=None,
         )
-        return _replicate(out_torch.reshape(1, 1, seq_len, self.config.hidden_size),
-                          self.device, self.dtype)
+        return _replicate(
+            out_torch.reshape(1, 1, seq_len, self.config.hidden_size),
+            self.device,
+            self.dtype,
+        )
 
     def _mlp_forward(self, normed, seq_len, mode) -> ttnn.Tensor:
-        """Run MoE + shared MLP and return their sum."""
+        """
+        Run routed MoE and shared MLP, return their sum.
+        Falls back to HF CPU if use_tt_moe=False.
+        """
         hidden_size = self.config.hidden_size
 
         if self.tt_moe is not None and (seq_len == 1 or seq_len >= 32):
@@ -248,14 +332,18 @@ class TTGraniteDecoderLayer:
         else:
             hs_torch = _tt_to_torch(normed, (1, seq_len, hidden_size))
             moe_np = self.hf_layer.block_sparse_moe(hs_torch)[0]
-            moe_out_tt = _replicate(moe_np.reshape(1, 1, seq_len, hidden_size), self.device, self.dtype)
+            moe_out_tt = _replicate(
+                moe_np.reshape(1, 1, seq_len, hidden_size), self.device, self.dtype
+            )
 
         if self.shared_mlp is not None:
-            shared_out_tt = self.shared_mlp.forward(normed, mode=mode)
+            shared_out_tt = self.shared_mlp.forward(normed)
         else:
             hs_torch = _tt_to_torch(normed, (1, seq_len, hidden_size))
             shared_np = self.hf_layer.shared_mlp(hs_torch)
-            shared_out_tt = _replicate(shared_np.reshape(1, 1, seq_len, hidden_size), self.device, self.dtype)
+            shared_out_tt = _replicate(
+                shared_np.reshape(1, 1, seq_len, hidden_size), self.device, self.dtype
+            )
 
         out = ttnn.add(moe_out_tt, shared_out_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         moe_out_tt.deallocate(True)
@@ -263,7 +351,7 @@ class TTGraniteDecoderLayer:
         return out
 
     def reset_cache(self):
-        """Zero KV cache (attention) or SSM/conv state (Mamba) in-place to preserve trace addresses."""
+        """Zero KV cache (attention) or SSM/conv state (Mamba) in-place."""
         if self.is_attention_layer and self.simple_attention is not None:
             attn = self.simple_attention
             zeros_k = ttnn.zeros_like(attn.cache_k)
