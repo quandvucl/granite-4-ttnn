@@ -1,6 +1,15 @@
-\documentclass[format=sigconf, review=false, screen=true, nonacm, natbib]{acmart}
+\def\versionAIDE{true}
+\documentclass[sigconf, screen, nonacm, natbib]{acmart}
 
 \citestyle{acmauthoryear}
+
+\ifdefined\versionAIDE
+  \newcommand\modulecode{COMP0251}
+  \newcommand\programmename{Artificial Intelligence and Data Engineering}
+\else
+  \newcommand\modulecode{COMP0110}
+  \newcommand\programmename{Software Systems Engineering}
+\fi
 
 \usepackage{algorithm}
 \usepackage{algpseudocode}
@@ -11,7 +20,7 @@
 
 \title{Numerical and Architectural Challenges in Porting Granite-4.0-h Small/Tiny Models from HuggingFace to Tenstorrent Wormhole (Galaxy 32) Architecture}
 
-\subtitle{MSc AI \& Data Engineering Research Project}
+\subtitle{\modulecode: MSc \programmename{} Research Project, Academic Year 2025/26}
 
 \author{Anonymous}
 \authorsaddresses{}
@@ -42,7 +51,7 @@ The source code for this project is publicly available at:\\
 
 \section*{Declarations}
 
-This report is submitted as part requirement for the MSc Artificial Intelligence and Data Engineering degree at UCL. It is substantially the result of my own work except where explicitly indicated in the text. I have read, understood and abided by the restrictions on the use of generative AI for this assignment.
+This report is submitted as part requirement for the MSc \programmename{} degree at UCL. It is substantially the result of my own work except where explicitly indicated in the text. I have read, understood and abided by the restrictions on the use of generative AI for this assignment.
 
 The report may be freely copied and distributed provided the source is explicitly acknowledged.
 
