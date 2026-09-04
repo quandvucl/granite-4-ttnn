@@ -15,6 +15,7 @@ HERE = Path(__file__).parent.resolve()
 HDR = HERE / "tt-metal-headers"
 TTNN_SITE = Path("/work/tt-granite/env/lib/python3.10/site-packages/ttnn")
 
+
 def build():
     """Compile mamba2_ssm_decode.cpp into libmamba2_ssm_decode.so."""
     include_dirs = [
@@ -59,6 +60,7 @@ def build():
     if result.returncode != 0:
         raise RuntimeError(f"Build failed (exit {result.returncode})")
     print(f"Built: {out}")
+
 
 if __name__ == "__main__":
     build()

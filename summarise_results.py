@@ -1,5 +1,5 @@
-import json
 import glob
+import json
 import os
 
 files = sorted(glob.glob("./report_results/**/*.json", recursive=True))
@@ -14,7 +14,10 @@ for path in files:
     entry = {
         "file": key,
         "model": d.get("model"),
-        "hardware": d.get("hardware", "ttnn" if "ttnn" in key else ("cuda" if "cuda" in key else "cpu")),
+        "hardware": d.get(
+            "hardware",
+            "ttnn" if "ttnn" in key else ("cuda" if "cuda" in key else "cpu"),
+        ),
         "chunk_size": d.get("chunk_size"),
         "use_conv1d_kernel": d.get("use_conv1d_kernel"),
         "use_ssm_kernel": d.get("use_ssm_kernel"),

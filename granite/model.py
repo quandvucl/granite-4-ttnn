@@ -9,20 +9,24 @@ import ttnn
 from transformers import AutoModelForCausalLM
 
 sys.path.append(str(Path(__file__).parent.parent))
+from granite import MambaCacheManager
 from granite.config import TTGraniteConfig
 from granite.decoder_layer import TTGraniteDecoderLayer
-from granite import MambaCacheManager
-
-from models.common.modules.lm_head.lm_head_1d import LMHead1D
 from models.common.modules.embedding.embedding_1d import Embedding1D
-from models.common.rmsnorm import RMSNorm
 from models.common.modules.lazy_weight import LazyWeight
+from models.common.modules.lm_head.lm_head_1d import LMHead1D
 from models.common.modules.tt_ccl import get_tt_ccl
+from models.common.rmsnorm import RMSNorm
 from models.tt_transformers.tt.common import Mode
 
 
 class ReplicatedMLP:
-    """Shared MLP with weights replicated across all devices - no all_reduce."""
+    """SwiGLU MLP with full weights replicated on every device.
+
+    Each device runs the full matmul independently - no communication needed.
+    Used on the tiny 4-device (1x4) mesh where 40 all-gathers per forward pass
+    would cost more than the memory saved by sharding.
+    """
 
     def __init__(self, w1, w2, w3, dtype):
         self.w1 = w1
@@ -30,25 +34,28 @@ class ReplicatedMLP:
         self.w2 = w2
         self.dtype = dtype
 
-    def forward(self, x: "ttnn.Tensor", mode=None) -> "ttnn.Tensor":
-        """SwiGLU MLP forward."""
+    def forward(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        # SwiGLU: out = (silu(x @ w_gate) * (x @ w_up)) @ w_down
+        # gate = silu(x @ w1), up = x @ w3, mid = gate * up
         MC = ttnn.L1_MEMORY_CONFIG
         gate = ttnn.linear(x, self.w1, dtype=self.dtype, memory_config=MC)
-        up   = ttnn.linear(x, self.w3, dtype=self.dtype, memory_config=MC)
+        up = ttnn.linear(x, self.w3, dtype=self.dtype, memory_config=MC)
         gate = ttnn.silu(gate, memory_config=MC)
-        mid  = ttnn.mul(gate, up, memory_config=MC)
+        mid = ttnn.mul(gate, up, memory_config=MC)
         gate.deallocate(True)
         up.deallocate(True)
-        out  = ttnn.linear(mid, self.w2, dtype=self.dtype, memory_config=MC)
+        out = ttnn.linear(mid, self.w2, dtype=self.dtype, memory_config=MC)
         mid.deallocate(True)
         return out
 
 
 class ColumnParallelMLP:
-    """Column-parallel SwiGLU MLP - gate+up sharded across mesh cols, row-parallel down.
+    """SwiGLU MLP where w_gate and w_up are column-sharded across mesh columns.
 
-    Each device holds gate/up: [H, F/num_cols] and down: [F/num_cols, H].
-    After down projection, all-gather(col-axis) + sum completes the all-reduce.
+    Each of the num_cols devices computes a partial w_down output (its own shard of
+    the intermediate dimension); a ring all-gather + sum across those num_cols devices
+    then reconstructs the full hidden_size output on every device. Used on >4-device meshes where weight memory savings
+    outweigh the all-gather cost (vs ReplicatedMLP which skips communication entirely).
     """
 
     def __init__(self, w1, w2, w3, num_cols, dtype, tt_ccl=None, cluster_axis=1):
@@ -61,13 +68,12 @@ class ColumnParallelMLP:
         self._cluster_axis = cluster_axis
         self._topology = ttnn.Topology.Linear
 
-    def forward(self, x, mode=None):
-        """Column-parallel SwiGLU forward with async all-gather reduce."""
+    def forward(self, x):
         MC = ttnn.L1_MEMORY_CONFIG
         gate = ttnn.linear(x, self.w1, dtype=self.dtype, memory_config=MC)
-        up   = ttnn.linear(x, self.w3, dtype=self.dtype, memory_config=MC)
+        up = ttnn.linear(x, self.w3, dtype=self.dtype, memory_config=MC)
         gate = ttnn.silu(gate, memory_config=MC)
-        mid  = ttnn.mul(gate, up, memory_config=MC)
+        mid = ttnn.mul(gate, up, memory_config=MC)
         gate.deallocate(True)
         up.deallocate(True)
         out = ttnn.linear(mid, self.w2, dtype=self.dtype, memory_config=MC)
@@ -78,9 +84,14 @@ class ColumnParallelMLP:
                 gathered = ttnn.experimental.all_gather_async(
                     out,
                     persistent_output_buffer=None,
-                    dim=1, cluster_axis=ax,
-                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(ax),
-                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(ax),
+                    dim=1,
+                    cluster_axis=ax,
+                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(
+                        ax
+                    ),
+                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(
+                        ax
+                    ),
                     num_links=self.tt_ccl.get_num_links(ax),
                     memory_config=MC,
                     topology=self._topology,
@@ -89,7 +100,9 @@ class ColumnParallelMLP:
                     num_buffers_per_channel=2,
                 )
             else:
-                gathered = ttnn.all_gather(out, dim=1, cluster_axis=ax, memory_config=MC)
+                gathered = ttnn.all_gather(
+                    out, dim=1, cluster_axis=ax, memory_config=MC
+                )
             out.deallocate(True)
             out = ttnn.sum(gathered, dim=1, keepdim=True, memory_config=MC)
             gathered.deallocate(True)
@@ -98,14 +111,7 @@ class ColumnParallelMLP:
 
 class TTGraniteMoeHybridForCausalLM:
     """
-    Tenstorrent-accelerated Granite MoE Hybrid model for causal language modeling.
-
-    Implements hybrid execution:
-    - Attention layers (5, 15, 25, 35): Run on TT hardware
-    - Mamba layers (all others): Run on CPU
-    - Shared MLP: Run on TT hardware
-    - Embeddings: Run on TT hardware
-    - LM head: Run on TT hardware
+    The main Granite hybrid model class.
     """
 
     def __init__(
@@ -135,7 +141,9 @@ class TTGraniteMoeHybridForCausalLM:
         self.use_tt_attention = use_tt_attention
         self.use_tt_mamba = use_tt_mamba
         self.use_tt_moe = use_tt_moe
-        self.moe_weight_dtype = moe_weight_dtype if moe_weight_dtype is not None else ttnn.bfloat8_b
+        self.moe_weight_dtype = (
+            moe_weight_dtype if moe_weight_dtype is not None else ttnn.bfloat8_b
+        )
         self.mamba_weight_dtype = mamba_weight_dtype
         self.use_conv1d_kernel = use_conv1d_kernel
         self.use_ssm_kernel = use_ssm_kernel
@@ -151,13 +159,21 @@ class TTGraniteMoeHybridForCausalLM:
 
         padded_vocab_size = ((vocab_size + 31) // 32) * 32
         if vocab_size < padded_vocab_size:
-            lm_head_weight = torch.cat([
-                lm_head_weight,
-                torch.zeros(lm_head_weight.shape[0], padded_vocab_size - vocab_size,
-                            dtype=lm_head_weight.dtype)
-            ], dim=-1)
+            lm_head_weight = torch.cat(
+                [
+                    lm_head_weight,
+                    torch.zeros(
+                        lm_head_weight.shape[0],
+                        padded_vocab_size - vocab_size,
+                        dtype=lm_head_weight.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
         lm_head_lazy = LazyWeight(
-            source=lm_head_weight, device=device, dtype=config.get_ttnn_dtype(),
+            source=lm_head_weight,
+            device=device,
+            dtype=config.get_ttnn_dtype(),
         )
         self.lm_head = LMHead1D([lm_head_lazy])
 
@@ -175,12 +191,16 @@ class TTGraniteMoeHybridForCausalLM:
             device=device,
             dtype=config.get_ttnn_dtype(),
         )
-        self.embedding = Embedding1D(embedding_lazy, embed_scale=config.embedding_multiplier)
+        self.embedding = Embedding1D(
+            embedding_lazy, embed_scale=config.embedding_multiplier
+        )
         self._use_tt_embeddings = is_mesh
 
         if is_mesh:
             if verbose:
-                print(f"  Mesh device detected ({device.get_num_devices()} devices) - tensor parallelism enabled")
+                print(
+                    f"  Mesh device detected ({device.get_num_devices()} devices) - tensor parallelism enabled"
+                )
             self.tt_ccl = get_tt_ccl(device) if device.get_num_devices() > 1 else None
             _ms = device.shape
             # FABRIC_1D never triggers composite all-gather (no dynamic alloc), so
@@ -223,34 +243,43 @@ class TTGraniteMoeHybridForCausalLM:
 
             _num_dev = device.get_num_devices() if is_mesh else 1
             act_dtype = config.get_ttnn_dtype()
-            # bf8 weights only pay off on large matrices (small model, H=4096).
-            # Tiny (H=1536): matmuls are compute-fast in bf16; bf8 overhead exceeds BW saving.
-            wt_dtype  = self.moe_weight_dtype if config.hidden_size > 2048 else act_dtype
+            # If hidden_size > 2048, use bfloat8 for MoE weights to save memory
+            # otherwise, use the same dtype as activations to avoid precision loss.
+            wt_dtype = self.moe_weight_dtype if config.hidden_size > 2048 else act_dtype
 
-            # SharedMLP TP: col-parallel on meshes with >4 devices and num_cols > 1.
-            # Tiny (4 devices, 1x4): disabled - 40 all-gathers x ~12µs = 0.5ms overhead > savings.
-            # Small (8 devices, 8x4): num_cols=4 > 1 and _num_dev > 4 -> enabled.
+            # Tensor parallelism is used on meshes with more than 4 devices and more than 1 column.
             mesh_shape = device.shape if is_mesh else ttnn.MeshShape(1, 1)
             num_cols = mesh_shape[1] if is_mesh else 1
             use_tensor_parallel = is_mesh and num_cols > 1 and _num_dev > 4
 
             if use_tensor_parallel:
                 num_tp, cluster_axis = num_cols, 1
-                fwd_mapper = ttnn.ShardTensor2dMesh(device, dims=(None, 1), mesh_shape=mesh_shape)
-                rev_mapper = ttnn.ShardTensor2dMesh(device, dims=(None, 0), mesh_shape=mesh_shape)
-                F = gate_weight.shape[1]
+                fwd_mapper = ttnn.ShardTensor2dMesh(
+                    device, dims=(None, 1), mesh_shape=mesh_shape
+                )
+                rev_mapper = ttnn.ShardTensor2dMesh(
+                    device, dims=(None, 0), mesh_shape=mesh_shape
+                )
+                F = gate_weight.shape[1]  # The intermediate dimension of the MLP
                 if F % num_tp == 0:
+
                     def _upload_fwd(t):
                         return ttnn.from_torch(
-                            t, device=device, dtype=wt_dtype,
-                            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                            t,
+                            device=device,
+                            dtype=wt_dtype,
+                            layout=ttnn.TILE_LAYOUT,
+                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
                             mesh_mapper=fwd_mapper,
                         )
 
                     def _upload_rev(t):
                         return ttnn.from_torch(
-                            t, device=device, dtype=wt_dtype,
-                            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                            t,
+                            device=device,
+                            dtype=wt_dtype,
+                            layout=ttnn.TILE_LAYOUT,
+                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
                             mesh_mapper=rev_mapper,
                         )
 
@@ -264,14 +293,21 @@ class TTGraniteMoeHybridForCausalLM:
                         cluster_axis=cluster_axis,
                     )
                 else:
+                    # If the intermediate dimension is not divisible by the number of columns, disable tensor parallelism
                     use_tensor_parallel = False
 
             if not use_tensor_parallel:
+
                 def _upload_replicated(t):
                     return ttnn.from_torch(
-                        t, device=device, dtype=wt_dtype,
-                        layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                        mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh else None,
+                        t,
+                        device=device,
+                        dtype=wt_dtype,
+                        layout=ttnn.TILE_LAYOUT,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        mesh_mapper=(
+                            ttnn.ReplicateTensorToMesh(device) if is_mesh else None
+                        ),
                     )
 
                 layer_mlp = ReplicatedMLP(
@@ -319,20 +355,24 @@ class TTGraniteMoeHybridForCausalLM:
         self._decode_trace_output = None
         self._trace_zeros = None
         self._in_trace = False
-        if self.tt_ccl is not None: self.tt_ccl._in_trace = False
+        if self.tt_ccl is not None:
+            self.tt_ccl._in_trace = False
 
-        # Set sub-device stall group at init so all ops use the trace-compatible dispatch path.
-        _trace_supported_init = (self.tt_ccl is not None and self.is_mesh)
+        _trace_supported_init = self.tt_ccl is not None and self.is_mesh
         if _trace_supported_init:
+            # Group specific sub-devices together so they stall (or wait) synchronously,
+            # ensuring proper hardware serialization and preventing race conditions during parallel execution
             self.device.set_sub_device_stall_group([ttnn.SubDeviceId(0)])
 
         del self.hf_model
         self.hf_model = None
 
         if verbose:
-            print(f"\n✓ Model initialized with {len(self.layers)} layers")
+            print(f"\nModel initialized with {len(self.layers)} layers")
             print(f"  - {len(config.attention_layer_indices)} attention layers")
-            print(f"  - {config.num_hidden_layers - len(config.attention_layer_indices)} mamba layers")
+            print(
+                f"  - {config.num_hidden_layers - len(config.attention_layer_indices)} mamba layers"
+            )
             if is_mesh and device.get_num_devices() > 1:
                 print(f"  - Mesh device: {device.get_num_devices()} devices")
                 if use_tensor_parallel:
@@ -349,17 +389,14 @@ class TTGraniteMoeHybridForCausalLM:
         _state_only: bool = False,
     ) -> torch.Tensor:
         """
-        Forward pass. hidden_states stays on TTNN for all 40 layers.
-
-        For prefill with seq_len > mamba_chunk_size, the sequence is split into
-        segments processed sequentially to reduce peak DRAM allocation.
+        The forward pass.
         """
         batch_size, seq_len = input_ids.shape
         assert batch_size == 1, f"Only batch_size=1 supported, got {batch_size}"
 
         chunk_sz = self.mamba_chunk_size
         if chunk_sz is not None and seq_len > chunk_sz and seq_len > 1:
-            return self._forward_chunked(input_ids, position_ids, attention_mask, use_cache, chunk_sz)
+            return self._forward_chunked(input_ids, use_cache, chunk_sz)
 
         if position_ids is None:
             position_ids = torch.arange(
@@ -387,6 +424,7 @@ class TTGraniteMoeHybridForCausalLM:
             from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
                 HybridMambaAttentionDynamicCache,
             )
+
             self.cache_manager.hybrid_cache = HybridMambaAttentionDynamicCache(
                 config=self.hf_config,
                 batch_size=1,
@@ -396,10 +434,12 @@ class TTGraniteMoeHybridForCausalLM:
         self.cache_manager.hybrid_cache.has_previous_state = has_previous_state
 
         mamba_mask = attention_mask
-        if cache_position[0].item() > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+        if cache_position[0].item() > 0 or (
+            attention_mask is not None and torch.all(attention_mask == 1)
+        ):
             mamba_mask = None
 
-        is_decode = (seq_len == 1)
+        is_decode = seq_len == 1
         start_pos = position_ids[0, 0].item()
 
         if is_decode:
@@ -407,14 +447,23 @@ class TTGraniteMoeHybridForCausalLM:
                 if layer.is_attention_layer and layer.simple_attention is not None:
                     layer.simple_attention.update_decode_pos(start_pos)
 
-        # Trace requires mesh_shape[1]==1 or mesh_shape[0]==1 (not both >1).
-        # is_true_2d_mesh() = mesh[0]>1 && mesh[1]>1 -> composite_all_gather (dynamic alloc).
-        _trace_supported = (self.tt_ccl is not None and self.moe_use_all_gather
-                            and not self._is_multirow_mesh)
-        if is_decode and not _state_only and _trace_supported and self._decode_trace_id is not None:
+        _trace_supported = (
+            self.tt_ccl is not None
+            and self.moe_use_all_gather
+            and not self._is_multirow_mesh
+        )
+        if (
+            is_decode
+            and not _state_only
+            and _trace_supported
+            and self._decode_trace_id is not None
+        ):
             new_input = ttnn.from_torch(
-                hs4d, device=self.device, dtype=self.config.get_ttnn_dtype(),
-                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                hs4d,
+                device=self.device,
+                dtype=self.config.get_ttnn_dtype(),
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=mapper,
             )
             ttnn.assign(new_input, self._decode_trace_input)
@@ -422,31 +471,39 @@ class TTGraniteMoeHybridForCausalLM:
             self._in_trace = True
             if self.tt_ccl is not None:
                 self.tt_ccl._in_trace = True
-                # Restore index-0 so replay uses the same handles baked in during capture.
-                if hasattr(self.tt_ccl, 'reset_semaphore_indices'):
+                if hasattr(self.tt_ccl, "reset_semaphore_indices"):
                     self.tt_ccl.reset_semaphore_indices()
                 else:
                     self.tt_ccl.barrier_semaphore_idx = [0, 0, 0]
                     self.tt_ccl.ag_semaphores_idx = [0, 0, 0]
                     self.tt_ccl.rs_semaphores_idx = [0, 0, 0]
-            ttnn.execute_trace(self.device, self._decode_trace_id, cq_id=0, blocking=False)
+            ttnn.execute_trace(
+                self.device, self._decode_trace_id, cq_id=0, blocking=False
+            )
             ttnn.synchronize_device(self.device)
             self._in_trace = False
-            if self.tt_ccl is not None: self.tt_ccl._in_trace = False
+            if self.tt_ccl is not None:
+                self.tt_ccl._in_trace = False
             trace_logits = self._extract_logits(self._decode_trace_output)
             if use_cache:
                 self.cache_manager.increment_position(seq_len)
             return trace_logits
 
         hidden_tt = ttnn.from_torch(
-            hs4d, device=self.device, dtype=self.config.get_ttnn_dtype(),
+            hs4d,
+            device=self.device,
+            dtype=self.config.get_ttnn_dtype(),
             layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=mapper,
         )
 
         for layer_idx, layer in enumerate(self.layers):
-            layer_mask = mamba_mask if layer_idx not in self.config.attention_layer_indices else attention_mask
+            layer_mask = (
+                mamba_mask
+                if layer_idx not in self.config.attention_layer_indices
+                else attention_mask
+            )
             hidden_tt = layer.forward(
                 hidden_tt,
                 self.cache_manager,
@@ -475,16 +532,18 @@ class TTGraniteMoeHybridForCausalLM:
         return self._extract_logits(logits_tt)
 
     def capture_decode_trace(self):
-        """Capture the decode trace for fast decode replay.
-
-        Must be called after prefill + at least one non-trace decode step.
-        Does NOT advance KV cache or SSM state. Call once after warmup.
-        """
-        _trace_supported = (self.tt_ccl is not None and self.moe_use_all_gather
-                            and not self._is_multirow_mesh)
+        """Capture the decode trace for fast decode replay."""
+        _trace_supported = (
+            self.tt_ccl is not None
+            and self.moe_use_all_gather
+            and not self._is_multirow_mesh
+        )
         if not _trace_supported:
-            print(f"  [trace] SKIPPED: tt_ccl={self.tt_ccl is not None} "
-                  f"moe_all_gather={self.moe_use_all_gather} multirow={self._is_multirow_mesh}", flush=True)
+            print(
+                f"  [trace] SKIPPED: tt_ccl={self.tt_ccl is not None} "
+                f"moe_all_gather={self.moe_use_all_gather} multirow={self._is_multirow_mesh}",
+                flush=True,
+            )
             return
         if self._decode_trace_id is not None:
             print(f"  [trace] already captured, skipping", flush=True)
@@ -502,14 +561,19 @@ class TTGraniteMoeHybridForCausalLM:
         dummy_hs = torch.zeros(1, 1, 1, self.config.hidden_size, dtype=torch.bfloat16)
 
         self._decode_trace_input = ttnn.from_torch(
-            dummy_hs, device=self.device, dtype=self.config.get_ttnn_dtype(),
-            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dummy_hs,
+            device=self.device,
+            dtype=self.config.get_ttnn_dtype(),
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=mapper,
         )
         self._trace_zeros = ttnn.from_torch(
             torch.zeros(1, 1, 1, self.config.hidden_size, dtype=torch.bfloat16),
-            device=self.device, dtype=self.config.get_ttnn_dtype(),
-            layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            device=self.device,
+            dtype=self.config.get_ttnn_dtype(),
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=mapper,
         )
 
@@ -517,7 +581,7 @@ class TTGraniteMoeHybridForCausalLM:
         if self.tt_ccl is not None:
             self.tt_ccl._in_trace = True
             # Reset semaphore cycle counters so the trace always bakes in index-0 handles.
-            if hasattr(self.tt_ccl, 'reset_semaphore_indices'):
+            if hasattr(self.tt_ccl, "reset_semaphore_indices"):
                 self.tt_ccl.reset_semaphore_indices()
             else:
                 self.tt_ccl.barrier_semaphore_idx = [0, 0, 0]
@@ -525,8 +589,11 @@ class TTGraniteMoeHybridForCausalLM:
                 self.tt_ccl.rs_semaphores_idx = [0, 0, 0]
         _trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
 
-        hidden_tt = ttnn.add(self._decode_trace_input, self._trace_zeros,
-                             memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        hidden_tt = ttnn.add(
+            self._decode_trace_input,
+            self._trace_zeros,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
 
         position_ids = torch.tensor([[start_pos]], dtype=torch.long)
         cache_position = torch.arange(start_pos, start_pos + 1)
@@ -536,15 +603,20 @@ class TTGraniteMoeHybridForCausalLM:
             from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
                 HybridMambaAttentionDynamicCache,
             )
+
             self.cache_manager.hybrid_cache = HybridMambaAttentionDynamicCache(
-                config=self.hf_config, batch_size=1,
-                dtype=torch.bfloat16, device=torch.device("cpu"),
+                config=self.hf_config,
+                batch_size=1,
+                dtype=torch.bfloat16,
+                device=torch.device("cpu"),
             )
         self.cache_manager.hybrid_cache.has_previous_state = has_previous_state
 
         for layer_idx, layer in enumerate(self.layers):
             hidden_tt = layer.forward(
-                hidden_tt, self.cache_manager, position_ids,
+                hidden_tt,
+                self.cache_manager,
+                position_ids,
                 attention_mask=None,
                 position_embeddings=None,
                 cache_position=cache_position,
@@ -567,7 +639,7 @@ class TTGraniteMoeHybridForCausalLM:
             self.tt_ccl._in_trace = False
             # Reset indices so replays always use the same index-0 semaphore handles
             # that were baked in during capture.
-            if hasattr(self.tt_ccl, 'reset_semaphore_indices'):
+            if hasattr(self.tt_ccl, "reset_semaphore_indices"):
                 self.tt_ccl.reset_semaphore_indices()
             else:
                 self.tt_ccl.barrier_semaphore_idx = [0, 0, 0]
@@ -578,7 +650,9 @@ class TTGraniteMoeHybridForCausalLM:
     def _extract_logits(self, logits_tt):
         """Convert TTNN logits tensor to CPU torch tensor, gathering sharded vocab dim."""
         if self.is_mesh:
-            logits = ttnn.to_torch(logits_tt, mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=3))[0:1]
+            logits = ttnn.to_torch(
+                logits_tt, mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=3)
+            )[0:1]
         else:
             logits = logits_tt.cpu().to_torch()
         if logits_tt is not self._decode_trace_output:
@@ -587,12 +661,8 @@ class TTGraniteMoeHybridForCausalLM:
             logits = logits[0]
         return logits
 
-    def _forward_chunked(self, input_ids, position_ids, attention_mask, use_cache, chunk_sz):
-        """Prefill long sequences in chunks to reduce peak DRAM allocation.
-
-        Mamba SSM state and attention KV cache accumulate across chunks.
-        Only the final chunk's last-token logits are returned.
-        """
+    def _forward_chunked(self, input_ids, use_cache, chunk_sz):
+        """Prefill long sequences in chunks to reduce peak DRAM allocation."""
         batch_size, seq_len = input_ids.shape
         start_pos = self.cache_manager.get_position()
 
@@ -600,13 +670,15 @@ class TTGraniteMoeHybridForCausalLM:
         for offset in range(0, seq_len, chunk_sz):
             end = min(offset + chunk_sz, seq_len)
             chunk_ids = input_ids[:, offset:end]
-            chunk_pos = torch.arange(start_pos + offset, start_pos + end, dtype=torch.long).unsqueeze(0)
+            chunk_pos = torch.arange(
+                start_pos + offset, start_pos + end, dtype=torch.long
+            ).unsqueeze(0)
             chunks.append((chunk_ids, chunk_pos, offset))
 
         n = len(chunks)
         last_logits = None
         for i, (chunk_ids, chunk_pos, _) in enumerate(chunks):
-            is_last = (i == n - 1)
+            is_last = i == n - 1
             last_logits = self.forward(
                 chunk_ids,
                 position_ids=chunk_pos,
@@ -618,14 +690,14 @@ class TTGraniteMoeHybridForCausalLM:
         return last_logits
 
     def reset_cache(self):
-        """Reset KV and Mamba caches for a new sequence. Does NOT release the decode trace."""
+        """Reset KV and Mamba caches for a new sequence."""
         self.cache_manager.reset()
 
         if hasattr(self.cache_manager, "hybrid_cache"):
             delattr(self.cache_manager, "hybrid_cache")
 
         for layer in self.layers:
-            if hasattr(layer, 'reset_cache'):
+            if hasattr(layer, "reset_cache"):
                 layer.reset_cache()
 
     @classmethod

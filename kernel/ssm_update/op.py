@@ -1,35 +1,8 @@
-"""
-Host-side launcher for ssm_update - fused Metal kernel that computes:
-  h_out[d,n] = dBx[d,n] + dA[d,n] * state[d,n]
-  yc[d,n]    = h_out[d,n] * C[h%32, n]   (C row-broadcast over D)
-  y[d]       = sum_n(yc[d,n])             (reduce over N)
-
-in a single DRAM pass over dBx, dA, state, C.
-
-Expected shapes (bfloat16, TILE_LAYOUT, on device):
-  dBx_tt   : [1, H, D, N]   (B=1 for decode)
-  dA_tt    : [1, H, D, N]
-  state_tt : [1, H, D, N]
-  C_tt     : [1, H, N]
-
-Returns:
-  hout_tt  : [1, H, D, N]   updated SSM state
-  y_tt     : [1, H, D, 1]   y output in reduce_w layout (W=1 padded to 32, not squeezed)
-
-The caller is responsible for D-skip:  y_out = y_tt[:,:,:,0] + D * x
-
-Hot-path dispatch cost:
-  First call  - builds and caches static plan (CBs, CT args, KernelDescriptor shells,
-                core list with static per-core args).
-  Subsequent  - builds fresh RuntimeArgs by filling only the address slots per core,
-                then wraps in ProgramDescriptor and calls generic_op.
-  The plan cache avoids re-computing grid split, CT args, CBDescriptors, and the
-  core_list itself; only the 3xRuntimeArgs allocation + address fill remains on the
-  hot path (~180 µs/layer vs ~500 µs without caching).
-"""
+"""Host-side launcher for the ssm_update kernel (fused Mamba2 SSM decode step)."""
 
 import math
 import os
+
 import torch
 import ttnn
 
@@ -44,7 +17,11 @@ def _get_scaler(device):
     key = id(device)
     if key not in _scaler_cache:
         ones = torch.ones(1, 1, 32, 32, dtype=torch.bfloat16)
-        mapper = ttnn.ReplicateTensorToMesh(device) if hasattr(device, "get_num_devices") else None
+        mapper = (
+            ttnn.ReplicateTensorToMesh(device)
+            if hasattr(device, "get_num_devices")
+            else None
+        )
         _scaler_cache[key] = ttnn.from_torch(
             ones,
             dtype=ttnn.bfloat16,
@@ -62,19 +39,28 @@ class _SsmPlan:
     core_list: [(cx, cy, wpc, cur), ...] - pre-computed per-core static args.
                Only addresses change per call; these are constant.
     """
+
     __slots__ = [
-        'core_grid', 'core_list',
-        'Nt', 'Dt',
-        'reader_ct', 'writer_ct',
-        'cbs',
-        'is_mesh', 'mesh_rows', 'mesh_cols',
-        'scaler_tt',
-        'reader_src', 'writer_src', 'compute_src',
+        "core_grid",
+        "core_list",
+        "Nt",
+        "Dt",
+        "reader_ct",
+        "writer_ct",
+        "cbs",
+        "is_mesh",
+        "mesh_rows",
+        "mesh_cols",
+        "scaler_tt",
+        "reader_src",
+        "writer_src",
+        "compute_src",
     ]
 
 
-def _build_plan(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt, y_tt,
-                scaler_tt, cache_bust_id):
+def _build_plan(
+    dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt, y_tt, scaler_tt, cache_bust_id
+):
     """Build static dispatch plan: grid split, CB descriptors, compile-time args."""
     sh = dBx_tt.shape
     B, H, D, N = sh[0], sh[1], sh[2], sh[3]
@@ -89,7 +75,7 @@ def _build_plan(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt, y_tt,
     grid = _query_dev.compute_with_storage_grid_size()
     max_core = ttnn.CoreCoord(grid.x - 1, grid.y - 1)
     all_cores_set = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), max_core)])
-    (_, core_grid, group1, group2, g1_work, g2_work) = ttnn.split_work_to_cores(
+    _, core_grid, group1, group2, g1_work, g2_work = ttnn.split_work_to_cores(
         all_cores_set, num_groups
     )
 
@@ -107,19 +93,25 @@ def _build_plan(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt, y_tt,
     is_mesh = hasattr(device, "get_num_devices")
 
     if is_mesh:
-        dBx_d0   = ttnn.get_device_tensors(dBx_tt)[0]
+        dBx_d0 = ttnn.get_device_tensors(dBx_tt)[0]
         state_d0 = ttnn.get_device_tensors(state_tt)[0]
-        C_d0     = ttnn.get_device_tensors(C_tt)[0]
-        sc_d0    = ttnn.get_device_tensors(scaler_tt)[0]
-        hout_d0  = ttnn.get_device_tensors(hout_tt)[0]
-        y_d0     = ttnn.get_device_tensors(y_tt)[0]
+        C_d0 = ttnn.get_device_tensors(C_tt)[0]
+        sc_d0 = ttnn.get_device_tensors(scaler_tt)[0]
+        hout_d0 = ttnn.get_device_tensors(hout_tt)[0]
+        y_d0 = ttnn.get_device_tensors(y_tt)[0]
     else:
-        dBx_d0 = dBx_tt; state_d0 = state_tt; C_d0 = C_tt
-        sc_d0 = scaler_tt; hout_d0 = hout_tt; y_d0 = y_tt
+        dBx_d0 = dBx_tt
+        state_d0 = state_tt
+        C_d0 = C_tt
+        sc_d0 = scaler_tt
+        hout_d0 = hout_tt
+        y_d0 = y_tt
 
     reader_ct = []
     reader_ct.extend(ttnn.TensorAccessorArgs(dBx_d0).get_compile_time_args())
-    reader_ct.extend(ttnn.TensorAccessorArgs(dBx_d0).get_compile_time_args())   # dA same layout
+    reader_ct.extend(
+        ttnn.TensorAccessorArgs(dBx_d0).get_compile_time_args()
+    )  # dA same layout
     reader_ct.extend(ttnn.TensorAccessorArgs(state_d0).get_compile_time_args())
     reader_ct.extend(ttnn.TensorAccessorArgs(C_d0).get_compile_time_args())
     reader_ct.extend(ttnn.TensorAccessorArgs(sc_d0).get_compile_time_args())
@@ -134,60 +126,80 @@ def _build_plan(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt, y_tt,
         return ttnn.CBDescriptor(
             total_size=n_tiles * tile_bytes,
             core_ranges=core_grid,
-            format_descriptors=[ttnn.CBFormatDescriptor(
-                buffer_index=idx,
-                data_format=ttnn.bfloat16,
-                page_size=tile_bytes,
-            )],
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(
+                    buffer_index=idx,
+                    data_format=ttnn.bfloat16,
+                    page_size=tile_bytes,
+                )
+            ],
         )
 
     cbs = [
-        make_cb(0), make_cb(1), make_cb(2), make_cb(3), make_cb(4),
-        make_cb(5, Nt), make_cb(6, Nt),
-        make_cb(16), make_cb(17),
+        make_cb(0),
+        make_cb(1),
+        make_cb(2),
+        make_cb(3),
+        make_cb(4),
+        make_cb(5, Nt),
+        make_cb(6, Nt),
+        make_cb(16),
+        make_cb(17),
         # CB7 size encodes cache_bust_id so each Mamba layer gets a unique program hash,
         # preventing cross-layer generic_op cache collisions with stale L1 CB addresses.
         ttnn.CBDescriptor(
             total_size=(cache_bust_id + 1) * tile_bytes,
             core_ranges=core_grid,
-            format_descriptors=[ttnn.CBFormatDescriptor(
-                buffer_index=7,
-                data_format=ttnn.bfloat16,
-                page_size=tile_bytes,
-            )],
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(
+                    buffer_index=7,
+                    data_format=ttnn.bfloat16,
+                    page_size=tile_bytes,
+                )
+            ],
         ),
     ]
 
     plan = _SsmPlan()
-    plan.core_grid   = core_grid
-    plan.core_list   = core_list
-    plan.Nt          = Nt
-    plan.Dt          = Dt
-    plan.reader_ct   = reader_ct
-    plan.writer_ct   = writer_ct
-    plan.cbs         = cbs
-    plan.is_mesh     = is_mesh
-    plan.mesh_rows   = device.shape[0] if is_mesh else 1
-    plan.mesh_cols   = device.shape[1] if is_mesh else 1
-    plan.scaler_tt   = scaler_tt
-    plan.reader_src  = os.path.join(KERNEL_DIR, "dataflow", "reader.cpp")
-    plan.writer_src  = os.path.join(KERNEL_DIR, "dataflow", "writer.cpp")
+    plan.core_grid = core_grid
+    plan.core_list = core_list
+    plan.Nt = Nt
+    plan.Dt = Dt
+    plan.reader_ct = reader_ct
+    plan.writer_ct = writer_ct
+    plan.cbs = cbs
+    plan.is_mesh = is_mesh
+    plan.mesh_rows = device.shape[0] if is_mesh else 1
+    plan.mesh_cols = device.shape[1] if is_mesh else 1
+    plan.scaler_tt = scaler_tt
+    plan.reader_src = os.path.join(KERNEL_DIR, "dataflow", "reader.cpp")
+    plan.writer_src = os.path.join(KERNEL_DIR, "dataflow", "writer.cpp")
     plan.compute_src = os.path.join(KERNEL_DIR, "compute", "ssm_update.cpp")
     return plan
 
 
-def _make_runtime_args(plan, dBx_addr, dA_addr, state_addr, C_addr,
-                       scaler_addr, hout_addr, y_addr):
+def _make_runtime_args(
+    plan, dBx_addr, dA_addr, state_addr, C_addr, scaler_addr, hout_addr, y_addr
+):
     """Fill per-core address slots into RuntimeArgs structures."""
-    reader_rt  = ttnn.RuntimeArgs()
-    writer_rt  = ttnn.RuntimeArgs()
+    reader_rt = ttnn.RuntimeArgs()
+    writer_rt = ttnn.RuntimeArgs()
     compute_rt = ttnn.RuntimeArgs()
     Nt = plan.Nt
     Dt = plan.Dt
     for cx, cy, wpc, cur in plan.core_list:
-        reader_rt[cx][cy]  = [dBx_addr, dA_addr, state_addr, C_addr,
-                               scaler_addr, wpc, Nt, Dt, cur]
-        writer_rt[cx][cy]  = [hout_addr, y_addr, wpc, Nt, cur]
+        reader_rt[cx][cy] = [
+            dBx_addr,
+            dA_addr,
+            state_addr,
+            C_addr,
+            scaler_addr,
+            wpc,
+            Nt,
+            Dt,
+            cur,
+        ]
+        writer_rt[cx][cy] = [hout_addr, y_addr, wpc, Nt, cur]
         compute_rt[cx][cy] = [wpc, Nt, Dt, cur]
     return reader_rt, writer_rt, compute_rt
 
@@ -216,7 +228,7 @@ def _make_program(plan, reader_rt, writer_rt, compute_rt):
         core_ranges=plan.core_grid,
         compile_time_args=[],
         defines=[
-            ("REDUCE_OP",  "PoolType::SUM"),
+            ("REDUCE_OP", "PoolType::SUM"),
             ("REDUCE_DIM", "ReduceDim::REDUCE_ROW"),
         ],
         runtime_args=compute_rt,
@@ -229,8 +241,9 @@ def _make_program(plan, reader_rt, writer_rt, compute_rt):
     )
 
 
-def ssm_update(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt=None, y_tt=None,
-               cache_bust_id=0):
+def ssm_update(
+    dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt=None, y_tt=None, cache_bust_id=0
+):
     """
     Args:
         dBx_tt, dA_tt, state_tt : [1, H, D, N]  bfloat16 tile-layout
@@ -254,36 +267,49 @@ def ssm_update(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt=None, y_tt=None,
 
     if hout_tt is None:
         hout_tt = ttnn.allocate_tensor_on_device(
-            ttnn.Shape([B, H, D, N]), ttnn.bfloat16, ttnn.TILE_LAYOUT,
-            device, ttnn.DRAM_MEMORY_CONFIG,
+            ttnn.Shape([B, H, D, N]),
+            ttnn.bfloat16,
+            ttnn.TILE_LAYOUT,
+            device,
+            ttnn.DRAM_MEMORY_CONFIG,
         )
     if y_tt is None:
         y_tt = ttnn.allocate_tensor_on_device(
-            ttnn.Shape([B, H, D, 1]), ttnn.bfloat16, ttnn.TILE_LAYOUT,
-            device, ttnn.DRAM_MEMORY_CONFIG,
+            ttnn.Shape([B, H, D, 1]),
+            ttnn.bfloat16,
+            ttnn.TILE_LAYOUT,
+            device,
+            ttnn.DRAM_MEMORY_CONFIG,
         )
 
     plan_key = (id(device), B, H, D, N, cache_bust_id)
     if plan_key not in _plan_cache:
         _plan_cache[plan_key] = _build_plan(
-            dBx_tt, dA_tt, state_tt, C_tt, device,
-            hout_tt, y_tt, scaler_tt, cache_bust_id,
+            dBx_tt,
+            dA_tt,
+            state_tt,
+            C_tt,
+            device,
+            hout_tt,
+            y_tt,
+            scaler_tt,
+            cache_bust_id,
         )
     plan = _plan_cache[plan_key]
 
     if plan.is_mesh:
-        dBx_devs    = ttnn.get_device_tensors(dBx_tt)
-        dA_devs     = ttnn.get_device_tensors(dA_tt)
-        state_devs  = ttnn.get_device_tensors(state_tt)
-        C_devs      = ttnn.get_device_tensors(C_tt)
+        dBx_devs = ttnn.get_device_tensors(dBx_tt)
+        dA_devs = ttnn.get_device_tensors(dA_tt)
+        state_devs = ttnn.get_device_tensors(state_tt)
+        C_devs = ttnn.get_device_tensors(C_tt)
         scaler_devs = ttnn.get_device_tensors(scaler_tt)
-        hout_devs   = ttnn.get_device_tensors(hout_tt)
-        y_devs      = ttnn.get_device_tensors(y_tt)
+        hout_devs = ttnn.get_device_tensors(hout_tt)
+        y_devs = ttnn.get_device_tensors(y_tt)
 
         mesh_prog_desc = ttnn.MeshProgramDescriptor()
         for row in range(plan.mesh_rows):
             for col in range(plan.mesh_cols):
-                di    = row * plan.mesh_cols + col
+                di = row * plan.mesh_cols + col
                 coord = ttnn.MeshCoordinate(row, col)
                 r, w, c = _make_runtime_args(
                     plan,
@@ -295,18 +321,23 @@ def ssm_update(dBx_tt, dA_tt, state_tt, C_tt, device, hout_tt=None, y_tt=None,
                     hout_devs[di].buffer_address(),
                     y_devs[di].buffer_address(),
                 )
-                mesh_prog_desc[ttnn.MeshCoordinateRange(coord, coord)] = \
-                    _make_program(plan, r, w, c)
+                mesh_prog_desc[ttnn.MeshCoordinateRange(coord, coord)] = _make_program(
+                    plan, r, w, c
+                )
 
-        ttnn.generic_op([dBx_tt, dA_tt, state_tt, C_tt, scaler_tt, hout_tt, y_tt],
-                        mesh_prog_desc)
+        ttnn.generic_op(
+            [dBx_tt, dA_tt, state_tt, C_tt, scaler_tt, hout_tt, y_tt], mesh_prog_desc
+        )
     else:
         r, w, c = _make_runtime_args(
             plan,
-            dBx_tt.buffer_address(), dA_tt.buffer_address(),
-            state_tt.buffer_address(), C_tt.buffer_address(),
+            dBx_tt.buffer_address(),
+            dA_tt.buffer_address(),
+            state_tt.buffer_address(),
+            C_tt.buffer_address(),
             scaler_tt.buffer_address(),
-            hout_tt.buffer_address(), y_tt.buffer_address(),
+            hout_tt.buffer_address(),
+            y_tt.buffer_address(),
         )
         ttnn.generic_op(
             [dBx_tt, dA_tt, state_tt, C_tt, scaler_tt, hout_tt, y_tt],
